@@ -1,0 +1,32 @@
+diff --git a/src/internet/model/ipv4-l3-protocol.cc b/src/internet/model/ipv4-l3-protocol.cc
+--- a/src/internet/model/ipv4-l3-protocol.cc
++++ b/src/internet/model/ipv4-l3-protocol.cc
+@@ -662,6 +662,28 @@ Ipv4L3Protocol::SendIcmpNoRoute(const Ipv4Header& ipHeader, Ptr<const Packet> pa
+     {
+         return;
+     }
++    // RFC 1812 section 4.3.2.7 forbids sending an ICMP error in response to
++    // another ICMP error. Without this guard, a routing failure can recursively
++    // feed ICMP net-unreachable packets back through an on-demand routing
++    // protocol until its request queue continually drops and regenerates them.
++    if (ipHeader.GetProtocol() == Icmpv4L4Protocol::GetStaticProtocolNumber())
++    {
++        Icmpv4Header icmpHeader;
++        if (packet->PeekHeader(icmpHeader) > 0)
++        {
++            switch (icmpHeader.GetType())
++            {
++            case Icmpv4Header::ICMPV4_DEST_UNREACH:
++            case 4:  // Source Quench (obsolete, but still an ICMP error)
++            case 5:  // Redirect
++            case Icmpv4Header::ICMPV4_TIME_EXCEEDED:
++            case 12: // Parameter Problem
++                return;
++            default:
++                break;
++            }
++        }
++    }
+     Ptr<Icmpv4L4Protocol> icmp = GetIcmp();
+     if (icmp)
+     {

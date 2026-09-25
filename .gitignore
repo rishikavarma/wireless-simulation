@@ -1,0 +1,17 @@
+# Upstream ns-3 tree (clone or local symlink). Trailing slash would NOT
+# match a symlink, so keep the bare name.
+ns-3-dev
+
+# Local / generated outputs
+results/
+datasets/
+plots/
+summary.csv
+**/metrics.csv
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+__pycache__/
+*.pyc
