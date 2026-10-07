@@ -1,0 +1,65 @@
+{
+  "time": {
+    "simTime": 20,
+    "warmUp": 8,
+    "appDrain": 2,
+    "measureStart": 5,
+    "measureEnd": 1
+  },
+  "satellite": {
+    "altitudeKm": 550,
+    "inclinationDeg": 53,
+    "antennaUpdateMs": 1000
+  },
+  "radio": {
+    "ntnScenario": "NTN-Rural",
+    "frequencyHz": 20e9,
+    "bandwidthHz": 400e6,
+    "satEIRP": 20,
+    "ueTxPower": 40,
+    "ueAntennaGainDb": 38.5,
+    "gnbAntennaGainDb": 50,
+    "gnbNoiseFigureDb": 5,
+    "realisticPower": false,
+    "nrTraces": false
+  },
+  "topology": {
+    "ueDistanceM": 100,
+    "receiverMobility": false
+  },
+  "application": {
+    "workload": "probe",
+    "serverPort": 9,
+    "dataRate": "1Mbps",
+    "packetSize": 1400,
+    "probe": {
+      "traffic": "cbr",
+      "onTime": "1s",
+      "offTime": "1s"
+    },
+    "file": {
+      "fileSize": 1048576
+    },
+    "rpc": {
+      "reqSize": 256,
+      "respSize": 4096,
+      "count": 0
+    },
+    "stream": {
+      "chunkSize": 1400
+    },
+    "iot": {
+      "payload": 64,
+      "interval": "1s"
+    }
+  },
+  "output": {
+    "prefix": "smoke",
+    "tokenMode": "rtt",
+    "tokenFixedS": 0.1,
+    "tokenMinS": 0.005,
+    "tokenAggregate": "mean",
+    "tokenRttColumn": "srtt",
+    "tokenRttSecondsPerUnit": 0.1
+  }
+}

@@ -2,12 +2,14 @@
 
 #include "ns3/double.h"
 #include "ns3/geocentric-ecef-mobility-model.h"
-#include "ns3/hierarchical-mobility-model.h"
+#include "ns3/geographic-positions.h"
 #include "ns3/leo-circular-orbit-mobility-model.h"
 #include "ns3/mobility-module.h"
-#include "ns3/string.h"
+#include "ns3/random-variable-stream.h"
+#include "ns3/simulator.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace ns3
 {
@@ -27,11 +29,35 @@ InstallSatelliteMobility(Ptr<Node> satellite,
 }
 
 void
-InstallBaseStationMobility(Ptr<Node> baseStation, double latitudeDeg, double altitudeM)
+InstallBaseStationMobility(Ptr<Node> baseStation, Ptr<Node> satellite, double altitudeM)
 {
+    Ptr<MobilityModel> satMob = satellite->GetObject<MobilityModel>();
+    NS_ABORT_MSG_IF(!satMob, "InstallSatelliteMobility must run before InstallBaseStationMobility");
+    // Both ground endpoints sit at the satellite's initial nadir, inside the
+    // footprint. The orbit starts at the ascending node, so a latitude equal
+    // to the inclination is below the horizon for the whole short run.
+    const Vector satGeo = GeographicPositions::CartesianToGeographicCoordinates(
+        satMob->GetPosition(),
+        GeographicPositions::SPHERE);
     Ptr<GeocentricEcefMobilityModel> bsMob = CreateObject<GeocentricEcefMobilityModel>();
-    bsMob->SetGeographicPosition(Vector(latitudeDeg, 0.0, altitudeM));
+    bsMob->SetGeographicPosition(Vector(satGeo.x, satGeo.y, altitudeM));
     baseStation->AggregateObject(bsMob);
+}
+
+constexpr double kMetersPerDegree = 111320.0;
+
+void
+StepUeWalk(Ptr<GeocentricEcefMobilityModel> ueMob, Vector originGeo, double radiusM)
+{
+    const double half = std::max(10.0, radiusM);
+    Ptr<UniformRandomVariable> rv = CreateObject<UniformRandomVariable>();
+    const double north = rv->GetValue(-half, half);
+    const double east = rv->GetValue(-half, half);
+    const double dLat = north / kMetersPerDegree;
+    const double cosLat = std::cos(originGeo.x * M_PI / 180.0);
+    const double dLon = (std::abs(cosLat) < 1e-6) ? 0.0 : east / (kMetersPerDegree * cosLat);
+    ueMob->SetGeographicPosition(Vector(originGeo.x + dLat, originGeo.y + dLon, originGeo.z));
+    Simulator::Schedule(Seconds(1.0), &StepUeWalk, ueMob, originGeo, radiusM);
 }
 
 void
@@ -43,27 +69,15 @@ InstallUeMobility(Ptr<Node> ue,
     Ptr<GeocentricEcefMobilityModel> bsMob = baseStation->GetObject<GeocentricEcefMobilityModel>();
     NS_ABORT_MSG_IF(!bsMob, "InstallBaseStationMobility must run before InstallUeMobility");
 
-    Ptr<MobilityModel> ueChild;
+    const Vector bsGeo = bsMob->GetGeographicPosition();
+    Ptr<GeocentricEcefMobilityModel> ueMob = CreateObject<GeocentricEcefMobilityModel>();
+    ueMob->SetGeographicPosition(
+        Vector(bsGeo.x + (ueDistanceM / kMetersPerDegree), bsGeo.y, bsGeo.z));
+    ue->AggregateObject(ueMob);
     if (receiverMobility)
     {
-        const double half = std::max(10.0, ueDistanceM);
-        Ptr<RandomWalk2dMobilityModel> walk = CreateObject<RandomWalk2dMobilityModel>();
-        walk->SetAttribute("Bounds", RectangleValue(Rectangle(-half, half, -half, half)));
-        walk->SetAttribute("Speed", StringValue("ns3::UniformRandomVariable[Min=1.0|Max=2.0]"));
-        walk->SetPosition(Vector(ueDistanceM, 0.0, 0.0));
-        ueChild = walk;
+        Simulator::Schedule(Seconds(1.0), &StepUeWalk, ueMob, bsGeo, ueDistanceM);
     }
-    else
-    {
-        Ptr<ConstantPositionMobilityModel> fixed = CreateObject<ConstantPositionMobilityModel>();
-        fixed->SetPosition(Vector(ueDistanceM, 0.0, 0.0));
-        ueChild = fixed;
-    }
-
-    Ptr<HierarchicalMobilityModel> ueMob = CreateObject<HierarchicalMobilityModel>();
-    ueMob->SetParent(bsMob);
-    ueMob->SetChild(ueChild);
-    ue->AggregateObject(ueMob);
 }
 
 } // namespace ns3

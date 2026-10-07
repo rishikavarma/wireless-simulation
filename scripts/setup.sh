@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # Drop leftover ns-3 scenario processes from a previous run.
-pkill -f '/ns3-dev-sat-bs-handset-optimized' >/dev/null 2>&1 || true
+pkill -f 'sat-bs-handset-optimized' >/dev/null 2>&1 || true
 pkill -f 'ns3 run sat-bs-handset' >/dev/null 2>&1 || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,26 +119,34 @@ fi
 echo "==> Persisting \$HOME/.local/bin on PATH"
 ensure_local_bin_on_path
 
-echo "==> Cloning ns-3-dev into $NS3_DIR"
-if [[ -d "$NS3_DIR/.git" ]]; then
-    echo "    already present, skipping clone"
-elif [[ -e "$NS3_DIR" ]]; then
-    echo "error: $NS3_DIR exists but is not a git checkout" >&2
-    exit 1
-else
-    git clone --depth 1 https://gitlab.com/nsnam/ns-3-dev.git "$NS3_DIR"
-fi
+# Latest pair the 5G-LENA README lists as compatible. Master of each tree
+# has drifted: ns-3's phased-array channel method takes beamforming vectors
+# that current nr master does not pass.
+NS3_TAG="ns-3.48"
+NR_TAG="v5.1"
 
-echo "==> Ensuring 5G-LENA nr module in $NS3_DIR/contrib/nr"
+pin_checkout() {
+    local dir="$1"
+    local tag="$2"
+    local url="$3"
+    if [[ -d "$dir/.git" ]]; then
+        git -C "$dir" fetch --depth 1 origin tag "$tag"
+        git -C "$dir" checkout -f "$tag"
+    elif [[ -e "$dir" ]]; then
+        echo "error: $dir exists but is not a git checkout" >&2
+        exit 1
+    else
+        git clone --depth 1 --branch "$tag" "$url" "$dir"
+    fi
+    echo "    $dir at $(git -C "$dir" describe --tags --always)"
+}
+
+echo "==> Checking out ns-3 $NS3_TAG into $NS3_DIR"
+pin_checkout "$NS3_DIR" "$NS3_TAG" https://gitlab.com/nsnam/ns-3-dev.git
+
+echo "==> Checking out 5G-LENA nr $NR_TAG into $NS3_DIR/contrib/nr"
 mkdir -p "$NS3_DIR/contrib"
-if [[ -d "$NS3_DIR/contrib/nr/.git" ]]; then
-    echo "    already present, skipping clone"
-elif [[ -e "$NS3_DIR/contrib/nr" ]]; then
-    echo "error: $NS3_DIR/contrib/nr exists but is not a git checkout" >&2
-    exit 1
-else
-    git clone --depth 1 https://gitlab.com/cttc-lena/nr.git "$NS3_DIR/contrib/nr"
-fi
+pin_checkout "$NS3_DIR/contrib/nr" "$NR_TAG" https://gitlab.com/cttc-lena/nr.git
 
 echo "==> Symlinking scratch scenario into ns-3 scratch/"
 mkdir -p "$NS3_DIR/scratch"
@@ -155,30 +163,6 @@ rel_target="$(realpath --relative-to="$(dirname "$SCENARIO_LINK")" "$SCENARIO_SR
 ln -sfn "$rel_target" "$SCENARIO_LINK"
 echo "    $SCENARIO_LINK -> $rel_target"
 
-# Local ns-3 fixes shipped with this repo (idempotent).
-apply_ns3_patch() {
-    local patch="$1"
-    local name
-    name="$(basename "$patch")"
-    if [[ ! -f "$patch" ]]; then
-        echo "error: missing patch: $patch" >&2
-        exit 1
-    fi
-    if git -C "$NS3_DIR" apply --reverse --check "$patch" >/dev/null 2>&1; then
-        echo "    already applied: $name"
-    elif git -C "$NS3_DIR" apply --check "$patch" >/dev/null 2>&1; then
-        git -C "$NS3_DIR" apply "$patch"
-        echo "    applied: $name"
-    else
-        echo "error: cannot apply $patch (tree may have diverged)" >&2
-        exit 1
-    fi
-}
-
-echo "==> Applying local ns-3 patches"
-apply_ns3_patch "$ROOT_DIR/ns3-icmp-no-route-recursion.patch"
-apply_ns3_patch "$ROOT_DIR/ns3-ping-seq-on-failed-send.patch"
-
 echo "==> Configuring and building ns-3 (optimized; examples off)"
 echo "    this can take several minutes to around an hour depending on hardware"
 cd "$NS3_DIR"
@@ -191,12 +175,12 @@ if [[ "$SKIP_VERIFY" -eq 1 ]]; then
     echo "==> Skipping smoke test (--skip-verify)"
 else
     echo "==> Smoke-testing sat-bs-handset (short run)"
-    # Defaults are 120 s; keep the smoke test short but long enough for attach + a few replies.
-    ./ns3 run "sat-bs-handset --simTime=20 --warmUp=8 --appDrain=2 --dataRate=1Mbps"
+    # Full defaults are 120 s; smoke.json is long enough for attach plus a few replies.
+    ./ns3 run "sat-bs-handset --config=scratch/sat-bs-handset/config/smoke.json"
     echo "    smoke test passed"
 fi
 
 echo
 echo "Setup complete. Next:"
 echo "  cd \"${NS3_DIR}\" && ./ns3 run sat-bs-handset"
-echo "  # useful knobs: --simTime --satAltitudeKm --dataRate --computeDelayUs --realisticPower"
+echo "  # edit scratch/sat-bs-handset/config/config.json"

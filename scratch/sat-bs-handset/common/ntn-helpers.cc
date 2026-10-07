@@ -10,43 +10,45 @@ namespace ns3
 {
 
 void
-ApplyBackhaulPreset(double& frequencyHz,
+ApplyBentPipePreset(double& frequencyHz,
                     double& bandwidthHz,
                     double& satEIRP,
-                    double& groundTxPower,
-                    double& satAntennaGainDb,
-                    double& vsatAntennaGainDb,
-                    double& satNoiseFigureDb)
+                    double& ueTxPower,
+                    double& ueAntennaGainDb,
+                    double& gnbAntennaGainDb,
+                    double& gnbNoiseFigureDb)
 {
     frequencyHz = 20e9;
     bandwidthHz = 400e6;
     satEIRP = 20;
-    groundTxPower = 40;
-    satAntennaGainDb = 38.5;
-    vsatAntennaGainDb = 50;
-    satNoiseFigureDb = 5.0;
+    ueTxPower = 40;
+    ueAntennaGainDb = 38.5;
+    gnbAntennaGainDb = 50;
+    gnbNoiseFigureDb = 5.0;
 }
 
 void
-UpdateGnbAntennaTowardSat(Ptr<Node> gnbNode,
-                          Ptr<Node> satNode,
-                          Ptr<UniformPlanarArray> ant,
-                          Time period)
+UpdateAntennaToward(Ptr<Node> observer,
+                    Ptr<Node> target,
+                    Ptr<UniformPlanarArray> ant,
+                    Time period)
 {
-    const Vector satEcef = satNode->GetObject<MobilityModel>()->GetPosition();
-    const Vector gnbEcef = gnbNode->GetObject<MobilityModel>()->GetPosition();
-    const Vector gnbGeo =
-        GeographicPositions::CartesianToGeographicCoordinates(gnbEcef, GeographicPositions::SPHERE);
-    const Vector satGeo =
-        GeographicPositions::CartesianToGeographicCoordinates(satEcef, GeographicPositions::SPHERE);
-    const Vector enu =
-        GeographicPositions::GeographicToTopocentricCoordinates(satGeo,
-                                                                gnbGeo,
-                                                                GeographicPositions::SPHERE);
+    const Vector observerEcef = observer->GetObject<MobilityModel>()->GetPosition();
+    const Vector targetEcef = target->GetObject<MobilityModel>()->GetPosition();
+    const Vector observerGeo = GeographicPositions::CartesianToGeographicCoordinates(
+        observerEcef,
+        GeographicPositions::SPHERE);
+    const Vector targetGeo = GeographicPositions::CartesianToGeographicCoordinates(
+        targetEcef,
+        GeographicPositions::SPHERE);
+    const Vector enu = GeographicPositions::GeographicToTopocentricCoordinates(
+        targetGeo,
+        observerGeo,
+        GeographicPositions::SPHERE);
     const Angles angles(enu);
     ant->SetAlpha(angles.GetAzimuth());
     ant->SetBeta(angles.GetInclination());
-    Simulator::Schedule(period, &UpdateGnbAntennaTowardSat, gnbNode, satNode, ant, period);
+    Simulator::Schedule(period, &UpdateAntennaToward, observer, target, ant, period);
 }
 
 } // namespace ns3

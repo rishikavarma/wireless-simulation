@@ -1,32 +1,73 @@
 #include "common/ntn-helpers.h"
+#include "topology/bent-pipe-channel.h"
 #include "topology/nr-ntn-feeder.h"
 
+#include "ns3/boolean.h"
+#include "ns3/channel-condition-model.h"
 #include "ns3/ideal-beamforming-helper.h"
 #include "ns3/internet-module.h"
 #include "ns3/isotropic-antenna-model.h"
 #include "ns3/nr-gnb-net-device.h"
+#include "ns3/nr-gnb-phy.h"
 #include "ns3/nr-module.h"
+#include "ns3/nr-spectrum-phy.h"
+#include "ns3/nr-ue-phy.h"
+#include "ns3/pointer.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/three-gpp-propagation-loss-model.h"
 
 #include <cmath>
+#include <iostream>
 
 namespace ns3
 {
 
+Ptr<ThreeGppPropagationLossModel>
+MakeNtnHopLoss(const std::string& scenario, double frequencyHz)
+{
+    Ptr<ThreeGppPropagationLossModel> hop;
+    if (scenario == "NTN-Rural")
+    {
+        hop = CreateObject<ThreeGppNTNRuralPropagationLossModel>();
+    }
+    else if (scenario == "NTN-Suburban")
+    {
+        hop = CreateObject<ThreeGppNTNSuburbanPropagationLossModel>();
+    }
+    else if (scenario == "NTN-Urban")
+    {
+        hop = CreateObject<ThreeGppNTNUrbanPropagationLossModel>();
+    }
+    else if (scenario == "NTN-DenseUrban")
+    {
+        hop = CreateObject<ThreeGppNTNDenseUrbanPropagationLossModel>();
+    }
+    else
+    {
+        NS_ABORT_MSG("bent-pipe hop loss needs an NTN scenario, got " << scenario);
+    }
+    hop->SetFrequency(frequencyHz);
+    hop->SetAttribute("ShadowingEnabled", BooleanValue(false));
+    hop->SetAttribute("ChannelConditionModel",
+                      PointerValue(CreateObject<AlwaysLosChannelConditionModel>()));
+    return hop;
+}
+
 NrFeederResult
-InstallNrNtnFeeder(Ptr<Node> satellite,
-                   Ptr<Node> baseStation,
-                   double frequencyHz,
-                   double bandwidthHz,
-                   const std::string& ntnScenario,
-                   double satEIRP,
-                   double groundTxPower,
-                   double satAntennaGainDb,
-                   double vsatAntennaGainDb,
-                   double satNoiseFigureDb,
-                   bool realisticPower,
-                   bool nrTraces,
-                   Time antennaPeriod)
+InstallNrNtnBentPipe(Ptr<Node> ue,
+                     Ptr<Node> baseStation,
+                     Ptr<Node> satellite,
+                     double frequencyHz,
+                     double bandwidthHz,
+                     const std::string& ntnScenario,
+                     double satEIRP,
+                     double ueTxPower,
+                     double ueAntennaGainDb,
+                     double gnbAntennaGainDb,
+                     double gnbNoiseFigureDb,
+                     bool realisticPower,
+                     bool nrTraces,
+                     Time antennaPeriod)
 {
     NrFeederResult out;
     out.epcHelper = CreateObject<NrPointToPointEpcHelper>();
@@ -56,13 +97,12 @@ InstallNrNtnFeeder(Ptr<Node> satellite,
     const double ueArrayFactorDb = 10 * std::log10(ueNumRows * ueNumCols);
     const double gnbArrayFactorDb = 10 * std::log10(gnbNumRows * gnbNumCols);
 
-    // Sat is NR UE → UE array; BS is gNB → gNB array.
-    double satElementGainDb = satAntennaGainDb;
-    double gnbElementGainDb = vsatAntennaGainDb;
+    double ueElementGainDb = ueAntennaGainDb;
+    double gnbElementGainDb = gnbAntennaGainDb;
     if (realisticPower)
     {
-        satElementGainDb = satAntennaGainDb - ueArrayFactorDb;
-        gnbElementGainDb = vsatAntennaGainDb - gnbArrayFactorDb;
+        ueElementGainDb = ueAntennaGainDb - ueArrayFactorDb;
+        gnbElementGainDb = gnbAntennaGainDb - gnbArrayFactorDb;
     }
 
     out.nrHelper->SetUeAntennaTypeId("ns3::UniformPlanarArray");
@@ -74,7 +114,7 @@ InstallNrNtnFeeder(Ptr<Node> satellite,
         "AntennaElement",
         PointerValue(CreateObjectWithAttributes<IsotropicAntennaModel>(
             "Gain",
-            DoubleValue(satElementGainDb))));
+            DoubleValue(ueElementGainDb))));
 
     out.nrHelper->SetGnbAntennaTypeId("ns3::UniformPlanarArray");
     out.nrHelper->SetGnbAntennaAttribute("IsDualPolarized", BooleanValue(true));
@@ -88,28 +128,38 @@ InstallNrNtnFeeder(Ptr<Node> satellite,
 
     NodeContainer gnbNodes;
     gnbNodes.Add(baseStation);
-    NodeContainer satNrNodes;
-    satNrNodes.Add(satellite);
+    NodeContainer ueNodes;
+    ueNodes.Add(ue);
+
+    Ptr<MobilityModel> gnbMob = baseStation->GetObject<MobilityModel>();
+    Ptr<MobilityModel> ueMob = ue->GetObject<MobilityModel>();
+    Ptr<MobilityModel> satMob = satellite->GetObject<MobilityModel>();
+    const double oneWayS =
+        (gnbMob->GetDistanceFrom(satMob) + ueMob->GetDistanceFrom(satMob)) / 299792458.0;
+    // Handset slots start one light-time late, so a gNB transmission arrives
+    // as that handset slot begins.
+    NrUePhy::SetOneWayDelay(Seconds(oneWayS));
 
     out.gnbNetDev = out.nrHelper->InstallGnbDevice(gnbNodes, allBwps);
-    out.satNrNetDev = out.nrHelper->InstallUeDevice(satNrNodes, allBwps);
+    out.ueNrNetDev = out.nrHelper->InstallUeDevice(ueNodes, allBwps);
 
     int64_t randomStream = 1;
     randomStream += out.nrHelper->AssignStreams(out.gnbNetDev, randomStream);
-    randomStream += out.nrHelper->AssignStreams(out.satNrNetDev, randomStream);
+    randomStream += out.nrHelper->AssignStreams(out.ueNrNetDev, randomStream);
 
+    // Transparent bent-pipe link budget: gNB Tx modeled from satellite EIRP density.
     double gnbTxPower = (satEIRP + 30) + (10 * std::log10(bandwidthHz / 1e6));
     if (realisticPower)
     {
-        gnbTxPower -= vsatAntennaGainDb;
+        gnbTxPower -= gnbAntennaGainDb;
     }
     NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->SetTxPower(gnbTxPower);
-    NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->SetNoiseFigure(satNoiseFigureDb);
+    NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->SetNoiseFigure(gnbNoiseFigureDb);
 
-    double satUeTxPower = realisticPower ? groundTxPower : gnbTxPower;
-    NrHelper::GetUePhy(out.satNrNetDev.Get(0), 0)->SetTxPower(satUeTxPower);
+    double uplinkTxPower = realisticPower ? ueTxPower : gnbTxPower;
+    NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 0)->SetTxPower(uplinkTxPower);
 
-    // Dual-home the BS to the PGW so the gateway can reach the sat NR UE IP.
+    // Dual-home the BS to the PGW so a BS app can answer UE traffic through EPC.
     Ptr<Node> pgw = out.epcHelper->GetPgwNode();
     PointToPointHelper p2ph;
     p2ph.SetDeviceAttribute("DataRate", StringValue("100Gb/s"));
@@ -119,13 +169,13 @@ InstallNrNtnFeeder(Ptr<Node> satellite,
 
     InternetStackHelper internet;
     internet.SetIpv6StackInstall(false);
-    // gNB already has a stack from the EPC helper; install on the satellite NR UE.
-    internet.Install(satellite);
+    // The ground gNB already has a stack from the EPC helper.
+    internet.Install(ue);
 
     Ipv4AddressHelper ipv4h;
     ipv4h.SetBase("1.0.0.0", "255.0.0.0");
     Ipv4InterfaceContainer bsPgwIf = ipv4h.Assign(bsPgwDevs);
-    out.bsCoreAddr = bsPgwIf.GetAddress(1);
+    out.bsAddr = bsPgwIf.GetAddress(1);
 
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4> bsIpv4 = baseStation->GetObject<Ipv4>();
@@ -136,20 +186,66 @@ InstallNrNtnFeeder(Ptr<Node> satellite,
                                      Ipv4Mask("255.0.0.0"),
                                      bsCoreIface);
 
-    Ipv4InterfaceContainer satNrIf = out.epcHelper->AssignUeIpv4Address(out.satNrNetDev);
-    out.satAddr = satNrIf.GetAddress(0);
+    Ipv4InterfaceContainer ueNrIf = out.epcHelper->AssignUeIpv4Address(out.ueNrNetDev);
+    out.ueAddr = ueNrIf.GetAddress(0);
 
-    Ptr<Ipv4StaticRouting> satStaticRouting =
-        ipv4RoutingHelper.GetStaticRouting(satellite->GetObject<Ipv4>());
-    satStaticRouting->SetDefaultRoute(out.epcHelper->GetUeDefaultGatewayAddress(), 1);
+    Ptr<Ipv4StaticRouting> ueStaticRouting =
+        ipv4RoutingHelper.GetStaticRouting(ue->GetObject<Ipv4>());
+    ueStaticRouting->SetDefaultRoute(out.epcHelper->GetUeDefaultGatewayAddress(), 1);
 
-    out.nrHelper->AttachToClosestGnb(out.satNrNetDev, out.gnbNetDev);
+    out.nrHelper->AttachToClosestGnb(out.ueNrNetDev, out.gnbNetDev);
 
-    auto gnbNetDevice = out.gnbNetDev.Get(0)->GetObject<NrGnbNetDevice>();
-    auto gnbAntenna =
-        gnbNetDevice->GetPhy(0)->GetSpectrumPhy()->GetAntenna()->GetObject<UniformPlanarArray>();
+    // The NR helper's channel only sees the two ground endpoints. Replace that
+    // budget with feeder hop + service hop through the satellite.
+    Ptr<NrSpectrumPhy> gnbSpectrum =
+        NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->GetSpectrumPhy();
+    Ptr<SpectrumChannel> channel = gnbSpectrum->GetSpectrumChannel();
+    Ptr<ThreeGppPropagationLossModel> hopLoss = MakeNtnHopLoss(ntnScenario, frequencyHz);
+    const double gnbGainDb = gnbElementGainDb + gnbArrayFactorDb;
+    const double ueGainDb = ueElementGainDb + ueArrayFactorDb;
+    const double satEirpDbm = (satEIRP + 30.0) + (10.0 * std::log10(bandwidthHz / 1e6));
+    const double feederLossDb = -hopLoss->CalcRxPower(0.0, gnbMob, satMob);
+    // Fixed transponder gain: forward EIRP equals the configured satellite EIRP.
+    const double relayGainDb = satEirpDbm - gnbTxPower - gnbGainDb + feederLossDb;
+    const double serviceLossDb = -hopLoss->CalcRxPower(0.0, ueMob, satMob);
+    std::cout << "config bent-pipe feederLossDb=" << feederLossDb
+              << " serviceLossDb=" << serviceLossDb << " relayGainDb=" << relayGainDb
+              << " oneWayDelayS=" << oneWayS << '\n';
+
+    Ptr<BentPipePropagationLossModel> bentPipeLoss = CreateObject<BentPipePropagationLossModel>();
+    bentPipeLoss->Configure(gnbMob, ueMob, satMob, hopLoss, gnbGainDb, ueGainDb, relayGainDb);
+    channel->SetAttribute("PropagationLossModel", PointerValue(bentPipeLoss));
+
+    Ptr<PhasedArraySpectrumPropagationLossModel> installedFading =
+        channel->GetPhasedArraySpectrumPropagationLossModel();
+    NS_ABORT_MSG_IF(!installedFading, "NR channel has no phased-array fading model");
+    installedFading->SetNext(CreateObject<BentPipeFlatSpectrumModel>());
+
+    Ptr<BentPipeDelayModel> bentPipeDelay = CreateObject<BentPipeDelayModel>();
+    bentPipeDelay->SetDelay(Seconds(oneWayS));
+    channel->SetPropagationDelayModel(bentPipeDelay);
+
+    Ptr<NrGnbNetDevice> gnbDev = DynamicCast<NrGnbNetDevice>(out.gnbNetDev.Get(0));
+    Ptr<NrGnbPhy> gnbPhy = gnbDev->GetPhy(0);
+    const double slotS = gnbPhy->GetSlotPeriod().GetSeconds();
+    const uint32_t rttSlots =
+        static_cast<uint32_t>(std::ceil((2.0 * oneWayS) / slotS)) + 8;
+    gnbPhy->SetN1Delay(rttSlots);
+    gnbPhy->SetN2Delay(rttSlots);
+
+    auto gnbAntenna = gnbSpectrum->GetAntenna()->GetObject<UniformPlanarArray>();
     baseStation->AggregateObject(gnbAntenna);
-    UpdateGnbAntennaTowardSat(baseStation, satellite, gnbAntenna, antennaPeriod);
+    UpdateAntennaToward(baseStation, satellite, gnbAntenna, antennaPeriod);
+
+    auto ueAntenna = NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 0)
+                         ->GetSpectrumPhy()
+                         ->GetAntenna()
+                         ->GetObject<UniformPlanarArray>();
+    ue->AggregateObject(ueAntenna);
+    UpdateAntennaToward(ue, satellite, ueAntenna, antennaPeriod);
+
+    out.phyMetrics = Create<NrPhyMetricsCollector>();
+    out.phyMetrics->Connect(out.ueNrNetDev.Get(0), out.gnbNetDev.Get(0));
 
     if (nrTraces)
     {

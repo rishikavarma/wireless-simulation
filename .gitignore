@@ -2,12 +2,9 @@
 # match a symlink, so keep the bare name.
 ns-3-dev
 
-# Local / generated outputs
+# Local / generated outputs.
+# Periodic traces: results/<output.prefix>/ from config.json.
 results/
-datasets/
-plots/
-summary.csv
-**/metrics.csv
 
 # Editor / OS
 .DS_Store

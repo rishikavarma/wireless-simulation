@@ -1,17 +1,23 @@
-# Multi-file sat-bs-handset scenario.
-# Layout is role-based so more UEs / base stations can land in ue/ and bs/
-# without flattening the tree. Nested .cc files require this CMakeLists
-# (ns-3's default scratch GLOB only sees top-level sources).
+# Multi-file sat-bs-handset scenario (transparent NTN bent-pipe).
+# Nested .cc files require this CMakeLists (ns-3's default scratch GLOB only
+# sees top-level sources).
 
 set(sat_bs_handset_sources
   sat-bs-handset.cc
-  ue/ue-offload-client.cc
-  bs/bs-offload-gateway.cc
-  satellite/sat-compute-server.cc
+  ue/ue-tcp-client.cc
+  bs/bs-echo-server.cc
+  common/json.cc
+  common/tcp-pipe.cc
+  common/sim-config.cc
+  common/app-config.cc
   common/ntn-helpers.cc
+  metrics/phy-metrics.cc
+  metrics/ue-metrics.cc
+  metrics/bs-metrics.cc
+  metrics/metrics-report.cc
   topology/mobility.cc
+  topology/bent-pipe-channel.cc
   topology/nr-ntn-feeder.cc
-  topology/wifi-access.cc
 )
 
 get_scratch_prefix(sat_bs_handset_prefix)
@@ -24,7 +30,7 @@ build_exec(
   EXECUTABLE_DIRECTORY_PATH ${CMAKE_OUTPUT_DIRECTORY}/scratch/sat-bs-handset
 )
 
-# Includes use paths from the scenario root, e.g. "ue/ue-offload-client.h".
+# Includes use paths from the scenario root, e.g. "ue/ue-tcp-client.h".
 target_include_directories(
   ${sat_bs_handset_prefix}sat-bs-handset
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}

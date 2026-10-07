@@ -1,5 +1,5 @@
 /*
- * Mobility installers for satellite, base station(s), and UE(s).
+ * Mobility installers for the LEO satellite (geometry), ground BS, and UE(s).
  * Call once per node (or extend to NodeContainers) when scaling the scenario.
  */
 
@@ -19,7 +19,9 @@ void InstallSatelliteMobility(Ptr<Node> satellite,
                               double satInclinationDeg,
                               Time antennaPeriod);
 
-void InstallBaseStationMobility(Ptr<Node> baseStation, double latitudeDeg, double altitudeM = 25.0);
+void InstallBaseStationMobility(Ptr<Node> baseStation,
+                                Ptr<Node> satellite,
+                                double altitudeM = 25.0);
 
 void InstallUeMobility(Ptr<Node> ue,
                        Ptr<Node> baseStation,

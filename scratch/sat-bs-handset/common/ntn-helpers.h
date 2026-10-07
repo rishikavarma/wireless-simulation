@@ -1,5 +1,5 @@
 /*
- * NTN backhaul presets and gNB antenna tracking toward the LEO satellite.
+ * NTN bent-pipe RF presets and panel tracking toward the LEO satellite.
  */
 
 #ifndef SAT_BS_HANDSET_NTN_HELPERS_H
@@ -17,18 +17,18 @@ class Node;
 constexpr double kSatAltitudeMinKm = 550.0;
 constexpr double kSatAltitudeMaxKm = 1200.0;
 
-void ApplyBackhaulPreset(double& frequencyHz,
+void ApplyBentPipePreset(double& frequencyHz,
                          double& bandwidthHz,
                          double& satEIRP,
-                         double& groundTxPower,
-                         double& satAntennaGainDb,
-                         double& vsatAntennaGainDb,
-                         double& satNoiseFigureDb);
+                         double& ueTxPower,
+                         double& ueAntennaGainDb,
+                         double& gnbAntennaGainDb,
+                         double& gnbNoiseFigureDb);
 
-void UpdateGnbAntennaTowardSat(Ptr<Node> gnbNode,
-                               Ptr<Node> satNode,
-                               Ptr<UniformPlanarArray> ant,
-                               Time period);
+void UpdateAntennaToward(Ptr<Node> observer,
+                         Ptr<Node> target,
+                         Ptr<UniformPlanarArray> ant,
+                         Time period);
 
 } // namespace ns3
 
