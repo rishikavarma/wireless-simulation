@@ -98,12 +98,14 @@ NrPhyMetricsCollector::Recording(Time now) const
 void
 NrPhyMetricsCollector::Connect(Ptr<NetDevice> ueNrDevice, Ptr<NetDevice> gnbDevice)
 {
-    Ptr<NrUePhy> uePhy = NrHelper::GetUePhy(ueNrDevice, 0);
+    constexpr uint16_t dlBwpId = 0;
+    constexpr uint16_t ulBwpId = 1;
+    Ptr<NrUePhy> uePhy = NrHelper::GetUePhy(ueNrDevice, dlBwpId);
     NS_ABORT_MSG_IF(!uePhy, "UE NR PHY missing for SINR traces");
     uePhy->TraceConnectWithoutContext("DlDataSinr",
                                       MakeCallback(&NrPhyMetricsCollector::DlDataSinr, this));
 
-    Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbDevice, 0);
+    Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbDevice, ulBwpId);
     NS_ABORT_MSG_IF(!gnbPhy, "gNB NR PHY missing for SINR traces");
     gnbPhy->TraceConnectWithoutContext("UlSinrTrace",
                                        MakeCallback(&NrPhyMetricsCollector::UlSinr, this));

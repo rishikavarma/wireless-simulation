@@ -4,6 +4,19 @@
 The ns-3 run keeps writing one TCP row every 5 ms. This script reads those
 rows (and optional SINR traces) and writes one token per window. The window
 comes from output.token* in config.json.
+
+Min-RTT aggregation (default):
+  1. Size each window from the **current** min RTT (``rtt_rate * srtt``) at
+     the first sample of the buffer (not locked for the whole flow).
+  2. Accumulate fine-grained samples until wall time >= that window RTT.
+  3. Collapse the buffer with a **time-weighted mean**
+     ``sum(feature * dt) / sum(dt)`` (``lost`` = delta, ``ca_state`` = mode).
+  4. Emit one token; derived ``base_rtt`` is ``rtt_rate * srtt`` on the token.
+
+Set ``output.tokenRttLock`` true to freeze min RTT from the first sample
+(UNUM CC runtime). Set ``tokenRttColumn`` to ``srtt`` to size windows on
+smoothed RTT. ``tokenAggregate`` may be ``weighted`` (default), ``mean``, or
+``last``.
 """
 
 import argparse
@@ -11,6 +24,9 @@ import csv
 import json
 import sys
 from pathlib import Path
+
+
+MINRTT_ALIASES = ("minrtt", "min_rtt", "base_rtt")
 
 
 def load_config(path):
@@ -69,6 +85,27 @@ def mean(values):
     return sum(present) / len(present)
 
 
+def weighted_mean(values, weights):
+    """Time-weighted mean; falls back to unweighted if all weights are zero."""
+    total_w = 0.0
+    total = 0.0
+    present = 0
+    fallback = []
+    for value, weight in zip(values, weights):
+        if value is None:
+            continue
+        fallback.append(value)
+        present += 1
+        if weight > 0:
+            total += float(value) * weight
+            total_w += weight
+    if present == 0:
+        return None
+    if total_w < 1e-15:
+        return sum(fallback) / len(fallback)
+    return total / total_w
+
+
 def most_frequent(values):
     """Most common value. A tie keeps the one that appears latest in the window."""
     present = [value for value in values if value is not None]
@@ -97,79 +134,189 @@ def difference(values):
     return present[-1] - present[0]
 
 
+def window_rtt_units(row, rtt_column):
+    """RTT used to size tokens, in the same Sage units as ``srtt``.
+
+    ``minrtt`` / ``min_rtt`` / ``base_rtt`` resolve to ``rtt_rate * srtt``
+    (minimum RTT). Any other name is read as a plain column on the row.
+    """
+    if rtt_column in MINRTT_ALIASES:
+        srtt = row.get("srtt")
+        rtt_rate = row.get("rtt_rate")
+        if srtt is None or rtt_rate is None:
+            return 0.0
+        return float(rtt_rate) * float(srtt)
+    value = row.get(rtt_column)
+    return 0.0 if value is None else float(value)
+
+
+def sample_dts_s(times_us):
+    """Per-sample dt in seconds (time since previous sample), UNUM-style."""
+    if not times_us:
+        return []
+    dts = []
+    for i, t_us in enumerate(times_us):
+        if i == 0:
+            if len(times_us) > 1:
+                dts.append(max(1e-6, (times_us[1] - t_us) / 1e6))
+            else:
+                dts.append(0.005)
+        else:
+            dts.append(max(1e-6, (t_us - times_us[i - 1]) / 1e6))
+    return dts
+
+
+def collapse_group(group, dts, feature_keys, aggregate, locked_base_rtt_units):
+    """Aggregate one UNUM token from a sample buffer."""
+    start_us = microseconds(group[0]["time_s"])
+    end_us = microseconds(group[-1]["time_s"]) + microseconds(dts[-1])
+    token = {
+        "token": None,  # filled by caller
+        "t_start_s": start_us / 1e6,
+        "t_end_s": end_us / 1e6,
+        "window_s": (end_us - start_us) / 1e6,
+        "n_samples": float(len(group)),
+    }
+    if locked_base_rtt_units is not None:
+        token["base_rtt"] = locked_base_rtt_units
+    for key in feature_keys:
+        series = [row[key] for row in group]
+        if key == "ca_state":
+            token[key] = most_frequent(series)
+        elif key == "lost":
+            token[key] = difference(series)
+        elif aggregate == "last":
+            token[key] = series[-1]
+        elif aggregate == "mean":
+            token[key] = mean(series)
+        else:
+            token[key] = weighted_mean(series, dts)
+    return token
+
+
 def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
     mode = cfg_get(cfg, "output.tokenMode", "rtt")
     fixed_s = float(cfg_get(cfg, "output.tokenFixedS", 0.1))
     min_s = float(cfg_get(cfg, "output.tokenMinS", 0.005))
-    aggregate = cfg_get(cfg, "output.tokenAggregate", "mean")
-    rtt_column = cfg_get(cfg, "output.tokenRttColumn", "srtt")
+    aggregate = cfg_get(cfg, "output.tokenAggregate", "weighted")
+    rtt_column = cfg_get(cfg, "output.tokenRttColumn", "minrtt")
     seconds_per_unit = float(cfg_get(cfg, "output.tokenRttSecondsPerUnit", 0.1))
+    lock_rtt = bool(cfg_get(cfg, "output.tokenRttLock", False))
     if mode not in ("rtt", "fixed"):
         raise SystemExit(f"output.tokenMode must be rtt or fixed, got {mode}")
-    if aggregate not in ("mean", "last"):
-        raise SystemExit(f"output.tokenAggregate must be mean or last, got {aggregate}")
+    if aggregate not in ("weighted", "mean", "last"):
+        raise SystemExit(
+            f"output.tokenAggregate must be weighted, mean, or last, got {aggregate}"
+        )
 
-    tokens = []
-    index = 0
-    count = len(tcp_rows)
     times_us = [microseconds(row["time_s"]) for row in tcp_rows]
+    dts = sample_dts_s(times_us)
+    tokens = []
+    count = len(tcp_rows)
+
+    if mode == "fixed":
+        # Fixed wall-clock windows (legacy); still use configured aggregate.
+        index = 0
+        while index < count:
+            start_us = times_us[index]
+            end_us = start_us + microseconds(fixed_s)
+            group = []
+            group_dts = []
+            while index < count and times_us[index] < end_us:
+                group.append(tcp_rows[index])
+                group_dts.append(dts[index])
+                index += 1
+            if not group:
+                index += 1
+                continue
+            token = collapse_group(group, group_dts, feature_keys, aggregate, None)
+            token["token"] = float(len(tokens))
+            token["t_end_s"] = end_us / 1e6
+            token["window_s"] = (end_us - start_us) / 1e6
+            if "sinr_dl_db" not in feature_keys:
+                token["sinr_dl_db"] = hold_last(sinr_dl, end_us)
+                token["sinr_ul_db"] = hold_last(sinr_ul, end_us)
+            tokens.append(token)
+        return tokens
+
+    # RTT mode — UNUM: accumulate until locked (or per-window) base RTT.
+    locked_units = None
+    locked_window_s = None
+    buffer = []
+    buffer_dts = []
+    accumulated_s = 0.0
+    index = 0
     while index < count:
-        start_us = times_us[index]
-        if mode == "fixed":
-            window_s = fixed_s
-        else:
-            rtt_value = tcp_rows[index].get(rtt_column) or 0.0
-            window_s = max(min_s, rtt_value * seconds_per_unit)
-        end_us = start_us + microseconds(window_s)
-        group = []
-        while index < count and times_us[index] < end_us:
-            group.append(tcp_rows[index])
-            index += 1
-        if not group:
-            index += 1
-            continue
-        token = {
-            "token": float(len(tokens)),
-            "t_start_s": start_us / 1e6,
-            "t_end_s": end_us / 1e6,
-            "window_s": (end_us - start_us) / 1e6,
-            "n_samples": float(len(group)),
-        }
-        for key in feature_keys:
-            series = [row[key] for row in group]
-            if key == "ca_state":
-                token[key] = most_frequent(series)
-            elif key == "lost":
-                token[key] = difference(series)
+        row = tcp_rows[index]
+        dt = dts[index]
+        if locked_units is None or not lock_rtt:
+            units = window_rtt_units(row, rtt_column)
+            window_s = max(min_s, units * seconds_per_unit) if units > 0 else min_s
+            if lock_rtt:
+                locked_units = units if units > 0 else (min_s / seconds_per_unit)
+                locked_window_s = window_s
             else:
-                token[key] = series[-1] if aggregate == "last" else mean(series)
-        if "sinr_dl_db" not in feature_keys:
-            token["sinr_dl_db"] = hold_last(sinr_dl, end_us)
-            token["sinr_ul_db"] = hold_last(sinr_ul, end_us)
-        tokens.append(token)
+                # Re-size every token from the first sample of the new buffer.
+                if not buffer:
+                    locked_units = units if units > 0 else (min_s / seconds_per_unit)
+                    locked_window_s = window_s
+        target_s = locked_window_s if locked_window_s is not None else min_s
+
+        buffer.append(row)
+        buffer_dts.append(dt)
+        accumulated_s += dt
+        index += 1
+
+        if accumulated_s + 1e-15 >= target_s:
+            end_us = microseconds(buffer[-1]["time_s"])
+            # When unlocked, still record this window's minrtt as base_rtt.
+            token_base = locked_units if locked_units is not None else None
+            token = collapse_group(
+                buffer, buffer_dts, feature_keys, aggregate, token_base
+            )
+            token["token"] = float(len(tokens))
+            # Report the target window length UNUM aimed for (not just span of samples).
+            token["window_s"] = target_s
+            token["t_end_s"] = token["t_start_s"] + target_s
+            if "sinr_dl_db" not in feature_keys:
+                token["sinr_dl_db"] = hold_last(sinr_dl, end_us)
+                token["sinr_ul_db"] = hold_last(sinr_ul, end_us)
+            tokens.append(token)
+            buffer = []
+            buffer_dts = []
+            accumulated_s = 0.0
+            if not lock_rtt:
+                locked_units = None
+                locked_window_s = None
+
+    # Drop a trailing partial window (UNUM only emits when the base-RTT budget fills).
     return tokens
 
 
 def write_tokens(path, tokens, feature_keys, cfg):
     mode = cfg_get(cfg, "output.tokenMode", "rtt")
-    aggregate = cfg_get(cfg, "output.tokenAggregate", "mean")
-    extra = [] if "sinr_dl_db" in feature_keys else ["sinr_dl_db", "sinr_ul_db"]
-    header = [
-        "token",
-        "t_start_s",
-        "t_end_s",
-        "window_s",
-        "n_samples",
-        *feature_keys,
-        *extra,
-    ]
+    aggregate = cfg_get(cfg, "output.tokenAggregate", "weighted")
+    rtt_column = cfg_get(cfg, "output.tokenRttColumn", "minrtt")
+    lock_rtt = bool(cfg_get(cfg, "output.tokenRttLock", False))
+    extra = []
+    if tokens and "base_rtt" in tokens[0] and "base_rtt" not in feature_keys:
+        extra.append("base_rtt")
+    if "sinr_dl_db" not in feature_keys:
+        extra.extend(["sinr_dl_db", "sinr_ul_db"])
+    # Stable header: meta, optional locked base_rtt, sage features, sinr.
+    header = ["token", "t_start_s", "t_end_s", "window_s", "n_samples"]
+    if "base_rtt" in extra:
+        header.append("base_rtt")
+    header.extend(feature_keys)
+    header.extend([k for k in extra if k != "base_rtt"])
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(
-            f"# One token per window. mode={mode} aggregate={aggregate}. "
-            "lost is the increase in cumulative lost over the window. "
-            "ca_state is the most frequent value in the window. "
-            "SINR on a Sage row is already the latest report at that tick.\n"
+            f"# One token per window. mode={mode} aggregate={aggregate} "
+            f"rtt_column={rtt_column} lock_rtt={bool(lock_rtt)}. "
+            "minrtt windows use current rtt_rate*srtt unless lock_rtt; "
+            "time-weighted mean (lost=delta, ca_state=mode). "
+            "SINR is hold-last at the last sample in the window.\n"
         )
         writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
         writer.writeheader()

@@ -30,6 +30,10 @@ struct ScenarioConfig
     std::string ntnScenario{"NTN-Rural"};
     double frequencyHz{0.0};
     double bandwidthHz{0.0};
+    double dlFrequencyHz{0.0};
+    double ulFrequencyHz{0.0};
+    double dlBandwidthHz{0.0};
+    double ulBandwidthHz{0.0};
     double satEIRP{0.0};
     double ueTxPower{0.0};
     double ueAntennaGainDb{0.0};

@@ -2,11 +2,11 @@
  * UE application client. Every workload is a TCP byte stream to the BS.
  *
  * Workloads (config.json application.workload):
- *   probe  — paced messages, traffic cbr|onoff|bursty
- *   file   — bulk upload; BS ACKs each chunk
- *   rpc    — closed-loop request/response
- *   stream — paced chunks
- *   iot    — small periodic uplink reports
+ *   probe  — cbr, exponential ON/OFF, or Pareto-bursty with Poisson packets
+ *   file   — truncated log-normal files, exponential reading time, Poisson chunks
+ *   rpc    — WAP page: Pareto objects, geometric count, exponential gaps
+ *   stream — video frames with truncated-Pareto slice size and spacing
+ *   iot    — Poisson reports with a uniform payload
  */
 
 #ifndef SAT_BS_HANDSET_UE_TCP_CLIENT_H
@@ -20,6 +20,7 @@
 #include "ns3/event-id.h"
 #include "ns3/ipv4-address.h"
 #include "ns3/ptr.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/socket.h"
 
 #include <cstdint>
@@ -64,8 +65,11 @@ class UeTcpClient : public Application
     void EnterOn();
     void EnterOff();
     void SendProbe();
+    void BeginFile();
     void SendFileChunk();
+    void StartRpcPage();
     void SendRpc();
+    void StartFrame();
     void SendStreamChunk();
     void SendIot();
     void HandleReply(Ptr<Socket> socket);
@@ -73,11 +77,20 @@ class UeTcpClient : public Application
 
     bool Transmit(const std::vector<uint8_t>& body, SendResume resume);
     Time RateInterval(uint32_t bytes) const;
+    Time Exponential(double meanSeconds);
+    Time ProbeGap(uint32_t bytes);
+    Time OnDuration();
+    Time OffDuration();
+    uint64_t SampleFileSize();
+    uint32_t SampleParetoInt(double scale, double shape, double maxValue, uint32_t floor);
+    uint32_t SampleObjectCount();
+    uint32_t SampleIotSize();
     std::vector<uint8_t> MakeBody(AppMsgType type,
                                   uint64_t seq,
                                   uint32_t totalSize,
                                   uint32_t param0,
-                                  uint32_t param1);
+                                  uint32_t param1,
+                                  uint16_t flags = 0);
 
     Ipv4Address m_serverAddr;
     uint16_t m_serverPort{0};
@@ -88,7 +101,7 @@ class UeTcpClient : public Application
     bool m_sending{false};
     bool m_sendBlocked{false};
     bool m_rpcInFlight{false};
-    bool m_fileDone{false};
+    bool m_fileGapPending{false};
     SendResume m_resume{SendResume::None};
     uint32_t m_resumeBytes{0};
 
@@ -98,12 +111,22 @@ class UeTcpClient : public Application
     TcpPipe m_pipe;
     UeMetrics m_metrics;
 
+    uint16_t m_fileId{0};
+    uint64_t m_filesCompleted{0};
+    uint64_t m_fileSizeThis{0};
     uint64_t m_fileChunksTotal{0};
     uint64_t m_fileNextChunk{0};
     uint64_t m_fileBytesQueued{0};
     std::unordered_set<uint64_t> m_fileAcked;
 
+    uint32_t m_rpcObjectsLeft{0};
     uint64_t m_rpcCompleted{0};
+    uint32_t m_slicesLeft{0};
+
+    Ptr<ExponentialRandomVariable> m_exponential;
+    Ptr<LogNormalRandomVariable> m_lognormal;
+    Ptr<ParetoRandomVariable> m_pareto;
+    Ptr<UniformRandomVariable> m_uniform;
 };
 
 } // namespace ns3

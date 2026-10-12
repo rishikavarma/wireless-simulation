@@ -1,5 +1,6 @@
 #include "topology/bent-pipe-channel.h"
 
+#include "ns3/abort.h"
 #include "ns3/log.h"
 #include "ns3/mobility-model.h"
 #include "ns3/node.h"
@@ -8,6 +9,11 @@
 
 namespace ns3
 {
+
+namespace
+{
+constexpr double kSpeedOfLightMps = 299792458.0;
+}
 
 NS_LOG_COMPONENT_DEFINE("BentPipeChannel");
 
@@ -86,15 +92,59 @@ BentPipeDelayModel::GetTypeId()
 }
 
 void
-BentPipeDelayModel::SetDelay(Time delay)
+BentPipeDelayModel::Configure(Ptr<MobilityModel> gnb,
+                              Ptr<MobilityModel> ue,
+                              Ptr<MobilityModel> satellite)
 {
-    m_delay = delay;
+    NS_ABORT_MSG_IF(!gnb || !ue || !satellite,
+                    "BentPipeDelayModel needs gNB, UE, and satellite mobility");
+    m_gnb = gnb;
+    m_ue = ue;
+    m_satellite = satellite;
+}
+
+Time
+BentPipeDelayModel::GetFeederDelay() const
+{
+    NS_ABORT_MSG_IF(!m_gnb || !m_satellite, "BentPipeDelayModel is not configured");
+    return Seconds(m_gnb->GetDistanceFrom(m_satellite) / kSpeedOfLightMps);
+}
+
+Time
+BentPipeDelayModel::GetServiceDelay() const
+{
+    NS_ABORT_MSG_IF(!m_ue || !m_satellite, "BentPipeDelayModel is not configured");
+    return Seconds(m_ue->GetDistanceFrom(m_satellite) / kSpeedOfLightMps);
+}
+
+Time
+BentPipeDelayModel::GetCurrentDelay() const
+{
+    return GetFeederDelay() + GetServiceDelay();
+}
+
+Time
+BentPipeDelayModel::GetCommonTimingAdvance() const
+{
+    return GetFeederDelay() * 2;
+}
+
+Time
+BentPipeDelayModel::GetUeSpecificTimingAdvance() const
+{
+    return GetServiceDelay() * 2;
+}
+
+Time
+BentPipeDelayModel::GetTotalTimingAdvance() const
+{
+    return GetCurrentDelay() * 2;
 }
 
 Time
 BentPipeDelayModel::GetDelay(Ptr<MobilityModel> /*a*/, Ptr<MobilityModel> /*b*/) const
 {
-    return m_delay;
+    return GetCurrentDelay();
 }
 
 int64_t

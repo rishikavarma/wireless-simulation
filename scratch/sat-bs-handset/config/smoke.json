@@ -2,7 +2,7 @@
   "time": {
     "simTime": 20,
     "warmUp": 8,
-    "appDrain": 2,
+    "appDrain": 5,
     "measureStart": 5,
     "measureEnd": 1
   },
@@ -15,6 +15,10 @@
     "ntnScenario": "NTN-Rural",
     "frequencyHz": 20e9,
     "bandwidthHz": 400e6,
+    "dlFrequencyHz": 20e9,
+    "ulFrequencyHz": 30e9,
+    "dlBandwidthHz": 400e6,
+    "ulBandwidthHz": 400e6,
     "satEIRP": 20,
     "ueTxPower": 40,
     "ueAntennaGainDb": 38.5,
@@ -30,26 +34,46 @@
   "application": {
     "workload": "probe",
     "serverPort": 9,
-    "dataRate": "1Mbps",
+    "dataRate": "100kbps",
     "packetSize": 1400,
+    "tcpVariant": "TcpNewReno",
+    "queueSizeBdp": 2,
+    "aqm": "DropTail",
     "probe": {
-      "traffic": "cbr",
+      "traffic": "onoff",
       "onTime": "1s",
-      "offTime": "1s"
+      "offTime": "1s",
+      "burstShape": 1.5
     },
     "file": {
-      "fileSize": 1048576
+      "sizeMu": 14.45,
+      "sizeSigma": 0.35,
+      "sizeMax": 5000000,
+      "readingMean": "5s"
     },
     "rpc": {
-      "reqSize": 256,
-      "respSize": 4096,
+      "reqSize": 76,
+      "objectScale": 71.7,
+      "objectShape": 1.1,
+      "objectMax": 1400,
+      "objectsMean": 2,
+      "objectGap": "1.6s",
+      "readingMean": "5.5s",
       "count": 0
     },
     "stream": {
-      "chunkSize": 1400
+      "frameInterval": "100ms",
+      "slicesPerFrame": 8,
+      "sliceScale": 20,
+      "sliceShape": 1.2,
+      "sliceMax": 125,
+      "sliceGapScale": 0.0025,
+      "sliceGapShape": 1.2,
+      "sliceGapMax": 0.0125
     },
     "iot": {
-      "payload": 64,
+      "payloadMin": 48,
+      "payloadMax": 128,
       "interval": "1s"
     }
   },
@@ -58,8 +82,9 @@
     "tokenMode": "rtt",
     "tokenFixedS": 0.1,
     "tokenMinS": 0.005,
-    "tokenAggregate": "mean",
-    "tokenRttColumn": "srtt",
+    "tokenAggregate": "weighted",
+    "tokenRttColumn": "minrtt",
+    "tokenRttLock": false,
     "tokenRttSecondsPerUnit": 0.1
   }
 }

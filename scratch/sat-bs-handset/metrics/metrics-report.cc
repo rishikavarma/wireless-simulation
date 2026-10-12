@@ -95,8 +95,9 @@ WriteAppOutcome(std::ostream& os, const UeAppMetrics& ue)
     switch (ue.workload)
     {
     case AppWorkload::File:
-        os << "application chunks=" << ue.fileChunks << " acked=" << ue.fileAcked << '\n';
-        os << "application criterion=acked>=chunks\n";
+        os << "application files=" << ue.filesCompleted << " chunksPerFile=" << ue.fileChunks
+           << " ackedThisFile=" << ue.fileAcked << '\n';
+        os << "application criterion=files>0\n";
         break;
     case AppWorkload::Rpc:
         os << "application completed=" << ue.rpcCompleted << '\n';

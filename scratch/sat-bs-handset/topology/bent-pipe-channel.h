@@ -61,14 +61,29 @@ class BentPipeDelayModel : public PropagationDelayModel
   public:
     static TypeId GetTypeId();
 
-    void SetDelay(Time delay);
+    /**
+     * Configure a transparent bent-pipe path. The delay is recomputed from
+     * the current positions on every transmission.
+     */
+    void Configure(Ptr<MobilityModel> gnb,
+                   Ptr<MobilityModel> ue,
+                   Ptr<MobilityModel> satellite);
+
+    Time GetCurrentDelay() const;
+    Time GetFeederDelay() const;
+    Time GetServiceDelay() const;
+    Time GetCommonTimingAdvance() const;
+    Time GetUeSpecificTimingAdvance() const;
+    Time GetTotalTimingAdvance() const;
 
     Time GetDelay(Ptr<MobilityModel> a, Ptr<MobilityModel> b) const override;
 
   private:
     int64_t DoAssignStreams(int64_t stream) override;
 
-    Time m_delay;
+    Ptr<MobilityModel> m_gnb;
+    Ptr<MobilityModel> m_ue;
+    Ptr<MobilityModel> m_satellite;
 };
 
 /**

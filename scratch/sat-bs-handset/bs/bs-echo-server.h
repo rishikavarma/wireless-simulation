@@ -6,8 +6,8 @@
 #ifndef SAT_BS_HANDSET_BS_ECHO_SERVER_H
 #define SAT_BS_HANDSET_BS_ECHO_SERVER_H
 
-#include "metrics/bs-metrics.h"
 #include "common/tcp-pipe.h"
+#include "metrics/bs-metrics.h"
 
 #include "ns3/application.h"
 #include "ns3/ptr.h"

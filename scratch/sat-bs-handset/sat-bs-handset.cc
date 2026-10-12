@@ -16,6 +16,7 @@
 #include "common/ntn-helpers.h"
 #include "common/sim-config.h"
 #include "metrics/metrics-report.h"
+#include "topology/bent-pipe-channel.h"
 #include "topology/mobility.h"
 #include "topology/nr-ntn-feeder.h"
 #include "ue/ue-tcp-client.h"
@@ -62,11 +63,15 @@ main(int argc, char* argv[])
     InstallBaseStationMobility(baseStation, satellite);
     InstallUeMobility(ue, baseStation, sim.ueDistanceM, sim.receiverMobility);
 
+    ApplyTcpVariant(cfg.tcpVariant);
+
     NrFeederResult nr = InstallNrNtnBentPipe(ue,
                                              baseStation,
                                              satellite,
-                                             sim.frequencyHz,
-                                             sim.bandwidthHz,
+                                             sim.dlFrequencyHz,
+                                             sim.ulFrequencyHz,
+                                             sim.dlBandwidthHz,
+                                             sim.ulBandwidthHz,
                                              sim.ntnScenario,
                                              sim.satEIRP,
                                              sim.ueTxPower,
@@ -75,7 +80,8 @@ main(int argc, char* argv[])
                                              sim.gnbNoiseFigureDb,
                                              sim.realisticPower,
                                              sim.nrTraces,
-                                             antennaPeriod);
+                                             antennaPeriod,
+                                             cfg);
 
     Ptr<BsEchoServer> bsApp = CreateObject<BsEchoServer>();
     bsApp->Setup(sim.serverPort);
@@ -103,8 +109,10 @@ main(int argc, char* argv[])
               << recordEnd.GetSeconds() << " s)\n";
     std::cout << "config topology: UE (NR UE) --LEO relay--> BS (ground gNB + app)\n";
     std::cout << "config satellite altitude=" << sim.satAltitudeKm << " km (transparent relay)\n";
-    std::cout << "config NR NTN scenario=" << sim.ntnScenario << " f=" << sim.frequencyHz
-              << " Hz bw=" << sim.bandwidthHz
+    std::cout << "config NR NTN scenario=" << sim.ntnScenario
+              << " FDD dl=" << sim.dlFrequencyHz << " Hz/" << sim.dlBandwidthHz
+              << " Hz ul=" << sim.ulFrequencyHz << " Hz/" << sim.ulBandwidthHz
+              << " Hz"
               << " Hz realisticPower=" << (sim.realisticPower ? "on" : "off") << '\n';
     std::cout << "config UE distance from BS=" << sim.ueDistanceM << " m\n";
     std::cout << "config addresses UE=" << nr.ueAddr << " BS=" << nr.bsAddr << '\n';
@@ -114,32 +122,51 @@ main(int argc, char* argv[])
     case AppWorkload::Probe:
         std::cout << " traffic=" << UeTrafficTypeToString(cfg.trafficType)
                   << " peakRate=" << cfg.dataRate << " packetSize=" << cfg.packetSize << " B";
-        if (cfg.trafficType != UeTrafficType::Cbr)
+        if (cfg.trafficType == UeTrafficType::Cbr)
         {
-            std::cout << " onTime=" << cfg.onTime.GetSeconds()
-                      << "s offTime=" << cfg.offTime.GetSeconds() << "s";
+            break;
+        }
+        std::cout << " onMean=" << cfg.onTime.GetSeconds()
+                  << "s offMean=" << cfg.offTime.GetSeconds() << "s";
+        if (cfg.trafficType == UeTrafficType::Bursty)
+        {
+            std::cout << " burstShape=" << cfg.burstShape << " packets=poisson";
         }
         break;
     case AppWorkload::File:
-        std::cout << " fileSize=" << cfg.fileSize << " B chunk=" << cfg.packetSize
-                  << " B rate=" << cfg.dataRate;
+        std::cout << " size=lognormal mu=" << cfg.fileSizeMu << " sigma=" << cfg.fileSizeSigma
+                  << " max=" << cfg.fileSizeMax << " B chunk=" << cfg.packetSize
+                  << " B packetGap=exponential at " << cfg.dataRate
+                  << " readingMean=" << cfg.fileReadingMean.GetSeconds() << "s";
         break;
     case AppWorkload::Rpc:
-        std::cout << " req=" << cfg.rpcReqSize << " B resp=" << cfg.rpcRespSize << " B count="
+        std::cout << " req=" << cfg.rpcReqSize << " B object=pareto k=" << cfg.rpcObjectScale
+                  << " a=" << cfg.rpcObjectShape << " max=" << cfg.rpcObjectMax
+                  << " objects=geometric mean " << cfg.rpcObjectsMean << "+1"
+                  << " objectGap=" << cfg.rpcObjectGap.GetSeconds()
+                  << "s readingMean=" << cfg.rpcReadingMean.GetSeconds() << "s count="
                   << (cfg.rpcCount == 0 ? "until-stop" : std::to_string(cfg.rpcCount));
         break;
     case AppWorkload::Stream:
-        std::cout << " chunk=" << cfg.chunkSize << " B rate=" << cfg.dataRate;
+        std::cout << " frame=" << cfg.frameInterval.GetSeconds() << "s slices=" << cfg.slicesPerFrame
+                  << " slice=pareto k=" << cfg.sliceScale << " a=" << cfg.sliceShape
+                  << " max=" << cfg.sliceMax << " B gap=pareto k=" << cfg.sliceGapScale
+                  << "s a=" << cfg.sliceGapShape << " max=" << cfg.sliceGapMax << "s";
         break;
     case AppWorkload::Iot:
-        std::cout << " payload=" << cfg.iotPayload << " B interval=" << cfg.iotInterval.GetSeconds()
-                  << "s";
+        std::cout << " payload=uniform " << cfg.iotPayloadMin << ".." << cfg.iotPayloadMax
+                  << " B interval=exponential mean " << cfg.iotInterval.GetSeconds() << "s";
         break;
     }
     std::cout << '\n';
 
     Simulator::Stop(simStop);
     Simulator::Run();
+    std::cout << "result bent-pipe final feederDelayS="
+              << nr.timingModel->GetFeederDelay().GetSeconds()
+              << " serviceDelayS=" << nr.timingModel->GetServiceDelay().GetSeconds()
+              << " oneWayDelayS=" << nr.timingModel->GetCurrentDelay().GetSeconds()
+              << " totalTaS=" << nr.timingModel->GetTotalTimingAdvance().GetSeconds() << '\n';
 
     if (!ueApp->Connected())
     {

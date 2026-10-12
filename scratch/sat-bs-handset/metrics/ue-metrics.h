@@ -97,6 +97,7 @@ struct UeAppMetrics
     double deliveryRatio{0.0};
     uint64_t fileChunks{0};
     uint64_t fileAcked{0};
+    uint64_t filesCompleted{0};
     uint64_t rpcCompleted{0};
     SageFeatures tcp;
     bool success{false};

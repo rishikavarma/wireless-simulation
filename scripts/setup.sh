@@ -175,9 +175,22 @@ if [[ "$SKIP_VERIFY" -eq 1 ]]; then
     echo "==> Skipping smoke test (--skip-verify)"
 else
     echo "==> Smoke-testing sat-bs-handset (short run)"
-    # Full defaults are 120 s; smoke.json is long enough for attach plus a few replies.
+    # Full defaults are 300 s; smoke.json is long enough for attach plus a few replies.
     ./ns3 run "sat-bs-handset --config=scratch/sat-bs-handset/config/smoke.json"
     echo "    smoke test passed"
+    echo "==> Folding 5 ms traces into RTT tokens and quantile-bucketizing all features (incl. SINR)"
+    smoke_cfg="$SCENARIO_SRC/config/smoke.json"
+    prefix="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"]["prefix"])' "$smoke_cfg")"
+    results="$ROOT_DIR/results/$prefix"
+    python3 "$ROOT_DIR/scripts/bucketize_metrics.py" \
+        --config "$smoke_cfg" \
+        --tcp "$results/${prefix}-tcp.csv" \
+        --sinr-dl "$results/${prefix}-sinr-dl.csv" \
+        --sinr-ul "$results/${prefix}-sinr-ul.csv" \
+        --num-buckets 50
+    # Smoke runs are short (< 20 RTT tokens); longer runs produce non-empty seq20 files.
+    python3 "$ROOT_DIR/scripts/tokenize_sequences.py" \
+        --bucketized "$results/${prefix}-bucketized.csv" || true
 fi
 
 echo

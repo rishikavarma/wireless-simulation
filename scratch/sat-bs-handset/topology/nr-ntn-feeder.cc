@@ -57,17 +57,20 @@ NrFeederResult
 InstallNrNtnBentPipe(Ptr<Node> ue,
                      Ptr<Node> baseStation,
                      Ptr<Node> satellite,
-                     double frequencyHz,
-                     double bandwidthHz,
+                     double dlFrequencyHz,
+                     double ulFrequencyHz,
+                     double dlBandwidthHz,
+                     double ulBandwidthHz,
                      const std::string& ntnScenario,
                      double satEIRP,
                      double ueTxPower,
                      double ueAntennaGainDb,
                      double gnbAntennaGainDb,
                      double gnbNoiseFigureDb,
-                     bool realisticPower,
-                     bool nrTraces,
-                     Time antennaPeriod)
+                                    bool realisticPower,
+                                    bool nrTraces,
+                                    Time antennaPeriod,
+                                    const UeWorkloadConfig& app)
 {
     NrFeederResult out;
     out.epcHelper = CreateObject<NrPointToPointEpcHelper>();
@@ -78,13 +81,19 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
 
     CcBwpCreator ccBwpCreator;
     constexpr uint8_t numCcPerBand = 1;
-    CcBwpCreator::SimpleOperationBandConf bandConf(frequencyHz, bandwidthHz, numCcPerBand);
-    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+    CcBwpCreator::SimpleOperationBandConf dlBandConf(dlFrequencyHz,
+                                                     dlBandwidthHz,
+                                                     numCcPerBand);
+    CcBwpCreator::SimpleOperationBandConf ulBandConf(ulFrequencyHz,
+                                                     ulBandwidthHz,
+                                                     numCcPerBand);
+    OperationBandInfo dlBand = ccBwpCreator.CreateOperationBandContiguousCc(dlBandConf);
+    OperationBandInfo ulBand = ccBwpCreator.CreateOperationBandContiguousCc(ulBandConf);
 
     Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
     channelHelper->ConfigureFactories(ntnScenario, "LOS", "ThreeGpp");
-    channelHelper->AssignChannelsToBands({band});
-    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
+    channelHelper->AssignChannelsToBands({dlBand, ulBand});
+    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({dlBand, ulBand});
 
     idealBeamformingHelper->SetAttribute("BeamformingMethod",
                                          TypeIdValue(DirectPathBeamforming::GetTypeId()));
@@ -134,11 +143,17 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     Ptr<MobilityModel> gnbMob = baseStation->GetObject<MobilityModel>();
     Ptr<MobilityModel> ueMob = ue->GetObject<MobilityModel>();
     Ptr<MobilityModel> satMob = satellite->GetObject<MobilityModel>();
-    const double oneWayS =
-        (gnbMob->GetDistanceFrom(satMob) + ueMob->GetDistanceFrom(satMob)) / 299792458.0;
-    // Handset slots start one light-time late, so a gNB transmission arrives
-    // as that handset slot begins.
-    NrUePhy::SetOneWayDelay(Seconds(oneWayS));
+    const double feederDelayS = gnbMob->GetDistanceFrom(satMob) / 299792458.0;
+    const double serviceDelayS = ueMob->GetDistanceFrom(satMob) / 299792458.0;
+    const double oneWayS = feederDelayS + serviceDelayS;
+    out.baseRtt = Seconds(2.0 * oneWayS);
+    const double capacityBps = app.dataRate.GetBitRate();
+    out.queueBytes = ComputeQueueBytes(capacityBps, out.baseRtt, app.queueSizeBdp);
+    ApplyQueueBudgetDefaults(out.queueBytes);
+    std::cout << "config application tcpVariant=" << app.tcpVariant
+              << " queueSizeBdp=" << app.queueSizeBdp << " aqm=" << AqmTypeToString(app.aqm)
+              << " capacityBps=" << capacityBps << " baseRttS=" << out.baseRtt.GetSeconds()
+              << " queueBytes=" << out.queueBytes << '\n';
 
     out.gnbNetDev = out.nrHelper->InstallGnbDevice(gnbNodes, allBwps);
     out.ueNrNetDev = out.nrHelper->InstallUeDevice(ueNodes, allBwps);
@@ -148,16 +163,24 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     randomStream += out.nrHelper->AssignStreams(out.ueNrNetDev, randomStream);
 
     // Transparent bent-pipe link budget: gNB Tx modeled from satellite EIRP density.
-    double gnbTxPower = (satEIRP + 30) + (10 * std::log10(bandwidthHz / 1e6));
+    double gnbTxPower = (satEIRP + 30) + (10 * std::log10(dlBandwidthHz / 1e6));
     if (realisticPower)
     {
         gnbTxPower -= gnbAntennaGainDb;
     }
-    NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->SetTxPower(gnbTxPower);
-    NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->SetNoiseFigure(gnbNoiseFigureDb);
-
     double uplinkTxPower = realisticPower ? ueTxPower : gnbTxPower;
-    NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 0)->SetTxPower(uplinkTxPower);
+    Ptr<NrGnbPhy> dlGnbPhy = NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0);
+    Ptr<NrGnbPhy> ulGnbPhy = NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 1);
+    Ptr<NrUePhy> dlUePhy = NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 0);
+    Ptr<NrUePhy> ulUePhy = NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 1);
+    dlGnbPhy->SetTxPower(gnbTxPower);
+    dlGnbPhy->SetNoiseFigure(gnbNoiseFigureDb);
+    ulGnbPhy->SetNoiseFigure(gnbNoiseFigureDb);
+    dlUePhy->SetTxPower(uplinkTxPower);
+    ulUePhy->SetTxPower(uplinkTxPower);
+    dlGnbPhy->SetPattern("DL|DL|DL|DL|DL|DL|DL|DL|DL|DL|");
+    ulGnbPhy->SetPattern("UL|UL|UL|UL|UL|UL|UL|UL|UL|UL|");
+    NrHelper::GetBwpManagerGnb(out.gnbNetDev.Get(0))->SetOutputLink(1, 0);
 
     // Dual-home the BS to the PGW so a BS app can answer UE traffic through EPC.
     Ptr<Node> pgw = out.epcHelper->GetPgwNode();
@@ -197,55 +220,105 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
 
     // The NR helper's channel only sees the two ground endpoints. Replace that
     // budget with feeder hop + service hop through the satellite.
-    Ptr<NrSpectrumPhy> gnbSpectrum =
-        NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), 0)->GetSpectrumPhy();
-    Ptr<SpectrumChannel> channel = gnbSpectrum->GetSpectrumChannel();
-    Ptr<ThreeGppPropagationLossModel> hopLoss = MakeNtnHopLoss(ntnScenario, frequencyHz);
     const double gnbGainDb = gnbElementGainDb + gnbArrayFactorDb;
     const double ueGainDb = ueElementGainDb + ueArrayFactorDb;
-    const double satEirpDbm = (satEIRP + 30.0) + (10.0 * std::log10(bandwidthHz / 1e6));
-    const double feederLossDb = -hopLoss->CalcRxPower(0.0, gnbMob, satMob);
-    // Fixed transponder gain: forward EIRP equals the configured satellite EIRP.
-    const double relayGainDb = satEirpDbm - gnbTxPower - gnbGainDb + feederLossDb;
-    const double serviceLossDb = -hopLoss->CalcRxPower(0.0, ueMob, satMob);
-    std::cout << "config bent-pipe feederLossDb=" << feederLossDb
-              << " serviceLossDb=" << serviceLossDb << " relayGainDb=" << relayGainDb
-              << " oneWayDelayS=" << oneWayS << '\n';
+    const double satEirpDlDbm =
+        (satEIRP + 30.0) + (10.0 * std::log10(dlBandwidthHz / 1e6));
+    const double satEirpUlDbm =
+        (satEIRP + 30.0) + (10.0 * std::log10(ulBandwidthHz / 1e6));
+    Ptr<BentPipeDelayModel> timingModel;
 
-    Ptr<BentPipePropagationLossModel> bentPipeLoss = CreateObject<BentPipePropagationLossModel>();
-    bentPipeLoss->Configure(gnbMob, ueMob, satMob, hopLoss, gnbGainDb, ueGainDb, relayGainDb);
-    channel->SetAttribute("PropagationLossModel", PointerValue(bentPipeLoss));
+    for (uint32_t bwpId = 0; bwpId < 2; ++bwpId)
+    {
+        const bool downlink = bwpId == 0;
+        const double frequencyHz = downlink ? dlFrequencyHz : ulFrequencyHz;
+        Ptr<NrSpectrumPhy> gnbSpectrum =
+            NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), bwpId)->GetSpectrumPhy();
+        Ptr<SpectrumChannel> channel = gnbSpectrum->GetSpectrumChannel();
+        Ptr<ThreeGppPropagationLossModel> hopLoss =
+            MakeNtnHopLoss(ntnScenario, frequencyHz);
+        const double feederLossDb = -hopLoss->CalcRxPower(0.0, gnbMob, satMob);
+        const double serviceLossDb = -hopLoss->CalcRxPower(0.0, ueMob, satMob);
+        const double relayGainDb =
+            downlink ? satEirpDlDbm - gnbTxPower - gnbGainDb + feederLossDb
+                     : satEirpUlDbm - uplinkTxPower - ueGainDb + serviceLossDb;
 
-    Ptr<PhasedArraySpectrumPropagationLossModel> installedFading =
-        channel->GetPhasedArraySpectrumPropagationLossModel();
-    NS_ABORT_MSG_IF(!installedFading, "NR channel has no phased-array fading model");
-    installedFading->SetNext(CreateObject<BentPipeFlatSpectrumModel>());
+        std::cout << "config bent-pipe " << (downlink ? "DL" : "UL")
+                  << " feederLossDb=" << feederLossDb
+                  << " serviceLossDb=" << serviceLossDb
+                  << " relayGainDb=" << relayGainDb << '\n';
 
-    Ptr<BentPipeDelayModel> bentPipeDelay = CreateObject<BentPipeDelayModel>();
-    bentPipeDelay->SetDelay(Seconds(oneWayS));
-    channel->SetPropagationDelayModel(bentPipeDelay);
+        Ptr<BentPipePropagationLossModel> bentPipeLoss =
+            CreateObject<BentPipePropagationLossModel>();
+        bentPipeLoss->Configure(gnbMob,
+                                ueMob,
+                                satMob,
+                                hopLoss,
+                                gnbGainDb,
+                                ueGainDb,
+                                relayGainDb);
+        channel->SetAttribute("PropagationLossModel", PointerValue(bentPipeLoss));
 
-    Ptr<NrGnbNetDevice> gnbDev = DynamicCast<NrGnbNetDevice>(out.gnbNetDev.Get(0));
-    Ptr<NrGnbPhy> gnbPhy = gnbDev->GetPhy(0);
-    const double slotS = gnbPhy->GetSlotPeriod().GetSeconds();
-    const uint32_t rttSlots =
-        static_cast<uint32_t>(std::ceil((2.0 * oneWayS) / slotS)) + 8;
-    gnbPhy->SetN1Delay(rttSlots);
-    gnbPhy->SetN2Delay(rttSlots);
+        Ptr<PhasedArraySpectrumPropagationLossModel> installedFading =
+            channel->GetPhasedArraySpectrumPropagationLossModel();
+        NS_ABORT_MSG_IF(!installedFading, "NR channel has no phased-array fading model");
+        installedFading->SetNext(CreateObject<BentPipeFlatSpectrumModel>());
 
-    auto gnbAntenna = gnbSpectrum->GetAntenna()->GetObject<UniformPlanarArray>();
-    baseStation->AggregateObject(gnbAntenna);
-    UpdateAntennaToward(baseStation, satellite, gnbAntenna, antennaPeriod);
+        Ptr<BentPipeDelayModel> bentPipeDelay = CreateObject<BentPipeDelayModel>();
+        bentPipeDelay->Configure(gnbMob, ueMob, satMob);
+        channel->SetPropagationDelayModel(bentPipeDelay);
+        if (downlink)
+        {
+            timingModel = bentPipeDelay;
+        }
 
-    auto ueAntenna = NrHelper::GetUePhy(out.ueNrNetDev.Get(0), 0)
-                         ->GetSpectrumPhy()
-                         ->GetAntenna()
-                         ->GetObject<UniformPlanarArray>();
-    ue->AggregateObject(ueAntenna);
-    UpdateAntennaToward(ue, satellite, ueAntenna, antennaPeriod);
+        auto gnbAntenna = gnbSpectrum->GetAntenna()->GetObject<UniformPlanarArray>();
+        UpdateAntennaToward(baseStation, satellite, gnbAntenna, antennaPeriod);
+        auto ueAntenna = NrHelper::GetUePhy(out.ueNrNetDev.Get(0), bwpId)
+                             ->GetSpectrumPhy()
+                             ->GetAntenna()
+                             ->GetObject<UniformPlanarArray>();
+        UpdateAntennaToward(ue, satellite, ueAntenna, antennaPeriod);
+    }
+    NS_ABORT_MSG_IF(!timingModel, "No bent-pipe timing model was installed");
+    out.timingModel = timingModel;
+    const auto timingCallback =
+        MakeCallback(&BentPipeDelayModel::GetCurrentDelay, timingModel);
+    dlUePhy->SetNtnOneWayDelayCallback(timingCallback);
+    ulUePhy->SetNtnOneWayDelayCallback(timingCallback);
+
+    // K1/K2 must leave enough time for a grant or DL transport block to
+    // traverse the bent pipe and for the timing-advanced UL response to be
+    // emitted. Use the radio-horizon slant ranges as a pass-wide bound.
+    const double satRadius = satMob->GetPosition().GetLength();
+    const double gnbRadius = gnbMob->GetPosition().GetLength();
+    const double ueRadius = ueMob->GetPosition().GetLength();
+    const double maxFeederRange =
+        std::sqrt(std::max(0.0, satRadius * satRadius - gnbRadius * gnbRadius));
+    const double maxServiceRange =
+        std::sqrt(std::max(0.0, satRadius * satRadius - ueRadius * ueRadius));
+    const double maxRttS = 2.0 * (maxFeederRange + maxServiceRange) / 299792458.0;
+    const uint32_t ntnKOffset =
+        static_cast<uint32_t>(std::ceil(maxRttS / dlGnbPhy->GetSlotPeriod().GetSeconds()));
+    dlGnbPhy->SetNtnKOffset(ntnKOffset);
+    ulGnbPhy->SetNtnKOffset(ntnKOffset);
+    NrHelper::GetUeMac(out.ueNrNetDev.Get(0), 1)->SetNtnKOffset(ntnKOffset);
+
+    std::cout << "config bent-pipe initial feederDelayS=" << feederDelayS
+              << " serviceDelayS=" << serviceDelayS << " oneWayDelayS=" << oneWayS
+              << " commonTaS=" << timingModel->GetCommonTimingAdvance().GetSeconds()
+              << " ueSpecificTaS="
+              << timingModel->GetUeSpecificTimingAdvance().GetSeconds()
+              << " totalTaS=" << timingModel->GetTotalTimingAdvance().GetSeconds()
+              << " maxRttS=" << maxRttS << " ntnKOffsetSlots=" << ntnKOffset << '\n';
 
     out.phyMetrics = Create<NrPhyMetricsCollector>();
     out.phyMetrics->Connect(out.ueNrNetDev.Get(0), out.gnbNetDev.Get(0));
+
+    // Apply AQM on the ground PGW↔BS P2P hop (IP bottleneck). Leave NR devices
+    // on their helper-installed traffic-control defaults; RLC TX buffers already
+    // use the BDP budget via ApplyQueueBudgetDefaults.
+    InstallAqmOnDevices(app.aqm, out.queueBytes, bsPgwDevs);
 
     if (nrTraces)
     {
