@@ -68,6 +68,7 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
         cfg.workload.tcpVariant = *tcpVariant;
     }
     Overlay(root, "application.queueSizeBdp", cfg.workload.queueSizeBdp, JsonDouble);
+    Overlay(root, "application.queueSizeBytes", cfg.workload.queueSizeBytes, JsonUint);
     Overlay(root, "application.computeDelayUs", cfg.workload.computeDelayUs, JsonUint);
     if (const std::optional<std::string> aqm = JsonGet(root, "application.aqm"))
     {
@@ -205,6 +206,8 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
                         "application.iot.payloadMax must be >= payloadMin");
         NS_ABORT_MSG_IF(w.iotInterval <= Time(0), "application.iot.interval must be > 0");
     }
+    NS_ABORT_MSG_IF(w.queueSizeBytes > 0 && w.queueSizeBytes < 10240,
+                    "application.queueSizeBytes must be zero or at least 10240");
     NS_ABORT_MSG_IF(w.queueSizeBdp <= 0.0, "application.queueSizeBdp must be > 0");
     NS_ABORT_MSG_IF(w.tcpVariant.empty(), "application.tcpVariant must be set");
 }

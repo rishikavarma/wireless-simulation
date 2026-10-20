@@ -190,6 +190,12 @@ rel_target="$(realpath --relative-to="$(dirname "$SCENARIO_LINK")" "$SCENARIO_SR
 ln -sfn "$rel_target" "$SCENARIO_LINK"
 echo "    $SCENARIO_LINK -> $rel_target"
 
+# Maintained calibration experiments use the same model and a read-only RTT observer.
+calibration_src="$ROOT_DIR/experiments/queue-calibration"
+calibration_link="$NS3_DIR/scratch/queue-calibration"
+calibration_target="$(realpath --relative-to="$NS3_DIR/scratch" "$calibration_src")"
+ln -sfn "$calibration_target" "$calibration_link"
+
 echo "==> Configuring and building ns-3 (optimized; examples off)"
 echo "    this can take several minutes to around an hour depending on hardware"
 cd "$NS3_DIR"

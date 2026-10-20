@@ -26,8 +26,8 @@ vehicle-cabin attenuation, oscillator error and residual Doppler error.
 
 ## Experiment design
 
-`scripts/dataset/run_dataset.py` defines 50 profiles with four matched RNG
-replicates each. Each simulation lasts 130 s, with application activity from
+The default `comparison` preset in `scripts/dataset/run_dataset.py` defines
+50 profiles with four matched RNG replicates each. Each simulation lasts 130 s, with application activity from
 15–120 s and measurements from 20–119 s.
 
 | Factor | Settings in the full run |
@@ -49,6 +49,122 @@ Their relay is selected explicitly; distance alone does not select a satellite.
 Each UE has its own geometry and timing. There is no independent feeder queue
 or detailed two-hop co-channel interference model. Changing relay does not
 remove contention at the shared gNB scheduler.
+
+## Full dataset preset
+
+The separately selected `--preset full` is defined by
+[`full_dataset.json`](../scripts/dataset/full_dataset.json). It defaults to 2,000
+profiles and 20 independent RNG repeats per profile. It derives 49 controlled
+anchors from `comparison`, enabling automatic relay selection in each and
+merging the now-identical baseline and relay-switch profile. Another 1,951
+profiles sample joint conditions within balanced application/transport/direction strata. The
+design is a stratified sample of the joint space, not its full Cartesian product.
+Native apps have UL/DL strata; the five synthetic apps originate UL.
+The table gives candidate levels for the additional profiles. Anchors retain
+their original settings, including the 5/20/80 kbit/s background sources.
+
+| Factor | Full-preset candidate values |
+|---|---|
+| Applications | All nine; sizes, timing and source rates also vary where supported |
+| TCP | NewReno, CUBIC, BBR, Vegas, Hybla, WestwoodPlus, crossed with each application |
+| UDP | Every application; TCP-only feature heads remain NaN |
+| Source pacing | 0.5, 2, 10, 32, 128, 512 kbit/s for paced workloads; TCP bulk remains backlogged |
+| Packet/write size | 128, 256, 512, 1200 B for probe/file/native bulk/CBR/OnOff |
+| Queue budget | 0.5, 1, 2, 4, 8, 16 × measured clear-link capacity/unloaded-RTT BDP; 10 KiB minimum |
+| Motion | Stationary or 0.5, 1.4, 5, 10, 15, 30, 50 m/s; disks of 0.1, 0.5, 5, 20, 50 km |
+| Background | 0, 1, 3, 8 stationary UEs; 2, 10, 32, 128 kbit/s per UE; relay 0/1; 0.5, 5, 50 km separation |
+| Geometry | Orbit altitude fixed at 800 km, inclination 53°, relay spacing 8°; gateway north/east offsets −20, 0, 20 km |
+| Paired service bandwidth | 10 or 20 MHz per direction; carrier center frequencies stay fixed |
+| Attenuation | Service 0, 0.75, 1.5, 2.25, 3 dB; feeder 0, 6, 12, 18, 24, 30 dB |
+| Switching | Automatic relay selection enabled in every configuration, within the same NR cell |
+| File | Median content 16 kB/128 kB/1 MB; reading means 0.1/1/3/10 s |
+| RPC | Requests 64/128/512 B; response scale 64/128/512 B; reading means 0.2/1.5/5 s |
+| Stream | 5/15/30 frames/s; 1/2/4/8 slices/frame; content scales 40/120/500 B, cap 1000 B |
+| IoT | Minimum body 64/128/512 B, maximum twice that; mean intervals 0.05/0.2/1.5/5 s |
+
+Inactive rate knobs are not randomized: VoIP keeps its native codec-traffic
+defaults, and `dataRate` does not cap TCP bulk or pace RPC/stream/IoT. Native
+OnOff retains its fixed 1 s ON/1 s OFF phases. RLC AM, the 120-byte new-PDU cap,
+LOS assumptions and the absence of waveform/Doppler outputs remain part of the
+model; changing bandwidth does not make this a peak-capacity measurement.
+
+Full profiles, including controlled anchors, use an explicit byte budget from
+[`experiments/queue-calibration/reference.json`](../experiments/queue-calibration/reference.json).
+Separate UL/DL experiments measure saturated PDCP SDU rate and post-handshake
+unloaded data RTT at 10 and 20 MHz. Each bandwidth uses the larger directional
+BDP as its common per-buffer reference. Multipliers are applied independently of
+application pacing, with the existing 10 KiB minimum. The manifest records the
+nominal factor and actual `queueSizeBytes`; lower factors can be clamped by the
+floor. Attenuation/background changes retain this clear-link reference. See the
+[root README calibration procedure](../README.md#queue-calibration-experiments)
+for loads, repeats, acceptance checks and measurements. Comparison profiles
+retain their legacy offered-rate/geometric-RTT sizing when no explicit byte
+budget is supplied.
+
+Relay selection follows the existing visibility, path advantage, hysteresis and
+time-to-trigger rules. Full-preset admission selects geometries predicting one
+switch inside the measurement window. The `comparison` preset retains its
+original switch-disabled controls.
+
+Full-preset admission checks use a conservative envelope covering both the
+primary UE's disk and background separation. Candidates outside visibility,
+bootstrap-budget or switch-time constraints are rejected before configurations
+are emitted. Only admitted configurations enter the manifest; those checks do
+not prove successful application delivery. Poor-performance interaction runs
+remain observations when they finish without crashing, including zero-delivery
+background flows. Geometry constraints also mean not every listed combination
+can be admitted.
+
+All profiles share the same 20 RNG run numbers (10001–10020); these are matched
+comparisons across profiles, with independent repeats within each profile.
+Replicates 16–19 (RNG 10017–10020) are held out as a group. This tests unseen
+RNG realizations of the configuration distribution, not unseen knob values.
+The 49 anchor profiles supply the controlled plots; a separate coverage page
+shows descriptive distributions across mixed conditions. The full preset's
+switching page shows observed protocol and geometric RTT before/after the event;
+it has no switch-disabled control and does not establish the causal benefit of
+switching. The comparison preset retains its matched switching/control plot.
+
+### Size and relation to UNUM
+
+The [first UNUM paper, Appendix 8.1](https://www.usenix.org/system/files/nsdi26-chen-jiayi.pdf)
+reports over 35 million unique samples, crossing applications and Linux
+congestion-control algorithms across network conditions, with an 80/20 split.
+Its Table 1 includes 6–192 Mbit/s bottlenecks, 10–160 ms base RTTs and
+0.5–16 BDP queues; it also uses adaptive-video workloads and real bandwidth
+traces. That motivates wider interactions and training volume here.
+
+Our default full plan has 40,000 × 990 = **39.6 million distinct time bins**;
+each bin produces one transport state vector. With non-overlapping windows of
+20 tokens, each run supplies 49 windows: **1.96 million windows**, split into
+1,568,000 training / 392,000 test windows. The last ten tokens per run are not
+part of a complete window. A time bin is not a guaranteed unique feature vector.
+
+These counts are an explicit size objective, not equivalence to UNUM's sample
+definition or a reproduction of its dataset. Our tokens are fixed at 100 ms
+(shared with UDP); UNUM aggregates at RTT scale. The satellite model lacks
+adaptive bitrate control and replay of real bandwidth traces. Radio bandwidth
+in MHz is also not an application bottleneck rate in Mbit/s. More runs cannot
+remove those differences.
+
+Use `--target-windows` to request a minimum number of complete examples rather
+than time bins. A target of 35,000,000 windows with 20 repeats and 49 windows/run
+requires 35,715 profiles × 20 = **714,300 runs**, producing 35,000,700 windows.
+`--describe` calculates this without generating configurations or launching ns-3.
+The default full setting stays at 40,000 runs; changing the window target is
+explicit and increases actual collection volume, rather than repeating windows.
+
+### Full-preset storage
+
+The full preset processes at most 100 runs per transport/radio shard. Transport
+shards hold `sequences`, feature names, run IDs and truncation flags; slice the
+first/last ten tokens for history/future. The two index JSON files list all
+shards and run identities. Quantile fitting uses a seeded uniform random-priority
+sample of up to 200,000 **training time tokens**, never held-out tokens; the
+actual sample count and training-token count are recorded. The comparison
+preset retains its existing archives and exact quantile fitting. The sharded
+layout requires an index-aware training loader, rather than a loader expecting
+a single `dataset-train.npz` file.
 
 ## Metric coverage
 
@@ -95,6 +211,9 @@ volume and PRB totals to be reconciled independently.
 
 Rates below describe source settings before IP/transport/radio overhead.
 Delivered rate depends on the stack and available capacity.
+The [application rate reference](application-rates.md) explains every supported
+workload, its packet framing, active/average rates, direction and configuration
+controls in detail.
 
 | Application | Source behavior and rate controls |
 |---|---|
@@ -127,7 +246,7 @@ UDP. Separate radio arrays contain 23 continuous features over 99 one-second
 measurement intervals, with shape `[runs, 99, 23]`. Idle rates/counts are zero;
 unobserved delay, SINR, MCS and BSR values are NaN.
 
-Training/test separation holds out the fourth RNG replicate as a complete
+For the comparison preset, training/test separation holds out the fourth RNG replicate as a complete
 group: 150 training runs and 50 test runs. Quantile boundaries are fitted only
 on training data. Transport examples have 10 history and 10 future tokens.
 Raw configs, logs, execution outcomes and source hashes identify each run.

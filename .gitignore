@@ -12,9 +12,10 @@ ns-3-dev/
 /embedding/
 /requirements-train.txt
 
-# Keep only the experiment explanation; reports and slides belong under local/.
+# Keep experiment/application explanations; reports and slides belong under local/.
 /docs/*
 !/docs/experiment.md
+!/docs/application-rates.md
 
 # Dataset archives generated outside results/.
 *.npz

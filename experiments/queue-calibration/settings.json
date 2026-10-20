@@ -1,0 +1,45 @@
+{
+  "bandwidthMHz": [
+    10,
+    20
+  ],
+  "directions": [
+    "ul",
+    "dl"
+  ],
+  "rngRuns": [
+    20001,
+    20002,
+    20003
+  ],
+  "offeredRatesKbps": [
+    8,
+    32,
+    128,
+    512,
+    2048
+  ],
+  "capacityPacketBytes": 512,
+  "capacityQueueBytes": 65536,
+  "checkQueueBytes": 131072,
+  "rttRateKbps": 1,
+  "rttPacketBytes": 128,
+  "measurementStartS": 20,
+  "measurementEndS": 119,
+  "switchExclusionS": 5,
+  "plateauTolerance": 0.15,
+  "minimumQueueBytes": 10240,
+  "queueMultipliers": [
+    0.5,
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "extraOfferedRatesKbps": {
+    "20-ul": [
+      8192
+    ]
+  }
+}

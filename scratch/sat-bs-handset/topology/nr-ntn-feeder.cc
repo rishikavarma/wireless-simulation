@@ -174,7 +174,9 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     const double oneWayS = feederDelayS + serviceDelayS;
     out.baseRtt = Seconds(2.0 * oneWayS);
     const double capacityBps = app.dataRate.GetBitRate();
-    out.queueBytes = ComputeQueueBytes(capacityBps, out.baseRtt, app.queueSizeBdp);
+    out.queueBytes = app.queueSizeBytes > 0
+                         ? app.queueSizeBytes
+                         : ComputeQueueBytes(capacityBps, out.baseRtt, app.queueSizeBdp);
     ApplyQueueBudgetDefaults(out.queueBytes);
     std::cout << "config application tcpVariant=" << app.tcpVariant
               << " queueSizeBdp=" << app.queueSizeBdp << " aqm=" << AqmTypeToString(app.aqm)

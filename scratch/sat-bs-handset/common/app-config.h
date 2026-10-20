@@ -109,6 +109,8 @@ struct UeWorkloadConfig
     std::string transport{"tcp"};
     std::string tcpVariant{"TcpNewReno"};
     double queueSizeBdp{2.0};
+    /** Explicit per-buffer budget in bytes; zero retains legacy rate/RTT sizing. */
+    uint64_t queueSizeBytes{0};
     AqmType aqm{AqmType::DropTail};
     /** Server think time before the reply is enqueued. 0 = immediate. */
     uint64_t computeDelayUs{0};

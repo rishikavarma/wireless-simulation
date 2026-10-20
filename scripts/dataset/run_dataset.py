@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Matched 200-run NTN experiment covering applications, motion, relays, load and transport."""
+"""Collect the comparison dataset or the broader full dataset, with matched RNG replicates."""
 import argparse,concurrent.futures as cf,copy,hashlib,json,random,re,subprocess,sys,time
 from pathlib import Path
 import campaign_config
+import dataset_presets
 ROOT=Path(__file__).resolve().parents[2]
 BIN=ROOT/'ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized'
 def profiles():
@@ -48,24 +49,34 @@ def profiles():
  assert len(result)==50,len(result)
  return result
 
-def plan(out,stem):
+def plan(out,stem,settings=None):
+ settings=settings or dataset_presets.settings()
  out.mkdir(parents=True,exist_ok=True)
  if (out/'manifest.json').exists():raise SystemExit('manifest already exists; use --run to resume')
+ selected,rejected=dataset_presets.expand_profiles(profiles(),settings)
+ proofs={name:(dataset_presets.preflight(cfg) if settings['preset']=='full' else campaign_config.preflight(cfg)) for name,_,cfg in selected}
+ if not all(proofs.values()):raise RuntimeError('geometry admission failed')
  runs=[]
- for rep in range(4):
-  for name,group,cfg in profiles():
+ for rep in range(settings['replicates']):
+  for name,group,cfg in selected:
    cfg=copy.deepcopy(cfg);prefix=f'{stem}-{rep}-{name}';cfg['output']['prefix']=prefix
    if (ROOT/'results'/prefix).exists():raise SystemExit(f'results exist for {prefix}; select --run-prefix')
    path=out/'configs'/(prefix+'.json');path.parent.mkdir(exist_ok=True);path.write_text(json.dumps(cfg,indent=2)+'\n')
-   proof=campaign_config.preflight(cfg)
-   if not proof:raise RuntimeError(('geometry admission failed',name))
-   runs.append({'prefix':prefix,'case':name,'group':group,'replicate':rep,'rngRun':701+rep,
-                'config':str(path),'preflight':proof,'knobs':{'workload':cfg['application']['workload'],
+   runs.append({'prefix':prefix,'case':name,'group':group,'replicate':rep,'rngRun':settings['rngStart']+rep,
+                'config':str(path),'preflight':proofs[name],'knobs':{'workload':cfg['application']['workload'],
                 'transport':cfg['application'].get('transport','tcp'),'handover':cfg['handover']['enabled'],
+                'tcpVariant':cfg['application']['tcpVariant'],'direction':cfg['application'].get('direction','ul'),
+                'dataRate':cfg['application']['dataRate'],'queueSizeBdp':cfg['application']['queueSizeBdp'],
+                'queueSizeBytes':cfg['application'].get('queueSizeBytes'),
+                'queueBudgetMultiplier':cfg['application']['queueSizeBdp'],
+                'serviceExcessLossDb':cfg['radio']['serviceExcessLossDb'],'feederExcessLossDb':cfg['radio']['feederExcessLossDb'],
+                'bandwidthMHz':cfg['radio']['ulBandwidthHz']/1e6,'altitudeKm':cfg['satellite']['altitudeKm'],
                 'receiverMobility':cfg['topology']['receiverMobility'],
                 'ueSpeedMps':cfg['topology']['ueSpeedMps'] if cfg['topology']['receiverMobility'] else 0,
                 'backgroundCount':cfg.get('background',{}).get('count',0)}})
- manifest={'design':'50 profiles x 4 matched RNG replicates; one-factor contrasts plus stated background interactions',
+ manifest={'design':f"{len(selected)} profiles x {settings['replicates']} matched RNG replicates; {settings['anchorProfileCount']} controlled anchors plus sampled cross-factor profiles",
+           'preset':settings['preset'],'settings':settings,'plannedSize':dataset_presets.planned_size(settings),
+           'rejectedProfileCandidates':rejected,
            'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'73 legacy transport/SINR features plus separate radio/KPI logs',
            'runs':runs}
  (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -82,6 +93,10 @@ def run(out,jobs):
  stamp=out/'source-hashes.json'
  if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; select a fresh campaign')
  stamp.write_text(json.dumps(sources,indent=2)+'\n')
+ for name in sources:
+  if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
+  snapshot=out/'source-snapshot'/name;snapshot.parent.mkdir(parents=True,exist_ok=True)
+  snapshot.write_bytes((ROOT/name).read_bytes())
  def one(rec):
   prefix=rec['prefix'];status=out/'logs'/(prefix+'.json')
   if status.exists():return json.loads(status.read_text())
@@ -138,19 +153,24 @@ def prepare_features(rec):
 def post(out,jobs):
  manifest=json.loads((out/'manifest.json').read_text())
  with cf.ThreadPoolExecutor(max_workers=jobs) as pool:list(pool.map(prepare_features,manifest['runs']))
- # Preserve matched replicate groups across the split by forcing replicate 3 to test.
+ if manifest.get('settings',{}).get('shardRuns',0):
+  from dataset_storage import post_sharded
+  post_sharded(ROOT,out,manifest)
+  return
+ # Preserve matched replicate groups across the split (replicate 3 in older manifests).
  # This avoids the same RNG stream appearing on both sides via controlled contrasts.
  import numpy as np
  from make_datasets import load_run_windows,fit_boundaries_on_train,tokenize_multi,save_split
  files=[ROOT/'results'/r['prefix']/(r['prefix']+'-features.csv') for r in manifest['runs']]
  values,names,ids,_=load_run_windows(files,seq_len=20,stride=10)
- test_prefixes={r['prefix'] for r in manifest['runs'] if r['replicate']==3}
+ held_out=dataset_presets.test_replicates(manifest)
+ test_prefixes={r['prefix'] for r in manifest['runs'] if r['replicate'] in held_out}
  test=np.array([r in test_prefixes for r in ids]);edges=fit_boundaries_on_train(values[~test],names,50)
  tokens,columns=tokenize_multi(values,names,edges)
  for split,mask in [('train',~test),('test',test)]:
   selected=[r for r,m in zip(ids,mask) if m]
   save_split(out/('dataset-'+split),tokens[mask],10,columns,names,selected,[False]*len(selected),
-             {'split':split,'splitUnit':'matched RNG replicate','testReplicate':3,'context':10,'future':10})
+             {'split':split,'splitUnit':'matched RNG replicate','testReplicates':sorted(held_out),'context':10,'future':10})
  (out/'dataset-boundaries.json').write_text(json.dumps(edges,indent=2)+'\n')
  (out/'post-complete.json').write_text(json.dumps({'runs':len(files),'shape':list(values.shape)},indent=2)+'\n')
  print('postprocessed',len(files),'runs',values.shape,flush=True)
@@ -158,7 +178,13 @@ def post(out,jobs):
 def main():
  """Run the complete dataset workflow by default, or only explicitly selected stages."""
  p=argparse.ArgumentParser(description=__doc__)
- p.add_argument('--out-dir',type=Path,required=True)
+ p.add_argument('--out-dir',type=Path)
+ p.add_argument('--preset',choices=('comparison','full'),help='comparison: 200 runs (default); full: settings in full_dataset.json')
+ p.add_argument('--profile-count',type=int,help='full-preset profile count, including the 49 switching-enabled anchors')
+ p.add_argument('--replicates',type=int,help='matched RNG repeats per profile; comparison defaults to 4, full to 20')
+ p.add_argument('--design-seed',type=int,help='seed for sampling the full-preset configurations')
+ p.add_argument('--target-windows',type=int,help='increase the full-preset profile count to reach this many 20-token windows')
+ p.add_argument('--describe',action='store_true',help='print settings and planned size without creating files or running simulations')
  p.add_argument('--run-prefix',default='full',help='unique result prefix for a fresh collection')
  p.add_argument('--plan',action='store_true',help='only plan configurations, unless other stages are selected')
  p.add_argument('--run',action='store_true',help='execute an existing plan')
@@ -166,14 +192,27 @@ def main():
  p.add_argument('--analyze',action='store_true',help='audit the dataset and generate comparison plots')
  p.add_argument('--report',action='store_true',help='write the results summary')
  p.add_argument('--jobs',type=int,default=8)
- p.epilog='With no stage flags, runs plan, simulation, postprocessing, analysis and report in order. Use a fresh output directory and prefix.'
- a=p.parse_args();out=a.out_dir.resolve()
+ p.epilog='Without --describe or stage flags, runs plan, simulation, postprocessing, analysis and report in order. Use a fresh output directory and prefix.'
+ a=p.parse_args()
  if a.jobs<1:p.error('--jobs must be positive')
+ if a.describe:
+  if any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with execution stages')
+  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
+  except ValueError as e:p.error(str(e))
+  print(json.dumps({'settings':configuration,'plannedSize':dataset_presets.planned_size(configuration)},indent=2));return
+ if a.out_dir is None:p.error('--out-dir is required unless --describe is used')
+ out=a.out_dir.resolve()
  if not any((a.plan,a.run,a.post,a.analyze,a.report)):
   a.plan=a.run=a.post=a.analyze=a.report=True
  if a.plan:
   if not a.run_prefix or any(not (c.isalnum() or c in '-_') for c in a.run_prefix):p.error('invalid --run-prefix')
-  plan(out,a.run_prefix)
+  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
+  except ValueError as e:p.error(str(e))
+  plan(out,a.run_prefix,configuration)
+ else:
+  if any(value is not None for value in (a.profile_count,a.replicates,a.design_seed,a.target_windows)):p.error('design overrides require the planning stage')
+  if a.preset and a.preset!=json.loads((out/'manifest.json').read_text()).get('preset','comparison'):
+   p.error('--preset disagrees with the saved manifest; resume using its existing design')
  if a.run:run(out,a.jobs)
  if a.post:post(out,a.jobs)
  if a.analyze:

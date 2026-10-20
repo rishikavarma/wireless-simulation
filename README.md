@@ -16,8 +16,9 @@ Relay switching selects between two satellites within the same NR cell.
 The maintained end-to-end experiment and its plots live together in
 [`scripts/dataset/`](scripts/dataset/). One-off investigations, historical plot
 and slide builders, and exploratory sweeps are preserved in ignored `local/`
-folders. All diagnostic and regression test files are archived under ignored
-`local/diagnostics/`; the dataset workflow does not depend on them.
+folders. Diagnostic and regression test files are archived under ignored
+`local/diagnostics/`; the dataset workflow does not depend on them. Maintained
+queue-calibration experiments live separately in `experiments/queue-calibration/`.
 
 ## Setup
 
@@ -37,13 +38,13 @@ The dataset scripts currently use the repository's `ns-3-dev` path; provide a
 symlink there when using another checkout. Re-running setup preserves an
 already patched checkout and rejects conflicting edits or a different commit.
 
-## Full dataset and comparison plots
+## Comparison dataset and plots
 
 Run these commands from the repository root with a **fresh output directory
 and unused prefix**:
 
 ```bash
-python3 scripts/dataset/run_dataset.py --out-dir results/full-example --run-prefix full-example --jobs 8
+python3 scripts/dataset/run_dataset.py --preset comparison --out-dir results/full-example --run-prefix full-example --jobs 8
 ```
 
 This creates **50 profiles × four matched RNG replicates**, each 130 s long,
@@ -56,11 +57,183 @@ copies the figures beside it. Reports, generated figures and raw data are
 ignored by Git. Slide decks and their previews are stored under ignored
 `local/slides/`.
 
+The 200 runs are a selected set of controlled comparisons, not every combination
+of the available knobs. Adding support for a knob does not multiply that design.
+`comparison` remains the default preset, preserving the existing configurations.
+
+## Broader full dataset (separate setting)
+
+`--preset full` reads [`scripts/dataset/full_dataset.json`](scripts/dataset/full_dataset.json).
+Its default is **2,000 configurations × 20 matched RNG repeats = 40,000 runs**.
+It uses 49 controlled profiles with automatic relay switching enabled, plus
+1,951 sampled joint configurations, stratified across nine applications, six
+TCP algorithms or UDP, and supported traffic directions. Enabling selection
+merges the formerly separate baseline and switch profile. Source/load rates,
+queue budgets, movement, bandwidth and attenuation vary together. Orbit altitude
+stays fixed at **800 km**, with 53° inclination and 8° relay spacing; automatic
+relay selection stays enabled in every full-preset configuration.
+
+Expected size is **39.6 million distinct 100 ms time bins** and **1.96 million
+non-overlapping 20-token windows** (10 history + 10 future). These are planned
+counts, not collected data or a claim that every feature vector will be unique.
+The held-out four RNG repeats give an 80/20 split: 32,000/8,000 runs.
+See [full-preset ranges and comparison with UNUM](docs/experiment.md#full-dataset-preset)
+for the scope and limits of that comparison.
+
+Inspect the setting without writing configurations or launching simulations:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --describe
+```
+
+To write configurations only, when ready:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --out-dir results/full-training --run-prefix full-training --plan
+```
+
+Later, explicitly execute that saved plan and the remaining stages:
+
+```bash
+python3 scripts/dataset/run_dataset.py --out-dir results/full-training --run --post --analyze --report --jobs 8
+```
+
+`--profile-count`, `--replicates` and `--design-seed` override planning defaults.
+`--target-windows` can instead raise the profile count to meet an explicit
+20-token-window target. For example, `--preset full --target-windows 35000000
+--describe` describes **714,300 runs / 35,000,700 windows** without creating or
+executing a plan. This is much larger than the default; a time-token count must
+not be confused with a window count when comparing datasets.
+At least 49 full-preset profiles are retained for controlled comparisons. Resuming uses the
+settings saved in the manifest, even if the JSON preset has since changed.
+The full preset writes bounded-size transport/radio shards, rather than loading
+the entire collection into memory. `dataset-index.json` and `radio-index.json`
+list those shards; derive history/future by slicing each shard's `sequences`.
+Quantile boundaries use a reproducible uniform sample of up to 200,000 training
+tokens, with no test tokens used for fitting. The existing comparison preset
+retains its monolithic archives and exact training-set quantiles.
+
+The full dataset has not been run. The queue calibration below uses short
+ns-3 experiments; the broader cross-factor configurations still need a pilot
+before collecting all 40,000 runs. Raw trace storage and runtime grow with traffic/load;
+sharding bounds processing memory, not total disk use.
+
+## Queue calibration experiments
+
+[`experiments/queue-calibration/`](experiments/queue-calibration/) contains a
+separate reproducible experiment design, runner, read-only RTT observer and
+validated reference. It does not launch the full dataset. Setup links and builds
+the calibration target alongside the main scenario. For an existing checkout:
+
+```bash
+ln -s ../../experiments/queue-calibration ns-3-dev/scratch/queue-calibration
+cd ns-3-dev
+./ns3 build queue-calibration sat-bs-handset
+cd ..
+python3 experiments/queue-calibration/calibrate.py --out-dir results/queue-calibration-new --plan --run --analyze --reference experiments/queue-calibration/reference.json --jobs 8
+```
+
+Use a fresh output directory. To resume, omit `--plan`; `--analyze` alone reads
+completed traces. `--extend` appends added load points from settings after a
+completed sweep, preserving prior configuration and source provenance.
+Generated configurations, logs, per-run traces and the detailed
+summary and calibration plots remain under ignored `results/`. The small
+versioned reference keeps the measured values and provenance available on
+another machine.
+
+The design holds altitude at **800 km**, the UE stationary in a 500 m disk,
+clear-link attenuation and no background UEs. Relay switching remains enabled.
+It measures UL and DL at both **10 and 20 MHz**, with three independent RNG runs
+(20001–20003, separate from the full dataset). Every simulation lasts 130 s;
+measurements use 20–119 s and exclude five seconds on either side of the switch.
+
+- Unloaded RTT: native TCP CBR, 128 B at 1 kbit/s. An observer attaches after
+  warm-up and records socket `LastRTT` changes, excluding the SYN handshake.
+  The reference is the median of the three per-run minimum data RTTs. This
+  includes scheduling, processing and the configured TCP delayed ACK behavior;
+  it is neither geometric propagation RTT nor rolling SRTT.
+- Service capacity: UDP CBR, 512 B, offered loads of 8, 32, 128, 512 and
+  2048 kbit/s, plus an 8192 kbit/s confirmation for the 20 MHz uplink, with a
+  fixed 64 KiB queue. The two highest loads must give
+  delivered rates within 15%, and the highest load must exceed delivery by at
+  least 50%. A 128 KiB control at the highest load checks buffer sensitivity.
+  Capacity uses received PDCP SDU rate, with application goodput reported
+  separately. This is sustainable service in this model, including its
+  scheduler, errors, RLC AM and 120 B new-PDU limit; it is not peak radio bitrate.
+
+Measured reference (three RNG runs per case; 80 completed calibration runs,
+including an earlier buffer control retained when extending the load sweep):
+
+| Bandwidth | Direction | PDCP service capacity | Minimum data RTT | Directional BDP |
+| --- | --- | ---: | ---: | ---: |
+| 10 MHz | UL | 337.1 kbit/s | 337 ms | 13.87 KiB |
+| 10 MHz | DL | 251.8 kbit/s | 308 ms | 9.47 KiB |
+| 20 MHz | UL | 715.2 kbit/s | 337 ms | 29.42 KiB |
+| 20 MHz | DL | 251.8 kbit/s | 308 ms | 9.47 KiB |
+
+The final two offered loads change delivery by less than **0.02%** in every
+case; doubling the buffer produces the same delivered rate for the control RNG.
+All 80 runs completed successfully with one relay switch each. The separate
+12-run pilot is retained under ignored results. An additional legacy-default
+regression reproduced saved application, TCP, SINR, TB, event and KPI traces
+byte for byte. All 2,000 full-preset profiles also passed geometry admission
+and calibrated-budget checks, with switching enabled and altitude fixed at
+800 km. The full dataset was not executed.
+
+Actual full-preset per-buffer budgets are:
+
+| Bandwidth | 0.5× | 1× | 2× | 4× | 8× | 16× |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 MHz | 10,240 B | 14,199 B | 28,398 B | 56,795 B | 113,589 B | 227,177 B |
+| 20 MHz | 15,065 B | 30,129 B | 60,258 B | 120,516 B | 241,032 B | 482,063 B |
+
+At 10 MHz, the nominal 0.5× budget is clamped to 10 KiB (about 0.72× the
+reference BDP). The other listed factors remain distinct.
+
+For each bandwidth, queue reference BDP is the **larger of the measured UL and
+DL products** `capacity_bits_per_second * unloaded_RTT_seconds / 8` in bytes.
+Both directions and all applications use the same byte budget at that bandwidth.
+Full-preset configurations set `application.queueSizeBytes` to the reference
+multiplied by 0.5, 1, 2, 4, 8 or 16, rounded up, with the existing **10 KiB floor**.
+The manifest records the nominal multiplier and actual bytes. A floor-clamped
+value must not be described as its nominal BDP multiple. This is a per-buffer
+limit applied to the configured RLC/device queues, not one shared memory pool.
+
+The full preset loads this measured reference instead of the former arbitrary
+10 Mbit/s sizing rate. Background load and attenuation vary against this fixed
+clear-link reference; they do not silently resize buffers. Planning rejects a
+reference whose scenario/patch hashes no longer match. Recalibrate after model
+changes. Existing comparison configurations keep their original queue sizing
+unless an explicit byte budget is supplied.
+
+## What the dataset helper modules do
+
+[`dataset_presets.py`](scripts/dataset/dataset_presets.py) decides **what to
+collect**: comparison versus full settings, reproducible knob combinations,
+geometry admission, calibrated queue bytes, RNG repeats and held-out repeats.
+It lets the 200-run comparison and 40,000-run design share one collection
+pipeline. A preset describes configurations; it does not run simulations itself.
+
+[`dataset_storage.py`](scripts/dataset/dataset_storage.py) decides **how to
+export the collected data**: bounded batches of transport/radio NPZ shards,
+indexes describing those shards, and consistent train/test membership. For the
+full setting it fits quantile bins from up to 200,000 training tokens and applies
+those same bins to both splits. UDP TCP-only fields remain NaN. The comparison
+setting keeps its existing single-file archives.
+
+These files are implementation modules, not extra dataset copies. Keeping them
+separate makes the runner smaller. Their functions are needed: presets preserve
+a reproducible design, while sharding avoids assembling all 40,000 runs in RAM.
+The functions could live in the runner, but the separate files are not an
+additional execution step or a new ns-3 dependency.
+
+## Processing and outputs
+
 Outputs include configurations, raw traces, execution logs, per-run summaries,
 metric audits, source hashes, and train/test archives. There are **73 transport
-features** and a separate **23-feature radio/KPI tensor**. Splits hold out an
-entire RNG replicate (150 training / 50 test runs); quantile boundaries are fit
-only on training data. TCP-only observations remain **NaN for UDP**.
+features** and a separate **23-feature radio/KPI tensor**. Splits hold out entire
+RNG replicates (150 training / 50 test runs in the comparison preset); quantile
+boundaries are fit only on training data. TCP-only observations remain **NaN for UDP**.
 
 Saved experiment runs and their provenance hashes remain untouched by repository
 reorganization. `run_dataset.py` executes planning, simulation, postprocessing,
@@ -78,8 +251,8 @@ python3 scripts/dataset/run_dataset.py --out-dir results/full-example --run --po
 ```
 
 Collection tools, tests, result/fix write-ups and slide materials outside the
-main workflow are preserved in ignored `local/` folders. The root README and
-the experiment explanation are the only versioned Markdown files.
+main workflow are preserved in ignored `local/` folders. Versioned Markdown is
+limited to this README, the experiment explanation and application rate reference.
 
 ## Supported traffic and metrics
 
@@ -94,8 +267,11 @@ sequence numbers, and seven interval KPIs. Optional MAC payload dumps expose
 simulated packet bytes. The PHY abstraction does not produce waveform IQ,
 DMRS samples, coded/scrambled bits, or channel-estimate arrays.
 
-See [experiment design, model, metric definitions and application rates](docs/experiment.md)
-for the settings and assumptions needed to interpret the dataset.
+See [experiment design, model and metric definitions](docs/experiment.md) and
+[all application rate details](docs/application-rates.md) for source rates,
+packet sizes, directions and the distinction between goodput and PDCP throughput.
+The TCP/UDP plot uses matched native CBR anchors: application goodput over 20–119 s
+and undelivered source bytes at run end, with each RNG repeat shown.
 
 ## Single scenario
 
@@ -106,7 +282,7 @@ cd ns-3-dev
 
 Edit the JSON configuration under `scratch/sat-bs-handset/config/`. Results go
 to `results/<output.prefix>/` at the repository root. A full run can exit 1
-when an application criterion is missed; campaign tools retain completed
+when an application criterion is missed; dataset tools retain completed
 observations and distinguish those outcomes from crashes and missing traces.
 
 ## Repository layout
@@ -115,8 +291,10 @@ observations and distinguish those outcomes from crashes and missing traces.
 scratch/sat-bs-handset/   scenario, radio/mobility, applications and telemetry
 patches/                  maintained ns-3.48 / NR v5.1 changes
 scripts/setup.sh          pinned upstream setup and smoke check
-scripts/dataset/          campaign, processing, validation, plots and report
+scripts/dataset/          presets, collection, processing, validation, plots and report
+experiments/queue-calibration/ maintained capacity/RTT calibration and reference
 docs/experiment.md        experiment design, model and metric definitions
+docs/application-rates.md source behavior, configured rates and interpretation
 local/reports/            ignored result and investigation write-ups
 local/slides/             ignored slide decks, notes and previews
 local/figures/            ignored presentation/design figures
