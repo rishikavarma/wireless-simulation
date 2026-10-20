@@ -1,14 +1,35 @@
-# Upstream ns-3 tree (clone or local symlink). Trailing slash would NOT
-# match a symlink, so keep the bare name.
+# Upstream source checkout or symlink; maintained changes live in patches/.
 ns-3-dev
+ns-3-dev/
 
-# Local / generated outputs.
-# Periodic traces: results/<output.prefix>/ from config.json.
-results/
+# Generated datasets, traces, figures, and local investigations.
+/results/
+/data/
+/datasets/
+/local/
 
-# Editor / OS
+# Optional downstream model training is outside the dataset collection workflow.
+/embedding/
+/requirements-train.txt
+
+# Keep only the experiment explanation; reports and slides belong under local/.
+/docs/*
+!/docs/experiment.md
+
+# Dataset archives generated outside results/.
+*.npz
+*.pkl
+*-seq20.json
+*-boundaries-quantile*.json
+*-bucketized.csv
+*-features.csv
+*-tokens.csv
+*-unum6.csv
+
+# Editor and Python caches.
 .DS_Store
 *.swp
 *~
 __pycache__/
 *.pyc
+.python-version

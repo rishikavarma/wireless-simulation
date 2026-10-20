@@ -16,12 +16,17 @@ namespace
 class JsonParser
 {
   public:
+    /** Store the source filename and JSON text by move, initializing the parser cursor and line
+     * counter for diagnostics.
+     */
     JsonParser(std::string path, std::string text)
         : m_path(std::move(path)),
           m_text(std::move(text))
     {
     }
 
+    /** Parse a nonempty JSON object and reject trailing data after its closing brace.
+     */
     JsonNode ParseRoot()
     {
         Skip();
@@ -34,6 +39,9 @@ class JsonParser
     }
 
   private:
+    /** Abort with the source path, current line, and parse reason; the explicit abort guarantees
+     * this routine never returns.
+     */
     [[noreturn]] void
     Fail(const std::string& why)
     {
@@ -41,6 +49,8 @@ class JsonParser
         std::abort();
     }
 
+    /** Advance across JSON whitespace while counting newlines for subsequent error messages.
+     */
     void
     Skip()
     {
@@ -63,6 +73,9 @@ class JsonParser
         }
     }
 
+    /** Skip whitespace and inspect the next character without consuming it, returning a null
+     * character at end of input.
+     */
     char
     Peek()
     {
@@ -70,6 +83,8 @@ class JsonParser
         return m_i < m_text.size() ? m_text[m_i] : '\0';
     }
 
+    /** Skip whitespace and consume one character, aborting if the input has ended.
+     */
     char
     Get()
     {
@@ -86,6 +101,8 @@ class JsonParser
         return c;
     }
 
+    /** Consume the next nonwhitespace character and fail unless it matches the required delimiter.
+     */
     void
     Expect(char want)
     {
@@ -96,6 +113,9 @@ class JsonParser
         }
     }
 
+    /** Dispatch the next token to object, string, boolean-literal, or number parsing; reject
+     * unsupported JSON value forms.
+     */
     JsonNode
     ParseValue()
     {
@@ -125,6 +145,9 @@ class JsonParser
         Fail(std::string("unexpected '") + c + "'");
     }
 
+    /** Parse key/value pairs recursively between braces, enforcing quoted keys and rejecting
+     * duplicate keys.
+     */
     JsonNode
     ParseObject()
     {
@@ -160,6 +183,9 @@ class JsonParser
         return node;
     }
 
+    /** Consume a quoted string and decode the supported escapes, rejecting raw control characters
+     * and unterminated strings.
+     */
     std::string
     ParseString()
     {
@@ -213,6 +239,9 @@ class JsonParser
         Fail("unterminated string");
     }
 
+    /** Match every byte of the required boolean literal and return its canonical scalar
+     * representation.
+     */
     JsonNode
     ParseLiteral(const char* literal, const char* stored)
     {
@@ -229,6 +258,9 @@ class JsonParser
         return node;
     }
 
+    /** Scan the JSON sign, integer, fraction, and exponent grammar and retain the original numeric
+     * text in a scalar node.
+     */
     JsonNode
     ParseNumber()
     {
@@ -293,6 +325,9 @@ class JsonParser
 
 } // namespace
 
+/** Read the entire config file into memory and parse its root object, aborting if the file cannot
+ * be opened.
+ */
 JsonNode
 LoadJsonFile(const std::string& path)
 {
@@ -303,6 +338,9 @@ LoadJsonFile(const std::string& path)
     return JsonParser(path, ss.str()).ParseRoot();
 }
 
+/** Walk a dotted path through object nodes, returning nullopt for a missing key and aborting if a
+ * path traverses or ends at the wrong node type.
+ */
 std::optional<std::string>
 JsonGet(const JsonNode& root, const std::string& path)
 {
@@ -323,6 +361,9 @@ JsonGet(const JsonNode& root, const std::string& path)
     return node->scalar;
 }
 
+/** Convert the entire scalar string with stod and abort with the key name if conversion fails or
+ * leaves trailing characters.
+ */
 double
 JsonDouble(const std::string& text, const std::string& key)
 {
@@ -340,6 +381,9 @@ JsonDouble(const std::string& text, const std::string& key)
     return 0.0;
 }
 
+/** Convert the entire scalar string with stoull and abort with the key name on conversion errors or
+ * trailing characters.
+ */
 uint64_t
 JsonUint(const std::string& text, const std::string& key)
 {
@@ -357,6 +401,9 @@ JsonUint(const std::string& text, const std::string& key)
     return 0;
 }
 
+/** Map the exact scalar literals true and false to bool, aborting with the configuration key for
+ * any other text.
+ */
 bool
 JsonBool(const std::string& text, const std::string& key)
 {

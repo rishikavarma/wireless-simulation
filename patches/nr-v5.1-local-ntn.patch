@@ -1,0 +1,1367 @@
+diff --git a/model/nr-control-messages.h b/model/nr-control-messages.h
+index fd201c8..2ea5aad 100644
+--- a/model/nr-control-messages.h
++++ b/model/nr-control-messages.h
+@@ -85,6 +85,27 @@ class NR_EXPORT NrControlMessage : public SimpleRefCount<NrControlMessage>
+      */
+     uint32_t GetSourceBwpArfcn() const;
+ 
++    /**
++     * @brief Preserve the gNB transmission slot across delayed NTN/cross-BWP delivery.
++     * @param slot Ground-clock slot to which DCI K0/K2 and RAR offsets refer
++     */
++    void SetTimingReference(const SfnSf& slot)
++    {
++        m_timingReference = slot;
++        m_hasTimingReference = true;
++    }
++
++    /**
++     * @brief Resolve the grant's slot origin without using the timing-advanced UL clock.
++     * @param localSlot Legacy reference when no NTN transmission stamp is present
++     * @return Original gNB slot, or the unchanged terrestrial fallback
++     */
++    SfnSf GetTimingReferenceOr(const SfnSf& localSlot) const
++    {
++        return m_hasTimingReference ? m_timingReference : localSlot;
++    }
++
++
+   protected:
+     /**
+      * @brief Set the MessageType
+@@ -94,6 +115,8 @@ class NR_EXPORT NrControlMessage : public SimpleRefCount<NrControlMessage>
+ 
+   private:
+     messageType m_messageType; //!< The message type
++    SfnSf m_timingReference; //!< Simulator metadata, not additional over-the-air DCI bits.
++    bool m_hasTimingReference{false}; //!< NTN grant has an explicit ground-clock origin.
+     uint32_t m_arfcn{0};       //!< Source BWP arfcn.
+ };
+ 
+diff --git a/model/nr-gnb-phy.cc b/model/nr-gnb-phy.cc
+index b54c921..db9b397 100644
+--- a/model/nr-gnb-phy.cc
++++ b/model/nr-gnb-phy.cc
+@@ -146,6 +146,12 @@ NrGnbPhy::GetTypeId()
+                           UintegerValue(2),
+                           MakeUintegerAccessor(&NrGnbPhy::SetN2Delay, &NrGnbPhy::GetN2Delay),
+                           MakeUintegerChecker<uint32_t>(0, 4))
++            .AddAttribute("NtnKOffset",
++                          "Cell-specific NTN scheduling offset added to K1 and K2 (slots)",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&NrGnbPhy::SetNtnKOffset,
++                                               &NrGnbPhy::GetNtnKOffset),
++                          MakeUintegerChecker<uint32_t>())
+             .AddAttribute("TbDecodeLatency",
+                           "Transport block decode latency",
+                           TimeValue(MicroSeconds(100)),
+@@ -498,8 +504,8 @@ NrGnbPhy::SetTddPattern(const std::vector<LteNrTddSlotType>& pattern)
+                                   &m_generateUl,
+                                   &m_dlHarqfbPosition,
+                                   0,
+-                                  GetN2Delay(),
+-                                  GetN1Delay(),
++                                  GetN2Delay() + GetNtnKOffset(),
++                                  GetN1Delay() + GetNtnKOffset(),
+                                   GetL1L2CtrlLatency());
+ }
+ 
+@@ -606,6 +612,19 @@ NrGnbPhy::SetN2Delay(uint32_t delay)
+     SetTddPattern(m_tddPattern); // Update the generate/send structures
+ }
+ 
++void
++NrGnbPhy::SetNtnKOffset(uint32_t slots)
++{
++    m_ntnKOffset = slots;
++    SetTddPattern(m_tddPattern);
++}
++
++uint32_t
++NrGnbPhy::GetNtnKOffset() const
++{
++    return m_ntnKOffset;
++}
++
+ bool
+ NrGnbPhy::DoesFhAllocationFit(uint16_t bwpId,
+                               uint32_t mcs,
+@@ -838,9 +857,10 @@ NrGnbPhy::StartSlot(const SfnSf& startSlot)
+     {
+         bool hasUlDci = false;
+         SfnSf ulSfn = m_currentSlot;
+-        ulSfn.Add(GetN2Delay());
++        const uint32_t k2 = GetN2Delay() + GetNtnKOffset();
++        ulSfn.Add(k2);
+ 
+-        if (GetN2Delay() > 0)
++        if (k2 > 0)
+         {
+             if (SlotAllocInfoExists(ulSfn))
+             {
+@@ -1816,6 +1836,15 @@ NrGnbPhy::SendCtrlChannels(const Time& varTtiPeriod)
+     // bandwidth.
+     SetSubChannels(fullBwRb, fullBwRb.size());
+ 
++    if (GetNtnKOffset() > 0)
++    {
++        // DL receive and timing-advanced UL clocks are not interchangeable.
++        // Keep the slot to which the transmitted grant's offsets apply.
++        for (const auto& msg : m_ctrlMsgs)
++        {
++            msg->SetTimingReference(m_currentSlot);
++        }
++    }
+     m_spectrumPhy->StartTxDlControlFrames(m_ctrlMsgs, varTtiPeriod);
+     m_ctrlMsgs.clear();
+ }
+diff --git a/model/nr-gnb-phy.h b/model/nr-gnb-phy.h
+index b08447c..53fb8cb 100644
+--- a/model/nr-gnb-phy.h
++++ b/model/nr-gnb-phy.h
+@@ -173,6 +173,13 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+      */
+     void SetN2Delay(uint32_t delay);
+ 
++    /**
++     * Set the cell-specific NTN scheduling offset. This is added to K1 and K2,
++     * independently of the UE processing delays N1 and N2.
++     */
++    void SetNtnKOffset(uint32_t slots);
++    uint32_t GetNtnKOffset() const;
++
+     /**
+      * \brief: Get the minimum processing delay (in slots)
+      * to decode DL DCI and decode DL Data
+@@ -938,6 +945,7 @@ class NR_EXPORT NrGnbPhy : public NrPhy
+     //!< earliest possible start of the corresponding ACK/NACK transmission (UE side)
+     uint32_t m_n2Delay{0}; //!< minimum processing delay (in slots) needed to decode UL DCI and
+                            //!< prepare UL data (UE side)
++    uint32_t m_ntnKOffset{0}; //!< cell-specific NTN round-trip scheduling offset (slots)
+ 
+     SfnSf m_currentSlot;      //!< The current slot number
+     bool m_isPrimary{false};  //!< Is this PHY a primary phy?
+diff --git a/model/nr-gnb-rrc.cc b/model/nr-gnb-rrc.cc
+index aa4998d..8ff0c72 100644
+--- a/model/nr-gnb-rrc.cc
++++ b/model/nr-gnb-rrc.cc
+@@ -3078,6 +3078,14 @@ void
+ NrGnbRrc::DoRecvRrcConnectionRequest(uint16_t rnti, NrRrcSap::RrcConnectionRequest msg)
+ {
+     NS_LOG_FUNCTION(this << rnti);
++    // Stale msg3 / RLF re-attach can arrive after the UE context was already
++    // removed (T300 / rejection timeout). GetUeManager returns nullptr then.
++    if (!HasUeManager(rnti))
++    {
++        NS_LOG_WARN("NrGnbRrc::DoRecvRrcConnectionRequest: no UeManager for RNTI="
++                    << rnti << "; ignoring stale RRC Connection Request");
++        return;
++    }
+     GetUeManager(rnti)->RecvRrcConnectionRequest(msg);
+ }
+ 
+@@ -3086,6 +3094,12 @@ NrGnbRrc::DoRecvRrcConnectionSetupCompleted(uint16_t rnti,
+                                             NrRrcSap::RrcConnectionSetupCompleted msg)
+ {
+     NS_LOG_FUNCTION(this << rnti);
++    if (!HasUeManager(rnti))
++    {
++        NS_LOG_WARN("NrGnbRrc::DoRecvRrcConnectionSetupCompleted: no UeManager for RNTI="
++                    << rnti << "; ignoring stale Setup Complete");
++        return;
++    }
+     GetUeManager(rnti)->RecvRrcConnectionSetupCompleted(msg);
+ }
+ 
+diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
+index b50fbb9..0e2f175 100644
+--- a/model/nr-mac-scheduler-ns3.cc
++++ b/model/nr-mac-scheduler-ns3.cc
+@@ -114,6 +114,11 @@ NrMacSchedulerNs3::GetTypeId()
+     static TypeId tid =
+         TypeId("ns3::NrMacSchedulerNs3")
+             .SetParent<NrMacScheduler>()
++            .AddAttribute("NtnHarqTimeoutSlots",
++                          "HARQ expiry in slots; zero uses the upstream process-count timeout",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_ntnHarqTimeoutSlots),
++                          MakeUintegerChecker<uint8_t>(0, 254))
+             .AddAttribute("CqiTimerThreshold",
+                           "The time while a CQI is valid",
+                           TimeValue(Seconds(1)),
+@@ -1212,7 +1217,9 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
+             continue;
+         }
+ 
+-        if (process.m_timer < m_macSchedSapUser->GetNumHarqProcess())
++        const uint32_t timeout = m_ntnHarqTimeoutSlots ? m_ntnHarqTimeoutSlots
++                                                     : m_macSchedSapUser->GetNumHarqProcess();
++        if (process.m_timer < timeout)
+         {
+             ++process.m_timer;
+             NS_LOG_INFO("Updated process for UE " << rnti << " number "
+diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
+index e1ae87d..265df15 100644
+--- a/model/nr-mac-scheduler-ns3.h
++++ b/model/nr-mac-scheduler-ns3.h
+@@ -1066,6 +1066,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+ 
+     uint32_t m_srsSlotCounter{0}; //!< Counter for UL slots
+ 
++    uint8_t m_ntnHarqTimeoutSlots{0}; //!< Zero keeps the upstream process-count timeout.
+     bool m_enableHarqReTx{true}; //!< Flag to enable or disable HARQ ReTx (attribute)
+ 
+     TracedCallback<uint16_t, uint16_t, const std::shared_ptr<NrMacSchedulerUeInfo>&>
+diff --git a/model/nr-pdcp.cc b/model/nr-pdcp.cc
+index e46a948..c3daa50 100644
+--- a/model/nr-pdcp.cc
++++ b/model/nr-pdcp.cc
+@@ -80,6 +80,12 @@ NrPdcp::GetTypeId()
+     static TypeId tid = TypeId("ns3::NrPdcp")
+                             .SetParent<Object>()
+                             .SetGroupName("Nr")
++                            .AddTraceSource("TxPduPacket", "PDU bytes before lower-layer delivery.",
++                                            MakeTraceSourceAccessor(&NrPdcp::m_txPduPacket),
++                                            "ns3::Packet::TracedCallback")
++                            .AddTraceSource("RxPduPacket", "PDU bytes before upper-layer delivery.",
++                                            MakeTraceSourceAccessor(&NrPdcp::m_rxPduPacket),
++                                            "ns3::Packet::TracedCallback")
+                             .AddTraceSource("TxPDU",
+                                             "PDU transmission notified to the RLC.",
+                                             MakeTraceSourceAccessor(&NrPdcp::m_txPdu),
+@@ -181,6 +187,7 @@ NrPdcp::DoTransmitPdcpSdu(NrPdcpSapProvider::TransmitPdcpSduParameters params)
+     p->AddHeader(pdcpHeader);
+     p->AddByteTag(pdcpTag, 1, pdcpHeader.GetSerializedSize());
+ 
++    m_txPduPacket(m_rnti, m_lcid, p);
+     m_txPdu(m_rnti, m_lcid, p->GetSize());
+ 
+     NrRlcSapProvider::TransmitPdcpPduParameters txParams;
+@@ -202,6 +209,7 @@ NrPdcp::DoReceivePdu(Ptr<Packet> p)
+     Time delay;
+     p->FindFirstMatchingByteTag(pdcpTag);
+     delay = Simulator::Now() - pdcpTag.GetSenderTimestamp();
++    m_rxPduPacket(m_rnti, m_lcid, p);
+     m_rxPdu(m_rnti, m_lcid, p->GetSize(), delay.GetNanoSeconds());
+ 
+     NrPdcpHeader pdcpHeader;
+diff --git a/model/nr-pdcp.h b/model/nr-pdcp.h
+index fc2ee3d..679ef99 100644
+--- a/model/nr-pdcp.h
++++ b/model/nr-pdcp.h
+@@ -157,6 +157,10 @@ class NR_EXPORT NrPdcp : public Object // SimpleRefCount<NrPdcp>
+      * Used to inform of a PDU delivery to the RLC SAP provider.
+      * The parameters are RNTI, LCID and bytes delivered
+      */
++    /** Packet PDU snapshots before transmission and before header removal at reception. */
++    TracedCallback<uint16_t, uint8_t, Ptr<const Packet>> m_txPduPacket;
++    /** Received PDU snapshot, including the protocol header. */
++    TracedCallback<uint16_t, uint8_t, Ptr<const Packet>> m_rxPduPacket;
+     TracedCallback<uint16_t, uint8_t, uint32_t> m_txPdu;
+     /**
+      * Used to inform of a PDU reception from the RLC SAP user.
+diff --git a/model/nr-rlc-am.cc b/model/nr-rlc-am.cc
+index 35eee58..c45160a 100644
+--- a/model/nr-rlc-am.cc
++++ b/model/nr-rlc-am.cc
+@@ -113,6 +113,13 @@ NrRlcAm::GetTypeId()
+                           "configured, the buffer is unlimited.",
+                           UintegerValue(10 * 1024),
+                           MakeUintegerAccessor(&NrRlcAm::m_maxTxBufferSize),
++                          MakeUintegerChecker<uint32_t>())
++            .AddAttribute("MaxDataFieldBytes",
++                          "Maximum payload bytes in a new AMD PDU. Zero disables the cap; a "
++                          "cap helps when grants shrink and retransmission resegmentation "
++                          "is unavailable.",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&NrRlcAm::m_maxDataFieldBytes),
+                           MakeUintegerChecker<uint32_t>());
+     return tid;
+ }
+@@ -263,7 +270,8 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+         NrRlcTag rlcTag(Simulator::Now());
+         rlcTag.SetTxEntityId(m_rlcEntityId);
+         packet->AddByteTag(rlcTag, 1, rlcAmHeader.GetSerializedSize());
+-        m_txPdu(m_rnti, m_lcid, packet->GetSize());
++        m_txPduPacket(m_rnti, m_lcid, packet);
++    m_txPdu(m_rnti, m_lcid, packet->GetSize());
+ 
+         // Send RLC PDU to MAC layer
+         NrMacSapProvider::TransmitPduParameters params;
+@@ -360,7 +368,8 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+ 
+                     NS_LOG_LOGIC("new AM RLC header: " << rlcAmHeader);
+ 
+-                    m_txPdu(m_rnti, m_lcid, packet->GetSize());
++                    m_txPduPacket(m_rnti, m_lcid, packet);
++    m_txPdu(m_rnti, m_lcid, packet->GetSize());
+ 
+                     // Send RLC PDU to MAC layer
+                     NrMacSapProvider::TransmitPduParameters params;
+@@ -466,7 +475,14 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+     rlcAmHeader.SetDataPdu();
+ 
+     // Build Data field
++    // A PDU built for a large grant cannot be retransmitted once the uplink
++    // MCS falls and later grants are smaller. One such SN then blocks delivery
++    // for the rest of the connection. Stay within a size later grants can carry.
+     uint32_t nextSegmentSize = txOpParams.bytes - 4;
++    if (m_maxDataFieldBytes > 0 && nextSegmentSize > m_maxDataFieldBytes)
++    {
++        nextSegmentSize = m_maxDataFieldBytes;
++    }
+     uint32_t nextSegmentId = 1;
+     uint32_t dataFieldAddedSize = 0;
+     std::vector<Ptr<Packet>> dataField;
+@@ -768,6 +784,7 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+     m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()).m_retxCount = 0;
+     m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()).m_waitingSince = Simulator::Now();
+ 
++    m_txPduPacket(m_rnti, m_lcid, packet);
+     m_txPdu(m_rnti, m_lcid, packet->GetSize());
+ 
+     // Send RLC PDU to MAC layer
+@@ -815,6 +832,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+ 
+     delay = Simulator::Now() - rlcTag.GetSenderTimestamp();
+ 
++    m_rxPduPacket(m_rnti, m_lcid, rxPduParams.p);
+     m_rxPdu(m_rnti, m_lcid, rxPduParams.p->GetSize(), delay.GetNanoSeconds());
+ 
+     if (rlcAmHeader.IsDataPdu())
+diff --git a/model/nr-rlc-am.h b/model/nr-rlc-am.h
+index 1c78e82..4570661 100644
+--- a/model/nr-rlc-am.h
++++ b/model/nr-rlc-am.h
+@@ -207,6 +207,7 @@ class NR_EXPORT NrRlcAm : public NrRlc
+     uint16_t m_maxRetxThreshold; ///< \todo How these parameters are configured???
+     uint16_t m_pollPdu;          ///< poll PDU
+     uint16_t m_pollByte;         ///< poll byte
++    uint32_t m_maxDataFieldBytes{0}; ///< optional new AMD PDU payload cap; 0 disables it
+ 
+     /// Set once the maxRetxThreshold has been reached and the RLF callback fired,
+     /// so the radio-link-failure indication is raised at most once per RLC entity.
+diff --git a/model/nr-rlc.cc b/model/nr-rlc.cc
+index 2c0af2f..e2c97c3 100644
+--- a/model/nr-rlc.cc
++++ b/model/nr-rlc.cc
+@@ -99,6 +99,12 @@ NrRlc::GetTypeId()
+     static TypeId tid = TypeId("ns3::NrRlc")
+                             .SetParent<Object>()
+                             .SetGroupName("Nr")
++                            .AddTraceSource("TxPduPacket", "PDU bytes before lower-layer delivery.",
++                                            MakeTraceSourceAccessor(&NrRlc::m_txPduPacket),
++                                            "ns3::Packet::TracedCallback")
++                            .AddTraceSource("RxPduPacket", "PDU bytes before upper-layer delivery.",
++                                            MakeTraceSourceAccessor(&NrRlc::m_rxPduPacket),
++                                            "ns3::Packet::TracedCallback")
+                             .AddTraceSource("TxPDU",
+                                             "PDU transmission notified to the MAC.",
+                                             MakeTraceSourceAccessor(&NrRlc::m_txPdu),
+diff --git a/model/nr-rlc.h b/model/nr-rlc.h
+index 8ca8c2b..51bae27 100644
+--- a/model/nr-rlc.h
++++ b/model/nr-rlc.h
+@@ -267,6 +267,10 @@ class NR_EXPORT NrRlc : public Object // SimpleRefCount<NrRlc>
+     /**
+      * Used to inform of a PDU delivery to the MAC SAP provider
+      */
++    /** Packet PDU snapshots before transmission and before header removal at reception. */
++    TracedCallback<uint16_t, uint8_t, Ptr<const Packet>> m_txPduPacket;
++    /** Received PDU snapshot, including the protocol header. */
++    TracedCallback<uint16_t, uint8_t, Ptr<const Packet>> m_rxPduPacket;
+     TracedCallback<uint16_t, uint8_t, uint32_t> m_txPdu;
+     /**
+      * Used to inform of a PDU reception from the MAC SAP user
+diff --git a/model/nr-spectrum-phy.cc b/model/nr-spectrum-phy.cc
+index 132cb70..e53b930 100644
+--- a/model/nr-spectrum-phy.cc
++++ b/model/nr-spectrum-phy.cc
+@@ -138,6 +138,11 @@ NrSpectrumPhy::GetTypeId()
+         TypeId("ns3::NrSpectrumPhy")
+             .SetParent<SpectrumPhy>()
+             .AddConstructor<NrSpectrumPhy>()
++            .AddAttribute("NtnRxBoundaryTolerance",
++                          "Maximum adjacent RX-window overlap accommodated for NTN drift (<=100 ns)",
++                          TimeValue(Seconds(0)),
++                          MakeTimeAccessor(&NrSpectrumPhy::m_ntnBoundaryTolerance),
++                          MakeTimeChecker(Seconds(0), NanoSeconds(100)))
+             .AddAttribute("DataErrorModelEnabled",
+                           "Activate/Deactivate the error model of data (TBs of PDSCH and PUSCH) "
+                           "[by default is active].",
+@@ -186,6 +191,18 @@ NrSpectrumPhy::GetTypeId()
+                 "This traced callback is triggered every time that the channel is occupied",
+                 MakeTraceSourceAccessor(&NrSpectrumPhy::m_channelOccupied),
+                 "ns3::Time::TracedCallback")
++            .AddTraceSource("NtnBoundaryOverlap", "Overlap trimmed at an adjacent NTN receive boundary.",
++                            MakeTraceSourceAccessor(&NrSpectrumPhy::m_ntnBoundaryTrace),
++                            "ns3::Time::TracedCallback")
++            .AddTraceSource("HarqDecision", "Generated HARQ feedback after a reception.",
++                            MakeTraceSourceAccessor(&NrSpectrumPhy::m_harqDecision),
++                            "ns3::TracedCallback::Uint16Uint8Bool")
++            .AddTraceSource("TxTransportBlock", "Packet burst and actual data allocation.",
++                            MakeTraceSourceAccessor(&NrSpectrumPhy::m_txTransportBlock),
++                            "ns3::PacketBurst::TracedCallback")
++            .AddTraceSource("RxMacPdu", "Received MAC PDU and analytical decoding outcome.",
++                            MakeTraceSourceAccessor(&NrSpectrumPhy::m_rxMacPdu),
++                            "ns3::Packet::TracedCallback")
+             .AddTraceSource("TxDataTrace",
+                             "Indicates when the channel is being occupied by a data transmission",
+                             MakeTraceSourceAccessor(&NrSpectrumPhy::m_txDataTrace),
+@@ -858,6 +875,7 @@ NrSpectrumPhy::StartTxDataFrames(const Ptr<PacketBurst>& pb,
+         txParams->cellId = GetCellId();
+         txParams->ctrlMsgList = ctrlMsgList;
+         txParams->rnti = dci->m_rnti;
++        m_txTransportBlock(pb, dci);
+         txParams->precodingMatrix = dci->m_precMats;
+ 
+         /* This section is used for trace */
+@@ -1224,13 +1242,19 @@ NrSpectrumPhy::AddSrsSnrReportCallback(SrsSnrReportCallback callback)
+ // private
+ 
+ void
+-NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params)
++NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params, Time duration)
+ {
++    duration = duration.IsZero() ? params->duration : duration;
++    if (DeferNtnBoundaryRx(params, RX_DATA, duration))
++    {
++        return;
++    }
++
+     NS_LOG_FUNCTION(this);
+ 
+     m_rxDataTrace(m_phy->GetCurrentSfnSf(),
+                   params->psd,
+-                  params->duration,
++                  duration,
+                   m_phy->GetBwpId(),
+                   m_phy->GetCellId());
+ 
+@@ -1266,8 +1290,13 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+     case RX_UL_CTRL:
+         /* no break */
+     case RX_UL_SRS:
+-        NS_FATAL_ERROR("Cannot receive DATA while receiving CTRL.");
+-        break;
++        // Bent-pipe / NTN delay can make a DATA burst arrive while the PHY is
++        // still in a CTRL RX state. Treat as a stale overlap (same spirit as
++        // the handover TX overlap above) instead of aborting the whole run.
++        NS_LOG_WARN("NrSpectrumPhy::StartRxData: DATA while receiving CTRL; "
++                    "ignoring overlapping DATA. cellId:"
++                    << params->cellId);
++        return;
+     case CCA_BUSY:
+         NS_LOG_INFO("Start receiving DATA while in CCA_BUSY state.");
+         /* no break */
+@@ -1294,14 +1323,22 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+         // reaches this point while a reception is still open. Decline to decode it rather than
+         // corrupting the interference window; its power is still accounted for, because
+         // AddSignalMimo() has already registered it as interference in StartRx().
+-        if (!m_rxPacketBurstList.empty() &&
+-            ((m_firstRxStart != Simulator::Now()) || (m_firstRxDuration != params->duration)))
++        const bool exactlyAligned = m_firstRxStart == Simulator::Now() &&
++                                    m_firstRxDuration == duration;
++        const bool ntnAligned = m_isGnb &&
++            Abs(m_firstRxStart - Simulator::Now()) <= m_ntnBoundaryTolerance &&
++            Abs(m_firstRxStart + m_firstRxDuration - Simulator::Now() - duration) <=
++                m_ntnBoundaryTolerance;
++        // Distinct NTN UEs have small differential delay drift even with timing
++        // advance. Keep simultaneous OFDMA signals within the configured bound;
++        // rejecting every nonzero skew silently drops all but the first UE.
++        if (!m_rxPacketBurstList.empty() && !exactlyAligned && !ntnAligned)
+         {
+             NS_LOG_WARN("NrSpectrumPhy::StartRxData: discarding misaligned signal from cellId:"
+                         << params->cellId << " rnti:" << params->rnti << " (firstRxStart:"
+                         << m_firstRxStart.As(Time::US) << " now:" << Simulator::Now().As(Time::US)
+                         << " firstRxDuration:" << m_firstRxDuration.As(Time::US)
+-                        << " duration:" << params->duration.As(Time::US) << ")");
++                        << " duration:" << duration.As(Time::US) << ")");
+             return;
+         }
+ 
+@@ -1312,11 +1349,11 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+             NS_ASSERT(m_state == IDLE || m_state == CCA_BUSY);
+             // first transmission, i.e., we're IDLE and we start RX
+             m_firstRxStart = Simulator::Now();
+-            m_firstRxDuration = params->duration;
+-            NS_LOG_LOGIC(this << " scheduling EndRx with delay " << params->duration.GetSeconds()
++            m_firstRxDuration = duration;
++            NS_LOG_LOGIC(this << " scheduling EndRx with delay " << duration.GetSeconds()
+                               << "s");
+ 
+-            Simulator::Schedule(params->duration, &NrSpectrumPhy::EndRxData, this);
++            Simulator::Schedule(duration, &NrSpectrumPhy::EndRxData, this);
+         }
+         else
+         {
+@@ -1325,11 +1362,12 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+             // should occur at the same time and have the same
+             // duration, otherwise the interference calculation
+             // won't be correct
+-            NS_ASSERT((m_firstRxStart == Simulator::Now()) &&
+-                      (m_firstRxDuration == params->duration));
++            NS_ASSERT(Abs(m_firstRxStart - Simulator::Now()) <= m_ntnBoundaryTolerance &&
++                      Abs(m_firstRxStart + m_firstRxDuration - Simulator::Now() - duration) <=
++                          m_ntnBoundaryTolerance);
+         }
+ 
+-        ChangeState(RX_DATA, params->duration);
++        ChangeState(RX_DATA, m_firstRxStart + m_firstRxDuration - Simulator::Now());
+ 
+         if (params->packetBurst && !params->packetBurst->GetPackets().empty())
+         {
+@@ -1349,8 +1387,14 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+ }
+ 
+ void
+-NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& params)
++NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& params, Time duration)
+ {
++    duration = duration.IsZero() ? params->duration : duration;
++    if (DeferNtnBoundaryRx(params, RX_DL_CTRL, duration))
++    {
++        return;
++    }
++
+     // The current code of this function assumes:
+     // that this function is called only when cellId = m_cellId, which means
+     // that UE can start to receive DL CTRL only from its own cellId,
+@@ -1380,11 +1424,11 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
+     case IDLE: {
+         NS_ASSERT(m_rxControlMessageList.empty());
+         NS_LOG_LOGIC(this << "receiving DL CTRL from cellId:" << params->cellId
+-                          << "and scheduling EndRx with delay " << params->duration);
++                          << "and scheduling EndRx with delay " << duration);
+         // store the DCIs
+         m_rxControlMessageList = params->ctrlMsgList;
+-        Simulator::Schedule(params->duration, &NrSpectrumPhy::EndRxCtrl, this);
+-        ChangeState(RX_DL_CTRL, params->duration);
++        Simulator::Schedule(duration, &NrSpectrumPhy::EndRxCtrl, this);
++        ChangeState(RX_DL_CTRL, duration);
+         break;
+     }
+     default: {
+@@ -1395,8 +1439,14 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
+ }
+ 
+ void
+-NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params)
++NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params, Time duration)
+ {
++    duration = duration.IsZero() ? params->duration : duration;
++    if (DeferNtnBoundaryRx(params, RX_UL_CTRL, duration))
++    {
++        return;
++    }
++
+     // The current code of this function assumes:
+     // 1) that this function is called only when cellId = m_cellId
+     // 2) this function should be only called for gNB, only gNB should enter into reception of
+@@ -1410,10 +1460,11 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+         NS_FATAL_ERROR("Cannot RX UL CTRL while TX.");
+         break;
+     case RX_DATA:
+-        NS_FATAL_ERROR("Cannot RX UL CTRL while receiving DATA.");
++        NS_FATAL_ERROR("Cannot RX UL CTRL while receiving DATA. remainingNs="
++                       << (m_firstRxStart + m_firstRxDuration - Simulator::Now()).GetNanoSeconds());
+         break;
+     case RX_UL_SRS:
+-        NS_FATAL_ERROR("Cannot start RX UL CTRL while already receiving SRS.");
++        NS_FATAL_ERROR("Cannot start RX UL CTRL while already receiving SRS. remainingNs=" << (m_ntnRxWindowEnd-Simulator::Now()).GetNanoSeconds());
+         break;
+     case RX_DL_CTRL:
+         NS_FATAL_ERROR("gNB should not be in RX_DL_CTRL state.");
+@@ -1430,17 +1481,18 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+             // first transmission, i.e., we're IDLE and we start RX
+             NS_ASSERT(m_rxControlMessageList.empty());
+             m_firstRxStart = Simulator::Now();
+-            m_firstRxDuration = params->duration;
+-            NS_LOG_LOGIC(this << " scheduling EndRx with delay " << params->duration);
++            m_firstRxDuration = duration;
++            NS_LOG_LOGIC(this << " scheduling EndRx with delay " << duration);
+             // store the DCIs
+             m_rxControlMessageList = params->ctrlMsgList;
+-            Simulator::Schedule(params->duration, &NrSpectrumPhy::EndRxCtrl, this);
+-            ChangeState(RX_UL_CTRL, params->duration);
++            Simulator::Schedule(duration, &NrSpectrumPhy::EndRxCtrl, this);
++            ChangeState(RX_UL_CTRL, duration);
+         }
+         else // already in RX_UL_CTRL state, just add new CTRL messages from other UE
+         {
+-            NS_ASSERT((m_firstRxStart == Simulator::Now()) &&
+-                      (m_firstRxDuration == params->duration));
++            NS_ASSERT(Abs(m_firstRxStart - Simulator::Now()) <= m_ntnBoundaryTolerance &&
++                      Abs(m_firstRxStart + m_firstRxDuration - Simulator::Now() - duration) <=
++                          m_ntnBoundaryTolerance);
+             m_rxControlMessageList.insert(m_rxControlMessageList.end(),
+                                           params->ctrlMsgList.begin(),
+                                           params->ctrlMsgList.end());
+@@ -1455,8 +1507,14 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+ }
+ 
+ void
+-NrSpectrumPhy::StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params)
++NrSpectrumPhy::StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params, Time duration)
+ {
++    duration = duration.IsZero() ? params->duration : duration;
++    if (DeferNtnBoundaryRx(params, RX_UL_SRS, duration))
++    {
++        return;
++    }
++
+     NS_LOG_FUNCTION(this);
+     // The current code of this function assumes:
+     // 1) that this function is called only when cellId = m_cellId
+@@ -1494,13 +1552,13 @@ NrSpectrumPhy::StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& para
+         // empty
+         NS_ASSERT(m_rxControlMessageList.empty());
+         m_firstRxStart = Simulator::Now();
+-        m_firstRxDuration = params->duration;
++        m_firstRxDuration = duration;
+         NS_LOG_LOGIC(this << " scheduling EndRx for SRS signal reception with delay "
+-                          << params->duration);
++                          << duration);
+         // store the SRS message in the CTRL message list
+         m_rxControlMessageList = params->ctrlMsgList;
+-        Simulator::Schedule(params->duration, &NrSpectrumPhy::EndRxSrs, this);
+-        ChangeState(RX_UL_SRS, params->duration);
++        Simulator::Schedule(duration, &NrSpectrumPhy::EndRxSrs, this);
++        ChangeState(RX_UL_SRS, duration);
+     }
+     break;
+     default: {
+@@ -1535,11 +1593,64 @@ NrSpectrumPhy::SetIsGnb(bool isGnb)
+     m_isGnb = isGnb;
+ }
+ 
++bool
++NrSpectrumPhy::DeferNtnBoundaryRx(Ptr<const SpectrumSignalParameters> params, State incoming,
++                                  Time duration)
++{
++    if (m_ntnBoundaryTolerance.IsZero() || m_state == incoming ||
++        (m_state != RX_DATA && m_state != RX_DL_CTRL && m_state != RX_UL_CTRL && m_state != RX_UL_SRS))
++    {
++        return false;
++    }
++    const Time remaining = m_ntnRxWindowEnd - Simulator::Now();
++    const Time wait = remaining + NanoSeconds(1);
++    if (remaining.IsStrictlyNegative() || remaining > m_ntnBoundaryTolerance || duration <= wait)
++    {
++        return false; // Preserve the original error handling for larger scheduling errors.
++    }
++    // StartRx already registered params in m_allSignalsMimo. MIMO covariance
++    // excludes desired signals by object identity, so a copy here would be
++    // counted as an external interferer against its own original signal.
++    // Shorten only the receiver window and retain that original identity.
++    ++m_ntnBoundaryAdjustments;
++    m_ntnBoundaryTrace(remaining);
++    Simulator::Schedule(wait, &NrSpectrumPhy::RetryNtnBoundaryRx, this, params, incoming,
++                        duration - wait);
++    return true;
++}
++
++void
++NrSpectrumPhy::RetryNtnBoundaryRx(Ptr<const SpectrumSignalParameters> params, State incoming,
++                                  Time duration)
++{
++    // Receive handlers do not mutate signal parameters; the cast preserves
++    // their existing interface while retaining the registered object itself.
++    auto signal = ConstCast<SpectrumSignalParameters>(params);
++    switch (incoming)
++    {
++    case RX_DATA:
++        StartRxData(DynamicCast<NrSpectrumSignalParametersDataFrame>(signal), duration);
++        break;
++    case RX_DL_CTRL:
++        StartRxDlCtrl(DynamicCast<NrSpectrumSignalParametersDlCtrlFrame>(signal), duration);
++        break;
++    case RX_UL_CTRL:
++        StartRxUlCtrl(DynamicCast<NrSpectrumSignalParametersUlCtrlFrame>(signal), duration);
++        break;
++    case RX_UL_SRS:
++        StartRxSrs(DynamicCast<NrSpectrumSignalParametersUlCtrlFrame>(signal), duration);
++        break;
++    default:
++        NS_FATAL_ERROR("Unexpected deferred NTN reception type");
++    }
++}
++
+ void
+ NrSpectrumPhy::ChangeState(State newState, Time duration)
+ {
+     NS_LOG_LOGIC(this << " change state: " << m_state << " -> " << newState);
+     m_state = newState;
++    m_ntnRxWindowEnd = Simulator::Now() + duration;
+ 
+     if (newState == RX_DATA || newState == RX_DL_CTRL || newState == RX_UL_CTRL || newState == TX ||
+         newState == CCA_BUSY)
+@@ -1741,6 +1852,7 @@ NrSpectrumPhy::SendUlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
+     }
+ 
+     // Send the feedback
++    m_harqDecision(rnti, tbInfo.m_expected.m_harqProcessId, !tbInfo.m_isCorrupted);
+     m_phyUlHarqFeedbackCallback(harqUlInfo);
+ 
+     // Arrange the history
+@@ -1775,6 +1887,7 @@ NrSpectrumPhy::SendDlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
+     }
+ 
+     // Send the feedback
++    m_harqDecision(rnti, tbInfo.m_expected.m_harqProcessId, !tbInfo.m_isCorrupted);
+     m_phyDlHarqFeedbackCallback(harqDlInfo);
+ 
+     // Arrange the history
+@@ -1826,6 +1939,7 @@ NrSpectrumPhy::ProcessReceivedPacketBurst()
+             }
+             auto& tbInfo = itTb->second;
+ 
++            m_rxMacPdu(packet, rnti, tbInfo.m_isCorrupted);
+             if (!tbInfo.m_isCorrupted)
+             {
+                 m_phyRxDataEndOkCallback(packet);
+@@ -2175,6 +2289,14 @@ NrSpectrumPhy::ScheduleCsiIm(Ptr<SpectrumSignalParameters> csiRsParams) const
+     Simulator::Schedule(fakeCsiImSignal->duration, &NrInterference::EndRx, m_interferenceCsiIm);
+ }
+ 
++bool
++NrSpectrumPhy::IsReceivingDlData(uint16_t rnti) const
++{
++    const auto tb = m_transportBlocks.find(rnti);
++    return !m_isGnb && m_state == RX_DATA && tb != m_transportBlocks.end() &&
++           tb->second.m_expected.m_isDownlink;
++}
++
+ bool
+ NrSpectrumPhy::IsUeScheduled() const
+ {
+diff --git a/model/nr-spectrum-phy.h b/model/nr-spectrum-phy.h
+index 0cfa850..3e18923 100644
+--- a/model/nr-spectrum-phy.h
++++ b/model/nr-spectrum-phy.h
+@@ -80,6 +80,15 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+      * @return the object TypeId
+      */
+     static TypeId GetTypeId();
++    uint64_t GetNtnRxBoundaryAdjustments() const { return m_ntnBoundaryAdjustments; }
++
++    /**
++     * @brief Check for an actual downlink reception with an expected TB for the UE.
++     * @param rnti UE identifier
++     * @return True until physical reception ends, independently of local slot callbacks.
++     */
++    bool IsReceivingDlData(uint16_t rnti) const;
++
+ 
+     /**
+      * @brief NrSpectrumPhy constructor
+@@ -662,19 +671,25 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+ 
+     /**
+      * @brief Function is called when what is being received is holding data
+-     * @para params spectrum parameters that are holding information regarding data frame
++     * @param params spectrum parameters that are holding information regarding data frame
++     * @param duration remaining RX window, or zero for the original signal duration
+      */
+-    void StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params);
++    void StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& params,
++                     Time duration = Time(0));
+     /**
+      * @brief Function that is called when is being received DL CTRL
+      * @param params holds DL CTRL frame signal parameters structure
++     * @param duration remaining RX window, or zero for the original signal duration
+      */
+-    void StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& params);
++    void StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& params,
++                       Time duration = Time(0));
+     /**
+      * @brief Function that is called when is being received UL CTRL
+      * @param params holds UL CTRL frame signal parameters structure
++     * @param duration remaining RX window, or zero for the original signal duration
+      */
+-    void StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params);
++    void StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params,
++                       Time duration = Time(0));
+     /**
+      * @brief Function that is called when is being received CSI-RS signal
+      * @param csiRsParams holds CSI-RS signal parameters
+@@ -682,10 +697,12 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+     void StartRxCsiRs(const Ptr<NrSpectrumSignalParametersCsiRs>& csiRsParams);
+     /**
+      * @brief Function that is called when is being received SRS
+-     * @param param should hold UL CTRL frame signal parameters containing only
++     * @param params should hold UL CTRL frame signal parameters containing only
+      * one CTRL message which should be of type SRS
++     * @param duration remaining RX window, or zero for the original signal duration
+      */
+-    void StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params);
++    void StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& params,
++                    Time duration = Time(0));
+     /**
+      * @brief Checks if CSI-IM measurement is needed, if not, then it checks if needed to
+      * call directly the generation of CSI feedback
+@@ -838,6 +855,26 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+     std::list<Ptr<NrControlMessage>>
+         m_rxControlMessageList; //!< the list of received control messages
+ 
++    /**
++     * Defer a bounded adjacent-window overlap without copying the physical signal.
++     * @param params original signal already registered with the interference calculators
++     * @param incoming receive-state type
++     * @param duration remaining duration of this receive attempt
++     * @return whether the receive attempt was deferred
++     */
++    bool DeferNtnBoundaryRx(Ptr<const SpectrumSignalParameters> params, State incoming,
++                            Time duration);
++    /**
++     * Retry with the original signal identity and a separately shortened RX window.
++     * @param params original signal registered with the interference calculators
++     * @param incoming receive-state type
++     * @param duration remaining receive window, preserving the original on-air end
++     */
++    void RetryNtnBoundaryRx(Ptr<const SpectrumSignalParameters> params, State incoming,
++                            Time duration);
++    Time m_ntnBoundaryTolerance{Seconds(0)};
++    Time m_ntnRxWindowEnd{Seconds(0)};
++    uint64_t m_ntnBoundaryAdjustments{0};
+     Time m_firstRxStart{
+         Seconds(0)}; //!< this is needed to save the time at which we lock down onto signal
+     Time m_firstRxDuration{Seconds(0)}; //!< the duration of the current reception
+@@ -875,6 +912,14 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+     TracedCallback<Time>
+         m_channelOccupied; //!< trace callback that is notifying of total time that this spectrum
+                            //!< phy sees the channel occupied, by others and by itself
++    /** Accommodated NTN receive-window overlap, before the receiver retry. */
++    TracedCallback<Time> m_ntnBoundaryTrace;
++    /** HARQ feedback generation: RNTI, process ID, ACK. */
++    TracedCallback<uint16_t, uint8_t, bool> m_harqDecision;
++    /** Actual scheduled transport-block packet burst and allocation at transmission. */
++    TracedCallback<Ptr<const PacketBurst>, std::shared_ptr<DciInfoElementTdma>> m_txTransportBlock;
++    /** MAC PDU bytes at the PHY decoder boundary, with analytical corruption outcome. */
++    TracedCallback<Ptr<const Packet>, uint16_t, bool> m_rxMacPdu;
+     TracedCallback<Time> m_txDataTrace; //!< trace callback that is notifying when this spectrum phy
+                                         //!< starts to occupy the channel with data transmission
+     TracedCallback<Time> m_txCtrlTrace; //!< trace callback that is notifying when this spectrum phy
+diff --git a/model/nr-ue-mac.cc b/model/nr-ue-mac.cc
+index cf81e7d..a63d10e 100644
+--- a/model/nr-ue-mac.cc
++++ b/model/nr-ue-mac.cc
+@@ -338,6 +338,12 @@ NrUeMac::GetRnti() const
+     return m_rnti;
+ }
+ 
++void
++NrUeMac::SetNtnKOffset(uint32_t slots)
++{
++    m_ntnKOffset = slots;
++}
++
+ uint64_t
+ NrUeMac::GetImsi() const
+ {
+@@ -409,6 +415,7 @@ NrUeMac::DoTransmitPdu(NrMacSapProvider::TransmitPduParameters params)
+     NrMacHeaderVs header;
+     header.SetLcId(params.lcid);
+     header.SetSize(params.pdu->GetSize());
++    m_rlcPduBytesSent += params.pdu->GetSize();
+ 
+     params.pdu->AddHeader(header);
+ 
+@@ -435,6 +442,7 @@ NrUeMac::DoTransmitBufferStatusReport(NrMacSapProvider::BufferStatusReportParame
+ {
+     NS_LOG_FUNCTION(this << static_cast<uint32_t>(params.lcid));
+ 
++    ++m_bsrRevision[params.lcid];
+     auto it = m_ulBsrReceived.find(params.lcid);
+ 
+     NS_LOG_INFO("Received BSR for LC Id" << static_cast<uint32_t>(params.lcid));
+@@ -777,7 +785,7 @@ NrUeMac::DoReceivePhyPdu(Ptr<Packet> p)
+ }
+ 
+ void
+-NrUeMac::RecvRaResponse(NrBuildRarListElement_s raResponse)
++NrUeMac::RecvRaResponse(NrBuildRarListElement_s raResponse, const SfnSf& referenceSlot)
+ {
+     NS_LOG_FUNCTION(this);
+     m_waitingForRaResponse = false;
+@@ -788,7 +796,7 @@ NrUeMac::RecvRaResponse(NrBuildRarListElement_s raResponse)
+                          << " at: " << Simulator::Now().As(Time::MS));
+     // Save data for MSG3
+     m_rnti = raResponse.ulMsg3Dci->m_rnti;
+-    m_ulDciSfnsf = m_currentSlot;
++    m_ulDciSfnsf = referenceSlot;
+     m_ulDciSfnsf.Add(raResponse.k2Delay);
+     m_ulDciTotalUsed = 0;
+     m_ulDci = raResponse.ulMsg3Dci;
+@@ -834,7 +842,7 @@ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
+ {
+     NS_LOG_FUNCTION(this);
+ 
+-    SfnSf dataSfn = m_currentSlot;
++    SfnSf dataSfn = dciMsg->GetTimingReferenceOr(m_currentSlot);
+     dataSfn.Add(dciMsg->GetKDelay());
+ 
+     // Saving the data we need in DoTransmitPdu
+@@ -969,13 +977,19 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
+         return;
+     }
+ 
++    const uint32_t usedAtStart = m_ulDciTotalUsed;
+     uint32_t bytesPerLcId = usefulTbs / activeLcsRetx;
+ 
+     for (auto& itBsr : m_ulBsrReceived)
+     {
+         auto& bsr = itBsr.second;
+ 
+-        if (m_ulDciTotalUsed + bytesPerLcId <= usefulTbs)
++        if (bsr.retxQueueSize == 0)
++        {
++            continue;
++        }
++        // usefulTbs is the remaining phase budget, not an absolute TB endpoint.
++        if ((m_ulDciTotalUsed - usedAtStart) + bytesPerLcId <= usefulTbs)
+         {
+             NrMacSapUser::TxOpportunityParameters txParams;
+             txParams.lcid = bsr.lcid;
+@@ -990,15 +1004,16 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
+                                                     "of "
+                                                  << bytesPerLcId << " B for a RETX PDU");
+ 
++            const uint64_t sentBefore = m_rlcPduBytesSent;
++            const uint64_t revision = m_bsrRevision[bsr.lcid];
+             m_lcInfoMap.at(bsr.lcid).macSapUser->NotifyTxOpportunity(txParams);
+-            // After this call, m_ulDciTotalUsed has been updated with the
+-            // correct amount of bytes... but it is up to us in updating the BSR
+-            // value, subtracting the amount of bytes transmitted
+-
+-            // We need to use std::min here because bytesPerLcId can be
+-            // greater than bsr.txQueueSize because scheduler can assign
+-            // more bytes than needed due to how TB size is computed.
+-            bsr.retxQueueSize -= std::min(bytesPerLcId, bsr.retxQueueSize);
++            const uint32_t sent = static_cast<uint32_t>(m_rlcPduBytesSent - sentBefore);
++            // An undersized grant may send nothing. Never hide that pending PDU
++            // from the scheduler, or overwrite a fresh BSR issued in the callback.
++            if (m_bsrRevision[bsr.lcid] == revision)
++            {
++                bsr.retxQueueSize -= std::min(sent, bsr.retxQueueSize);
++            }
+         }
+         else
+         {
+@@ -1026,10 +1041,12 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+     constexpr uint32_t minTxOpBytes = 7;
+     constexpr uint32_t rlcAmWorstCaseHeaderBytes = 4;
+ 
++    const uint32_t usedAtStart = m_ulDciTotalUsed;
++
+     // Apply shortest-job first policy to prioritize lcids with less data
+-    while (m_ulDciTotalUsed < usefulTbs)
++    while (m_ulDciTotalUsed - usedAtStart < usefulTbs)
+     {
+-        uint32_t availableBytes = usefulTbs - m_ulDciTotalUsed;
++        uint32_t availableBytes = usefulTbs - (m_ulDciTotalUsed - usedAtStart);
+         if (availableBytes < minTxOpBytes)
+         {
+             NS_LOG_WARN("Not enough bytes available to send a TxPDU, skipping");
+@@ -1101,15 +1118,21 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+                                              << " of a TxOpp "
+                                                 "of "
+                                              << bytesPerLcId << " B for a TX PDU");
++        const uint64_t sentBefore = m_rlcPduBytesSent;
++        const uint64_t revision = m_bsrRevision[bsr.lcid];
+         m_lcInfoMap.at(bsr.lcid).macSapUser->NotifyTxOpportunity(txParams);
+-        // After this call, m_ulDciTotalUsed has been updated with the
+-        // correct amount of bytes... but it is up to us in updating the BSR
+-        // value, subtracting the amount of bytes transmitted
+-
+-        // We need to use std::min here because bytesPerLcId can be
+-        // greater than bsr.txQueueSize because scheduler can assign
+-        // more bytes than needed due to how TB size is computed.
+-        bsr.txQueueSize -= std::min(bytesPerLcId, bsr.txQueueSize);
++        const uint32_t sent = static_cast<uint32_t>(m_rlcPduBytesSent - sentBefore);
++        if (sent == 0)
++        {
++            // AM can prioritize a retransmission that does not fit this offer.
++            // Keep the unsent estimate and stop instead of falsely draining it.
++            break;
++        }
++        if (m_bsrRevision[bsr.lcid] == revision)
++        {
++            // This is a byte estimate; later RLC BSRs refresh exact SDU backlog.
++            bsr.txQueueSize -= std::min(sent, bsr.txQueueSize);
++        }
+     }
+ }
+ 
+@@ -1294,7 +1317,7 @@ NrUeMac::DoReceiveControlMessage(Ptr<NrControlMessage> msg)
+             {
+                 if (it->rarPayload.raPreambleId == m_raPreambleId)
+                 {
+-                    RecvRaResponse(it->rarPayload);
++                    RecvRaResponse(it->rarPayload, rarMsg->GetTimingReferenceOr(m_currentSlot));
+                 }
+             }
+         }
+@@ -1408,6 +1431,7 @@ NrUeMac::SendRaPreamble(bool contention)
+                                      << " at: " << Simulator::Now().As(Time::MS));
+     Time raWindowBegin = m_phySapProvider->GetSlotPeriod();
+     Time raWindowEnd = m_phySapProvider->GetSlotPeriod() * (6 + m_rachConfig.raResponseWindowSize);
++    raWindowEnd += m_phySapProvider->GetSlotPeriod() * m_ntnKOffset;
+     Simulator::Schedule(raWindowBegin, &NrUeMac::StartWaitingForRaResponse, this);
+     m_noRaResponseReceivedEvent =
+         Simulator::Schedule(raWindowEnd, &NrUeMac::RaResponseTimeout, this, contention);
+diff --git a/model/nr-ue-mac.h b/model/nr-ue-mac.h
+index a199212..04c9469 100644
+--- a/model/nr-ue-mac.h
++++ b/model/nr-ue-mac.h
+@@ -107,6 +107,7 @@ class NR_EXPORT NrUeMac : public Object
+     friend class UeMemberNrUeCmacSapProvider;
+     friend class UeMemberNrMacSapProvider;
+     friend class MacUeMemberPhySapUser;
++    friend class NrUeMacAccountingRegression; ///< Exercise grant accounting with a mock RLC peer.
+ 
+   public:
+     /**
+@@ -266,6 +267,9 @@ class NR_EXPORT NrUeMac : public Object
+      */
+     uint16_t GetRnti() const;
+ 
++    /** Extend random-access response timing by the cell-specific NTN K-offset. */
++    void SetNtnKOffset(uint32_t slots);
++
+     /**
+      * @brief Get the IMSI
+      * @return the IMSI
+@@ -308,9 +312,10 @@ class NR_EXPORT NrUeMac : public Object
+   private:
+     /**
+      * @brief Received a RA response
++     * @param referenceSlot Ground-clock slot carried by the delayed RAR
+      * @param raResponse the response
+      */
+-    void RecvRaResponse(NrBuildRarListElement_s raResponse);
++    void RecvRaResponse(NrBuildRarListElement_s raResponse, const SfnSf& referenceSlot);
+     /**
+      * @brief Set the RNTI
+      */
+@@ -470,6 +475,8 @@ class NR_EXPORT NrUeMac : public Object
+     std::shared_ptr<DciInfoElementTdma>
+         m_ulDci;                  //!< Received a DCI. While we process it, store it here.
+     SfnSf m_ulDciSfnsf;           //!< Received a DCI for transmitting data in this slot.
++    uint64_t m_rlcPduBytesSent{0}; //!< Actual RLC bytes accepted, before adding MAC subheaders.
++    std::unordered_map<uint8_t, uint64_t> m_bsrRevision; //!< Preserve synchronous RLC BSR refreshes.
+     uint32_t m_ulDciTotalUsed{0}; //!< Received a DCI, put the total count of bytes we sent.
+ 
+     std::unordered_map<uint8_t, NrMacSapProvider::BufferStatusReportParameters>
+@@ -557,6 +564,7 @@ class NR_EXPORT NrUeMac : public Object
+     NrUeCmacSapProvider::RachConfig m_rachConfig{}; ///< RACH configuration
+     uint8_t m_preambleTransmissionCounter{0};       ///< preamble transmission counter
+     EventId m_noRaResponseReceivedEvent;            ///< no RA response received event ID
++    uint32_t m_ntnKOffset{0};                       ///< cell-specific NTN offset in slots
+ };
+ 
+ } // namespace ns3
+diff --git a/model/nr-ue-net-device.cc b/model/nr-ue-net-device.cc
+index 390bdcb..a328397 100644
+--- a/model/nr-ue-net-device.cc
++++ b/model/nr-ue-net-device.cc
+@@ -166,6 +166,13 @@ NrUeNetDevice::RouteIngoingCtrlMsgs(const std::list<Ptr<NrControlMessage>>& msgL
+             return bwp.second->GetArfcn() == bwpArfcn;
+         });
+         NS_ASSERT_MSG(bwpIt != m_ccMap.end(), "UE missing BWP with ARFCN: " << bwpArfcn);
++        // A RAR is received on the FDD DL carrier, but its embedded Msg3 grant
++        // belongs to the primary UL carrier and must enter that PHY/MAC.
++        if (msg->GetMessageType() == NrControlMessage::RAR)
++        {
++            bwpIt = m_ccMap.find(m_rrc->GetPrimaryUlIndex());
++            NS_ASSERT_MSG(bwpIt != m_ccMap.end(), "UE primary UL BWP missing for RAR");
++        }
+         bwpIt->second->GetPhy()->PhyCtrlMessagesReceived(msg);
+     }
+ }
+diff --git a/model/nr-ue-phy.cc b/model/nr-ue-phy.cc
+index d1a8e89..b45a171 100644
+--- a/model/nr-ue-phy.cc
++++ b/model/nr-ue-phy.cc
+@@ -627,7 +627,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+             return; // DCI not for me
+         }
+ 
+-        SfnSf dciSfn = m_currentSlot;
++        SfnSf dciSfn = msg->GetTimingReferenceOr(m_currentSlot);
+         uint32_t k0Delay = dciMsg->GetKDelay();
+         dciSfn.Add(k0Delay);
+ 
+@@ -655,6 +655,14 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+                               dciMsg->GetK1Delay());
+ 
+         InsertAllocation(dciInfoElem);
++        if (m_ntnPhaseDirection > 0 && k0Delay == 0 && !GetNtnOneWayDelay().IsZero())
++        {
++            // Local VarTti timing can drift relative to the propagated control.
++            // A decoded same-slot grant must arm reception before the data arrives.
++            RegisterDlExpectedTb(dciInfoElem, dciSfn);
++            m_ntnRegisteredDlDci = dciInfoElem;
++        }
++
+ 
+         m_phySapUser->ReceiveControlMessage(msg);
+ 
+@@ -676,7 +684,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+             return; // DCI not for me
+         }
+ 
+-        SfnSf ulSfnSf = m_currentSlot;
++        SfnSf ulSfnSf = msg->GetTimingReferenceOr(m_currentSlot);
+         uint32_t k2Delay = dciMsg->GetKDelay();
+         ulSfnSf.Add(k2Delay);
+ 
+@@ -737,7 +745,7 @@ NrUePhy::ProcessRar(const Ptr<NrRarMessage>& rarMsg)
+                                                                 << " current RA preamble ID is :"
+                                                                 << m_raPreambleId);
+                 // insert allocation
+-                SfnSf ulSfnSf = m_currentSlot;
++                SfnSf ulSfnSf = rarMsg->GetTimingReferenceOr(m_currentSlot);
+                 uint32_t k2Delay = it->rarPayload.k2Delay;
+                 ulSfnSf.Add(k2Delay);
+                 NS_LOG_DEBUG("Insert RAR UL DCI allocation for " << ulSfnSf);
+@@ -1118,6 +1126,15 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
+     NS_LOG_FUNCTION(this);
+ 
+     Time varTtiDuration = GetSymbolPeriod() * dci->m_numSym;
++    // A timing-advanced NTN slot shortens while path delay increases. Ending
++    // UL CTRL at the nominal symbol boundary leaves only integer-rounding
++    // slack (8 ns at mu=0), so EndVarTti would clamp every advance above that
++    // slack and the local clock would drift. Leave a bounded final guard,
++    // below the cyclic prefix, so the next slot can follow the delay change.
++    if (m_ntnPhaseDirection < 0 && !GetNtnOneWayDelay().IsZero())
++    {
++        varTtiDuration -= MicroSeconds(1);
++    }
+ 
+     if (m_ctrlMsgs.empty())
+     {
+@@ -1177,6 +1194,33 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
+     return varTtiDuration;
+ }
+ 
++/** Register the expected transport block and its size trace from an accepted DL grant.
++ * NTN calls this on DCI reception; terrestrial links retain VarTti registration.
++ */
++void
++NrUePhy::RegisterDlExpectedTb(const std::shared_ptr<DciInfoElementTdma>& dci, const SfnSf& slot)
++{
++    if (dci->m_rnti != m_rnti || GetRbNum() / GetNumRbPerRbg() != dci->m_rbgBitmask.size())
++    {
++        return;
++    }
++    m_receptionEnabled = true;
++    NS_ASSERT(dci->m_rnti == m_rnti);
++    m_spectrumPhy->AddExpectedTb({dci->m_ndi,
++                                  dci->m_tbSize,
++                                  dci->m_mcs,
++                                  dci->m_rank,
++                                  dci->m_rnti,
++                                  FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask),
++                                  dci->m_harqProcess,
++                                  dci->m_rv,
++                                  true,
++                                  dci->m_symStart,
++                                  dci->m_numSym,
++                                  slot});
++    m_reportDlTbSize(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(), dci->m_tbSize);
++}
++
+ Time
+ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
+ {
+@@ -1196,21 +1240,10 @@ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
+         return varTtiDuration;
+     }
+ 
+-    m_receptionEnabled = true;
+-    NS_ASSERT(dci->m_rnti == m_rnti);
+-    m_spectrumPhy->AddExpectedTb({dci->m_ndi,
+-                                  dci->m_tbSize,
+-                                  dci->m_mcs,
+-                                  dci->m_rank,
+-                                  dci->m_rnti,
+-                                  FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask),
+-                                  dci->m_harqProcess,
+-                                  dci->m_rv,
+-                                  true,
+-                                  dci->m_symStart,
+-                                  dci->m_numSym,
+-                                  m_currentSlot});
+-    m_reportDlTbSize(m_netDevice->GetObject<NrUeNetDevice>()->GetImsi(), dci->m_tbSize);
++    if (m_ntnRegisteredDlDci.lock() != dci)
++    {
++        RegisterDlExpectedTb(dci, m_currentSlot);
++    }
+     NS_LOG_INFO("UE" << m_rnti << " RXing DL DATA frame for symbols " << +dci->m_symStart << "-"
+                      << +(dci->m_symStart + dci->m_numSym - 1) << " num of rbg assigned: "
+                      << FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask).size()
+@@ -1338,7 +1371,23 @@ NrUePhy::EndVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
+         // stale boundary to the current instant so the slot machine keeps
+         // running on the target BWP instead of asserting; StartSlot() detects
+         // the numerology change and cleanly re-stamps the loop from there.
+-        Time delay = m_lastSlotStart + GetSlotPeriod() - Simulator::Now();
++        const Time currentNtnDelay = GetNtnOneWayDelay();
++        const Time delayChange = currentNtnDelay - m_lastNtnOneWayDelay;
++        Time phaseAdjustment =
++            m_ntnPhaseDirection < 0 ? Time(0) - delayChange : delayChange;
++        // An abrupt shortening of the bent-pipe delay (relay switch) can put
++        // the propagated DL DCI a few hundred nanoseconds after the UE's
++        // local CTRL VarTti end.  The UE then advances its SFN before applying
++        // that DCI, so every following PDSCH is assigned to the wrong slot.
++        // Keep the DL slot boundary just behind the received waveform after
++        // such a jump.  Normal orbital drift is much smaller per slot.
++        if (m_ntnPhaseDirection > 0 && delayChange < Time(0) - MicroSeconds(1))
++        {
++            phaseAdjustment += NanoSeconds(250);
++        }
++        Time delay =
++            m_lastSlotStart + GetSlotPeriod() + phaseAdjustment - Simulator::Now();
++        m_lastNtnOneWayDelay = currentNtnDelay;
+         if (delay.IsNegative())
+         {
+             NS_LOG_WARN("Clamping next-slot start "
+@@ -1437,8 +1486,10 @@ void
+ NrUePhy::GenerateDlCqiReport(const SpectrumValue& sinr)
+ {
+     NS_LOG_FUNCTION(this);
+-    // Not totally sure what this is about. We have to check.
+-    if (m_ulConfigured && (m_rnti > 0) && m_receptionEnabled)
++    // EndVarTti may clear the local flag before propagated NTN reception ends.
++    const bool receivingNtnData = !GetNtnOneWayDelay().IsZero() &&
++                                  m_spectrumPhy->IsReceivingDlData(m_rnti);
++    if (m_ulConfigured && (m_rnti > 0) && (m_receptionEnabled || receivingNtnData))
+     {
+         m_dlDataSinrTrace(GetCellId(), m_rnti, ComputeAvgSinr(sinr), GetBwpId());
+ 
+@@ -1556,17 +1607,56 @@ NrUePhy::GetBeamId([[maybe_unused]] uint16_t rnti) const
+     NS_FATAL_ERROR("ERROR");
+ }
+ 
++void
++NrUePhy::SetNtnOneWayDelayCallback(const Callback<Time>& callback)
++{
++    m_ntnOneWayDelayCallback = callback;
++    if (m_startEvent.IsPending())
++    {
++        m_startEvent.Cancel();
++        ScheduleStartEventLoop(m_startNodeId, m_startFrame, m_startSubframe, m_startSlot);
++    }
++}
++
++Time
++NrUePhy::GetNtnOneWayDelay() const
++{
++    return m_ntnOneWayDelayCallback.IsNull() ? Seconds(0) : m_ntnOneWayDelayCallback();
++}
++
+ void
+ NrUePhy::ScheduleStartEventLoop(uint32_t nodeId, uint16_t frame, uint8_t subframe, uint16_t slot)
+ {
+     NS_LOG_FUNCTION(this);
+-    Simulator::ScheduleWithContext(nodeId,
+-                                   MilliSeconds(0),
+-                                   &NrUePhy::StartEventLoop,
+-                                   this,
+-                                   frame,
+-                                   subframe,
+-                                   slot);
++    m_startNodeId = nodeId;
++    m_startFrame = frame;
++    m_startSubframe = subframe;
++    m_startSlot = slot;
++    Time startDelay;
++    SfnSf startSlot(frame, subframe, slot, GetNumerology());
++    m_lastNtnOneWayDelay = GetNtnOneWayDelay();
++    if (!m_lastNtnOneWayDelay.IsZero() && HasUlSlot() && !HasDlSlot())
++    {
++        m_ntnPhaseDirection = -1;
++        const uint32_t slotsAhead = static_cast<uint32_t>(
++            std::ceil(m_lastNtnOneWayDelay.GetSeconds() / GetSlotPeriod().GetSeconds()));
++        startSlot.Add(slotsAhead);
++        startDelay = GetSlotPeriod() * slotsAhead - m_lastNtnOneWayDelay;
++    }
++    else if (!m_lastNtnOneWayDelay.IsZero() && HasDlSlot())
++    {
++        m_ntnPhaseDirection = 1;
++        startDelay = m_lastNtnOneWayDelay;
++    }
++    m_startEvent = Simulator::Schedule(startDelay, [this, nodeId, startSlot]() {
++        Simulator::ScheduleWithContext(nodeId,
++                                       Time(0),
++                                       &NrUePhy::StartEventLoop,
++                                       this,
++                                       startSlot.GetFrame(),
++                                       startSlot.GetSubframe(),
++                                       startSlot.GetSlot());
++    });
+ }
+ 
+ void
+diff --git a/model/nr-ue-phy.h b/model/nr-ue-phy.h
+index 0086172..0a758d9 100644
+--- a/model/nr-ue-phy.h
++++ b/model/nr-ue-phy.h
+@@ -419,6 +419,14 @@ class NR_EXPORT NrUePhy : public NrPhy
+      */
+     void SetCam(const Ptr<NrChAccessManager>& cam);
+ 
++    /** Return the current local slot start for timing diagnostics.
++     * @return Simulation time of the current slot boundary.
++     */
++    Time GetNtnSlotStart() const { return m_lastSlotStart; }
++    /** Return the sign used to follow NTN propagation-delay changes.
++     * @return -1 for timing-advanced UL, +1 for delayed DL, or zero for terrestrial.
++     */
++    int GetNtnPhaseDirection() const { return m_ntnPhaseDirection; }
+     const SfnSf& GetCurrentSfnSf() const override;
+ 
+     // From nr phy. Not used in the UE
+@@ -439,6 +447,10 @@ class NR_EXPORT NrUePhy : public NrPhy
+                                 uint8_t subframe,
+                                 uint16_t slot) override;
+ 
++    /** Configure a live NTN one-way propagation-delay provider for this BWP. */
++    void SetNtnOneWayDelayCallback(const Callback<Time>& callback);
++    Time GetNtnOneWayDelay() const;
++
+     /**
+      * @brief Called when rsReceivedPower is fired
+      * @param power the power received
+@@ -745,6 +757,14 @@ class NR_EXPORT NrUePhy : public NrPhy
+      */
+     Time DlData(const std::shared_ptr<DciInfoElementTdma>& dci) __attribute__((warn_unused_result));
+ 
++    /**
++     * @brief Register a decoded DL grant once, before its propagated data arrives.
++     * @param dci Decoded allocation
++     * @param slot Slot associated with the decoded grant
++     */
++    void RegisterDlExpectedTb(const std::shared_ptr<DciInfoElementTdma>& dci, const SfnSf& slot);
++
++
+     /**
+      * @brief Transmit UL data and return the duration of the transmission
+      * @param dci the current DCI
+@@ -1130,6 +1150,15 @@ class NR_EXPORT NrUePhy : public NrPhy
+     TracedCallback<uint16_t, uint16_t, double, double, bool, uint8_t> m_reportUeMeasurements;
+ 
+     bool m_isConnected; //!< Flag indicating PHY is connected
++    Callback<Time> m_ntnOneWayDelayCallback; //!< live bent-pipe light time
++    std::weak_ptr<DciInfoElementTdma> m_ntnRegisteredDlDci; //!< Avoid registering the same DCI twice.
++    Time m_lastNtnOneWayDelay{Seconds(0)};    //!< previous value used to rephase slots
++    int8_t m_ntnPhaseDirection{0}; //!< +1 DL receive clock, -1 UL transmit clock
++    EventId m_startEvent; //!< pending initial slot-loop event, rephased when NTN timing is installed
++    uint32_t m_startNodeId{0};
++    uint16_t m_startFrame{0};
++    uint8_t m_startSubframe{0};
++    uint16_t m_startSlot{0};
+ 
+     // Inherited
+     void NotifyConnectionSuccessful() override;

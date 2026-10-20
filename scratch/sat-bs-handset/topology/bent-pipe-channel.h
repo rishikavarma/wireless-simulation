@@ -1,7 +1,7 @@
 /*
  * Transparent bent-pipe between a ground gNB and a ground UE.
  * The satellite is a transparent relay. Path loss is the feeder hop plus
- * the service hop, with a fixed transponder gain. The one-way light time
+ * the service hop, with independent transmit budgets and composite hop SNR. The one-way light time
  * is the NR channel delay. The handset slot clock starts that much later,
  * so a downlink burst arrives as the handset's slot begins.
  */
@@ -12,6 +12,8 @@
 #include "ns3/phased-array-spectrum-propagation-loss-model.h"
 #include "ns3/propagation-delay-model.h"
 #include "ns3/propagation-loss-model.h"
+#include "ns3/spectrum-transmit-filter.h"
+#include <map>
 
 namespace ns3
 {
@@ -24,20 +26,28 @@ class BentPipePropagationLossModel : public PropagationLossModel
   public:
     static TypeId GetTypeId();
 
-    /**
-     * One NTN hop model, evaluated as ground↔satellite. relayGainDb is the
-     * fixed transponder gain, chosen so the satellite's forward EIRP matches
-     * the configured value at installation.
-     */
+    /** Visibility gate. Visible paths have unity scalar gain; spectrum model owns the budget. */
     void Configure(Ptr<MobilityModel> gnb,
                    Ptr<MobilityModel> ue,
                    Ptr<MobilityModel> satellite,
-                   Ptr<ThreeGppPropagationLossModel> hopLoss,
-                   double gnbGainDb,
-                   double ueGainDb,
-                   double relayGainDb);
+                   double feederMinElevationDeg,
+                   double serviceMinElevationDeg);
 
-    double HopLossDb(Ptr<MobilityModel> a, Ptr<MobilityModel> b) const;
+    /** Register a UE-specific transparent relay path. */
+    void RegisterPath(Ptr<const MobilityModel> ue, Ptr<BentPipePropagationLossModel> path);
+    /** Resolve either channel endpoint to its own path, or this primary path. */
+    const BentPipePropagationLossModel* Resolve(Ptr<const MobilityModel> a, Ptr<const MobilityModel> b) const;
+    /** Return the relay used by this path. */
+    Ptr<MobilityModel> GetSatellite() const { return m_satellite; }
+    static double ElevationDeg(Ptr<const MobilityModel> ground,
+                               Ptr<const MobilityModel> satellite);
+    double GetFeederElevationDeg() const;
+    double GetServiceElevationDeg() const;
+    bool IsVisible() const;
+    /** Set the shared relay interruption gate; visibility still additionally requires both hop
+     * elevation masks.
+     */
+    void SetAvailable(bool available) { m_available = available; }
 
   private:
     double DoCalcRxPower(double txPowerDbm,
@@ -45,15 +55,29 @@ class BentPipePropagationLossModel : public PropagationLossModel
                          Ptr<MobilityModel> b) const override;
     int64_t DoAssignStreams(int64_t stream) override;
 
-    double GainDb(Ptr<MobilityModel> mob) const;
-
+    std::map<Ptr<const MobilityModel>, Ptr<BentPipePropagationLossModel>> m_paths; ///< Per-UE visibility and relay.
     Ptr<MobilityModel> m_gnb;
     Ptr<MobilityModel> m_ue;
     Ptr<MobilityModel> m_satellite;
-    Ptr<ThreeGppPropagationLossModel> m_hopLoss;
-    double m_gnbGainDb{0.0};
-    double m_ueGainDb{0.0};
-    double m_relayGainDb{0.0};
+    double m_feederMinElevationDeg{30.0};
+    double m_serviceMinElevationDeg{30.0};
+    bool m_available{true};
+};
+
+/** Discard hidden paths at TX; the scalar gate also checks again at RX. */
+class BentPipeVisibilityFilter : public SpectrumTransmitFilter
+{
+  public:
+    static TypeId GetTypeId();
+    void Configure(Ptr<BentPipePropagationLossModel> visibility);
+    uint64_t GetBlockedTransmissions() const;
+
+  private:
+    bool DoFilter(Ptr<const SpectrumSignalParameters> params,
+                  Ptr<const SpectrumPhy> receiverPhy) override;
+    int64_t DoAssignStreams(int64_t stream) override;
+    Ptr<BentPipePropagationLossModel> m_visibility;
+    mutable uint64_t m_blocked{0};
 };
 
 class BentPipeDelayModel : public PropagationDelayModel
@@ -69,6 +93,8 @@ class BentPipeDelayModel : public PropagationDelayModel
                    Ptr<MobilityModel> ue,
                    Ptr<MobilityModel> satellite);
 
+    /** Register an independently timed background path. */
+    void RegisterPath(Ptr<const MobilityModel> ue, Ptr<BentPipeDelayModel> path) { m_paths[ue] = path; }
     Time GetCurrentDelay() const;
     Time GetFeederDelay() const;
     Time GetServiceDelay() const;
@@ -81,19 +107,39 @@ class BentPipeDelayModel : public PropagationDelayModel
   private:
     int64_t DoAssignStreams(int64_t stream) override;
 
+    std::map<Ptr<const MobilityModel>, Ptr<BentPipeDelayModel>> m_paths; ///< Per-UE delay models.
     Ptr<MobilityModel> m_gnb;
     Ptr<MobilityModel> m_ue;
     Ptr<MobilityModel> m_satellite;
 };
 
 /**
- * Sits behind the NR fading model and keeps the scalar bent-pipe budget.
- * The installed fading model only sees the two ground endpoints.
+ * Noise-limited SNS3-style two-hop abstraction, adapted to NR's receiver PSD.
+ * Independent satellite EIRP and actual source PSD; no per-run gain calibration.
+ * Composite SNR = 1/(1/SNR_first + 1/SNR_second). One UE/cell only; this
+ * equivalent-PSD mapping does not model two-hop co-channel interference.
  */
-class BentPipeFlatSpectrumModel : public PhasedArraySpectrumPropagationLossModel
+class BentPipeSpectrumModel : public PhasedArraySpectrumPropagationLossModel
 {
   public:
     static TypeId GetTypeId();
+    void Configure(Ptr<BentPipePropagationLossModel> visibility,
+                   Ptr<MobilityModel> satellite,
+                   Ptr<ThreeGppPropagationLossModel> firstHopLoss,
+                   Ptr<ThreeGppPropagationLossModel> secondHopLoss,
+                   double sourceGainDb,
+                   double satelliteRxGainDb,
+                   double satelliteEirpDensityDbwMhz,
+                   double destinationGainDb,
+                   double satelliteNoiseFigureDb,
+                   double destinationNoiseFigureDb,
+                   double firstExcessLossDb = 0.0,
+                   double secondExcessLossDb = 0.0);
+
+    /** Equivalent PSD whose division by NR receiver noise gives composite SNR. */
+    double EquivalentRxPsd(double sourcePsd,
+                           double firstHopLossDb,
+                           double secondHopLossDb) const;
 
   private:
     Ptr<SpectrumSignalParameters> DoCalcRxPowerSpectralDensity(
@@ -103,6 +149,18 @@ class BentPipeFlatSpectrumModel : public PhasedArraySpectrumPropagationLossModel
         Ptr<const PhasedArrayModel> aPhasedArrayModel,
         Ptr<const PhasedArrayModel> bPhasedArrayModel) const override;
     int64_t DoAssignStreams(int64_t stream) override;
+    Ptr<BentPipePropagationLossModel> m_visibility;
+    Ptr<MobilityModel> m_satellite;
+    Ptr<ThreeGppPropagationLossModel> m_firstHopLoss;
+    Ptr<ThreeGppPropagationLossModel> m_secondHopLoss;
+    double m_sourceGainDb{0};
+    double m_satelliteRxGainDb{0};
+    double m_satelliteEirpDensityDbwMhz{0};
+    double m_destinationGainDb{0};
+    double m_satelliteNoisePsd{0};
+    double m_destinationNoisePsd{0};
+    double m_firstExcessLossDb{0};
+    double m_secondExcessLossDb{0};
 };
 
 } // namespace ns3

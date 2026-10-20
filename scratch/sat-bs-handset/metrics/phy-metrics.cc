@@ -1,6 +1,7 @@
 #include "metrics/phy-metrics.h"
 
 #include "metrics/series-stats.h"
+#include "topology/bent-pipe-channel.h"
 
 #include "ns3/abort.h"
 #include "ns3/nr-gnb-phy.h"
@@ -17,6 +18,8 @@ namespace ns3
 namespace
 {
 
+/** Average the linear SINR across all reported spectrum bins, returning zero for an empty spectrum.
+ */
 double
 AvgSpectrumLinear(SpectrumValue& v)
 {
@@ -32,6 +35,12 @@ AvgSpectrumLinear(SpectrumValue& v)
 
 } // namespace
 
+/** Destroy the collector; stream members flush and close through their own destructors. */
+NrPhyMetricsCollector::~NrPhyMetricsCollector() = default;
+
+/** Accept only finite positive linear SINR values, convert them to decibels, and append them to the
+ * supplied series.
+ */
 bool
 NrPhyMetricsCollector::AddSample(std::vector<double>& dbSamples, double sinrLinear)
 {
@@ -43,6 +52,8 @@ NrPhyMetricsCollector::AddSample(std::vector<double>& dbSamples, double sinrLine
     return true;
 }
 
+/** Convert the generic count/minimum/maximum/mean summary into the PHY metric field layout.
+ */
 SinrSeriesStats
 NrPhyMetricsCollector::Summarize(const std::vector<double>& dbSamples)
 {
@@ -55,6 +66,9 @@ NrPhyMetricsCollector::Summarize(const std::vector<double>& dbSamples)
     return s;
 }
 
+/** Open separate downlink/uplink CSV streams, fail on open errors, and write the timestamp/SINR
+ * headers.
+ */
 void
 NrPhyMetricsCollector::OpenSinrTraces(const std::string& dlPath, const std::string& ulPath)
 {
@@ -68,6 +82,9 @@ NrPhyMetricsCollector::OpenSinrTraces(const std::string& dlPath, const std::stri
     m_ulTrace << std::setprecision(8) << header;
 }
 
+/** Enable an inclusive time filter for PHY CSV writes while continuing to collect run-wide
+ * summaries.
+ */
 void
 NrPhyMetricsCollector::SetRecordWindow(Time start, Time end)
 {
@@ -76,6 +93,8 @@ NrPhyMetricsCollector::SetRecordWindow(Time start, Time end)
     m_recordEnd = end;
 }
 
+/** Close each open PHY CSV stream so its buffered samples are written to disk.
+ */
 void
 NrPhyMetricsCollector::CloseTraces()
 {
@@ -89,12 +108,18 @@ NrPhyMetricsCollector::CloseTraces()
     }
 }
 
+/** Check whether a timestamp lies inside the configured inclusive recording interval, or accept it
+ * when no interval was set.
+ */
 bool
 NrPhyMetricsCollector::Recording(Time now) const
 {
     return !m_limitRecord || (now >= m_recordStart && now <= m_recordEnd);
 }
 
+/** Attach the UE BWP-0 downlink-data SINR and gNB BWP-1 allocated-RB uplink TB callbacks, aborting if
+ * either PHY is absent.
+ */
 void
 NrPhyMetricsCollector::Connect(Ptr<NetDevice> ueNrDevice, Ptr<NetDevice> gnbDevice)
 {
@@ -107,10 +132,13 @@ NrPhyMetricsCollector::Connect(Ptr<NetDevice> ueNrDevice, Ptr<NetDevice> gnbDevi
 
     Ptr<NrGnbPhy> gnbPhy = NrHelper::GetGnbPhy(gnbDevice, ulBwpId);
     NS_ABORT_MSG_IF(!gnbPhy, "gNB NR PHY missing for SINR traces");
-    gnbPhy->TraceConnectWithoutContext("UlSinrTrace",
-                                       MakeCallback(&NrPhyMetricsCollector::UlSinr, this));
+    gnbPhy->GetSpectrumPhy()->TraceConnectWithoutContext("RxPacketTraceGnb",
+        MakeCallback(&NrPhyMetricsCollector::UlTb,this).Bind(ueNrDevice));
 }
 
+/** Store a valid downlink report, update its held value, and append the timestamp/value to CSV when
+ * inside the recording interval.
+ */
 void
 NrPhyMetricsCollector::DlDataSinr(uint16_t /*cellId*/,
                                   uint16_t /*rnti*/,
@@ -129,6 +157,18 @@ NrPhyMetricsCollector::DlDataSinr(uint16_t /*cellId*/,
     }
 }
 
+void NrPhyMetricsCollector::UlTb(Ptr<NetDevice> ue, RxPacketTraceParams p)
+{
+    if(p.m_rnti!=DynamicCast<NrUeNetDevice>(ue)->GetRrc()->GetRnti()) return;
+    if(!AddSample(m_ulDb,p.m_sinr)) return;
+    m_haveUl=true;m_ulHeldDb=m_ulDb.back();
+    if(m_ulTrace.is_open() && Recording(Simulator::Now()))
+        m_ulTrace<<Simulator::Now().GetSeconds()<<','<<m_ulHeldDb<<'\n';
+}
+
+/** Average an uplink SINR spectrum in linear units, store it in decibels, and update held/CSV
+ * values under the recording filter.
+ */
 void
 NrPhyMetricsCollector::UlSinr(uint64_t /*imsi*/, SpectrumValue& sinr, SpectrumValue& /*power*/)
 {
@@ -144,10 +184,17 @@ NrPhyMetricsCollector::UlSinr(uint64_t /*imsi*/, SpectrumValue& sinr, SpectrumVa
     }
 }
 
+/** Return held per-direction SINR and availability flags; suppress both while the active relay path
+ * is unavailable or hidden.
+ */
 HeldSinr
 NrPhyMetricsCollector::LatestSinr() const
 {
     HeldSinr held;
+    if (m_visibility && !m_visibility->IsVisible())
+    {
+        return held;
+    }
     held.haveDl = m_haveDl;
     held.dlDb = m_dlHeldDb;
     held.haveUl = m_haveUl;
@@ -155,6 +202,16 @@ NrPhyMetricsCollector::LatestSinr() const
     return held;
 }
 
+/** Attach the shared relay visibility gate used to suppress stale held SINR during outages.
+ */
+void
+NrPhyMetricsCollector::SetVisibility(Ptr<BentPipePropagationLossModel> visibility)
+{
+    m_visibility = visibility;
+}
+
+/** Return separate all-run statistical summaries of recorded downlink and uplink SINR samples.
+ */
 NrPhyMetrics
 NrPhyMetricsCollector::GetMetrics() const
 {

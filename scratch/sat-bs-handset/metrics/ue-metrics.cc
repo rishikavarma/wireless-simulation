@@ -24,6 +24,9 @@ constexpr double kInflightUnitPkts = 1000.0;
 constexpr double kLostUnitPkts = 100.0;
 const Time kSamplePeriod = MilliSeconds(5);
 
+/** Compute a wrapping uint32 sequence advance and reject differences larger than half the sequence
+ * space as backward movement.
+ */
 uint32_t
 ForwardDelta(uint32_t now, uint32_t prev)
 {
@@ -31,6 +34,9 @@ ForwardDelta(uint32_t now, uint32_t prev)
     return delta > 0x80000000u ? 0u : delta;
 }
 
+/** Append the nine short/middle/long average/minimum/maximum CSV column names for one metric
+ * signal.
+ */
 void
 AppendWindowHeader(std::ostream& os, const char* name)
 {
@@ -39,6 +45,8 @@ AppendWindowHeader(std::ostream& os, const char* name)
        << "_l_min," << name << "_l_max";
 }
 
+/** Append the nine stored window summary values in the same order as their CSV headers.
+ */
 void
 AppendWindow(std::ostream& os, const SageWindow& window)
 {
@@ -47,28 +55,17 @@ AppendWindow(std::ostream& os, const SageWindow& window)
        << ',' << window.lMax;
 }
 
-void
-Assign(SageWindow& window, double sAvg, double sMin, double sMax, double mAvg, double mMin,
-       double mMax, double lAvg, double lMin, double lMax)
-{
-    window.sAvg = sAvg;
-    window.sMin = sMin;
-    window.sMax = sMax;
-    window.mAvg = mAvg;
-    window.mMin = mMin;
-    window.mMax = mMax;
-    window.lAvg = lAvg;
-    window.lMin = lMin;
-    window.lMax = lMax;
-}
-
 } // namespace
 
+/** Set the maximum retained sample count for this rolling history buffer.
+ */
 UeMetrics::History::History(std::size_t cap)
     : m_cap(cap)
 {
 }
 
+/** Append one observation and evict the oldest value if the configured sample capacity is exceeded.
+ */
 void
 UeMetrics::History::Add(double value)
 {
@@ -79,6 +76,8 @@ UeMetrics::History::Add(double value)
     }
 }
 
+/** Sum up to the requested number of newest history samples, returning zero for an empty selection.
+ */
 double
 UeMetrics::History::Sum(std::size_t n) const
 {
@@ -95,6 +94,9 @@ UeMetrics::History::Sum(std::size_t n) const
     return sum;
 }
 
+/** Divide the newest-sample sum by the available requested count, returning zero when no samples
+ * are selected.
+ */
 double
 UeMetrics::History::Avg(std::size_t n) const
 {
@@ -106,6 +108,8 @@ UeMetrics::History::Avg(std::size_t n) const
     return Sum(n) / static_cast<double>(take);
 }
 
+/** Return the minimum among the requested newest samples, or zero for an empty selection.
+ */
 double
 UeMetrics::History::Min(std::size_t n) const
 {
@@ -117,6 +121,8 @@ UeMetrics::History::Min(std::size_t n) const
     return *std::min_element(m_q.end() - static_cast<std::ptrdiff_t>(take), m_q.end());
 }
 
+/** Return the maximum among the requested newest samples, or zero for an empty selection.
+ */
 double
 UeMetrics::History::Max(std::size_t n) const
 {
@@ -128,11 +134,13 @@ UeMetrics::History::Max(std::size_t n) const
     return *std::max_element(m_q.end() - static_cast<std::ptrdiff_t>(take), m_q.end());
 }
 
+/** Construct the nine summary fields from the last 10, 200, and 1000 samples of one rolling
+ * history.
+ */
 SageWindow
 UeMetrics::Summarize(const History& history)
 {
-    SageWindow window;
-    Assign(window,
+    return {
            history.Avg(kSageShort),
            history.Min(kSageShort),
            history.Max(kSageShort),
@@ -141,14 +149,38 @@ UeMetrics::Summarize(const History& history)
            history.Max(kSageMid),
            history.Avg(kSageLong),
            history.Min(kSageLong),
-           history.Max(kSageLong));
-    return window;
+           history.Max(kSageLong)};
 }
 
+/** Reset per-socket TCP state, retain run-level counters/history, attach TCP trace callbacks, and
+ * begin 5 ms metric polling.
+ */
 void
 UeMetrics::Start(Ptr<Socket> socket)
 {
     m_socket = socket;
+    // Per-socket TCP state cannot be carried across a new connection. Keep
+    // application counters, cumulative loss and the run's trace file.
+    m_srtt = Time();
+    m_rttvarUs = 0.0;
+    m_minRttUs = 0.0;
+    m_haveVar = false;
+    m_cwndBytes = 0;
+    m_prevCwndBytes = 0;
+    m_caState = 0;
+    m_haveTx = false;
+    m_highTx = 0;
+    m_haveLost = false;
+    m_lastLostOutstanding = 0;
+    m_pendingLostBytes = 0;
+    m_prevDrMbps = 0.0;
+    m_prevDrMaxMbps = 0.0;
+    if (!DynamicCast<TcpSocketBase>(socket))
+    {
+        m_running = true;
+        m_event = Simulator::Schedule(kSamplePeriod, &UeMetrics::Poll, this);
+        return;
+    }
     UintegerValue segmentSize;
     socket->GetAttribute("SegmentSize", segmentSize);
     m_mss = segmentSize.Get() == 0 ? 1u : segmentSize.Get();
@@ -173,6 +205,9 @@ UeMetrics::Start(Ptr<Socket> socket)
     m_event = Simulator::Schedule(kSamplePeriod, &UeMetrics::Poll, this);
 }
 
+/** Open the TCP CSV and write the complete feature schema with scaling, sampling, and held-SINR
+ * documentation.
+ */
 void
 UeMetrics::OpenTcpTrace(const std::string& path)
 {
@@ -200,12 +235,17 @@ UeMetrics::OpenTcpTrace(const std::string& path)
                   "cwnd_unacked_rate,dr_max,dr_max_ratio,pre_act,sinr_dl_db,sinr_ul_db\n";
 }
 
+/** Store the shared PHY collector used to append the latest available SINR to each TCP row.
+ */
 void
 UeMetrics::SetPhyMetrics(Ptr<NrPhyMetricsCollector> phy)
 {
     m_phy = phy;
 }
 
+/** Set the inclusive CSV recording interval without stopping TCP state updates outside that
+ * interval.
+ */
 void
 UeMetrics::SetRecordWindow(Time start, Time end)
 {
@@ -214,12 +254,18 @@ UeMetrics::SetRecordWindow(Time start, Time end)
     m_recordEnd = end;
 }
 
+/** Return whether a sample time passes the configured inclusive recording interval, or true when
+ * filtering is disabled.
+ */
 bool
 UeMetrics::Recording(Time now) const
 {
     return !m_limitRecord || (now >= m_recordStart && now <= m_recordEnd);
 }
 
+/** Write the current scaled TCP snapshot and window summaries, then append held SINR or empty cells
+ * for unobserved/outage directions.
+ */
 void
 UeMetrics::WriteTcpRow(Time now)
 {
@@ -253,6 +299,9 @@ UeMetrics::WriteTcpRow(Time now)
     m_tcpTrace << '\n';
 }
 
+/** Cancel polling, commit one final socket snapshot, detach TCP trace callbacks, and flush the CSV
+ * while preserving it for reconnects.
+ */
 void
 UeMetrics::Stop()
 {
@@ -263,18 +312,34 @@ UeMetrics::Stop()
     Simulator::Cancel(m_event);
     Commit();
     m_running = false;
+    if (m_socket)
+    {
+        m_socket->TraceDisconnectWithoutContext("RTT", MakeCallback(&UeMetrics::OnSrtt, this));
+        m_socket->TraceDisconnectWithoutContext("LastRTT", MakeCallback(&UeMetrics::OnLastRtt, this));
+        m_socket->TraceDisconnectWithoutContext("CongestionWindow",
+                                               MakeCallback(&UeMetrics::OnCwnd, this));
+        m_socket->TraceDisconnectWithoutContext("CongState", MakeCallback(&UeMetrics::OnCaState, this));
+        m_socket->TraceDisconnectWithoutContext("HighestSequence",
+                                               MakeCallback(&UeMetrics::OnHighestSequence, this));
+        m_socket = nullptr;
+    }
     if (m_tcpTrace.is_open())
     {
         m_tcpTrace.flush();
     }
 }
 
+/** Retain the latest smoothed RTT supplied by the socket RTT trace.
+ */
 void
 UeMetrics::OnSrtt(Time /*oldRtt*/, Time newRtt)
 {
     m_srtt = newRtt;
 }
 
+/** Track the minimum positive RTT and update RTT variance with the initial half-sample value or a
+ * quarter-weighted absolute RTT error.
+ */
 void
 UeMetrics::OnLastRtt(Time /*oldRtt*/, Time newRtt)
 {
@@ -300,12 +365,16 @@ UeMetrics::OnLastRtt(Time /*oldRtt*/, Time newRtt)
     }
 }
 
+/** Retain the latest TCP congestion window in bytes for subsequent metric sampling.
+ */
 void
 UeMetrics::OnCwnd(uint32_t /*oldCwnd*/, uint32_t newCwnd)
 {
     m_cwndBytes = newCwnd;
 }
 
+/** Retain the socket congestion-state enum as its numeric metric value.
+ */
 void
 UeMetrics::OnCaState(TcpSocketState::TcpCongState_t /*oldState*/,
                          TcpSocketState::TcpCongState_t newState)
@@ -313,6 +382,8 @@ UeMetrics::OnCaState(TcpSocketState::TcpCongState_t /*oldState*/,
     m_caState = static_cast<uint8_t>(newState);
 }
 
+/** Retain the latest highest transmitted sequence and mark transmit sequence state available.
+ */
 void
 UeMetrics::OnHighestSequence(SequenceNumber32 /*oldSeq*/, SequenceNumber32 newSeq)
 {
@@ -320,6 +391,8 @@ UeMetrics::OnHighestSequence(SequenceNumber32 /*oldSeq*/, SequenceNumber32 newSe
     m_haveTx = true;
 }
 
+/** Commit a snapshot while sampling is active and schedule the next update five milliseconds later.
+ */
 void
 UeMetrics::Poll()
 {
@@ -327,10 +400,27 @@ UeMetrics::Poll()
     {
         return;
     }
-    Commit();
+    if (!DynamicCast<TcpSocketBase>(m_socket))
+    {
+        if (m_tcpTrace.is_open() && Recording(Simulator::Now()))
+        {
+            m_tcpTrace << Simulator::Now().GetSeconds();
+            for (int i = 0; i < 70; ++i) m_tcpTrace << ",nan";
+            const HeldSinr held = m_phy ? m_phy->LatestSinr() : HeldSinr{};
+            m_tcpTrace << ',';
+            if (held.haveDl) m_tcpTrace << held.dlDb; else m_tcpTrace << "nan";
+            m_tcpTrace << ',';
+            if (held.haveUl) m_tcpTrace << held.ulDb; else m_tcpTrace << "nan";
+            m_tcpTrace << '\n';
+        }
+    }
+    else Commit();
     m_event = Simulator::Schedule(kSamplePeriod, &UeMetrics::Poll, this);
 }
 
+/** Derive sent/ACKed/lost byte increments from socket state, update scaled Sage rates and rolling
+ * histories, and emit a timestamped snapshot.
+ */
 void
 UeMetrics::Commit()
 {
@@ -459,6 +549,8 @@ UeMetrics::Commit()
     WriteTcpRow(now);
 }
 
+/** Count one generated application body and add its bytes to cumulative UE transmit totals.
+ */
 void
 UeMetrics::NoteSend(uint32_t bytes)
 {
@@ -466,6 +558,8 @@ UeMetrics::NoteSend(uint32_t bytes)
     ++m_sent;
 }
 
+/** Count one delivered application reply and add its bytes to cumulative UE receive totals.
+ */
 void
 UeMetrics::NoteRecv(uint32_t bytes)
 {
@@ -473,12 +567,18 @@ UeMetrics::NoteRecv(uint32_t bytes)
     ++m_received;
 }
 
+/** Return the cumulative generated-message count, also used as the next application sequence
+ * number.
+ */
 uint64_t
 UeMetrics::Sent() const
 {
     return m_sent;
 }
 
+/** Snapshot application/TCP counters and derive missing replies, delivery ratio, and loss ratio
+ * from the cumulative message counts.
+ */
 UeAppMetrics
 UeMetrics::GetMetrics() const
 {

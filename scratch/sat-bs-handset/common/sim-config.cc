@@ -6,6 +6,7 @@
 #include "ns3/abort.h"
 
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <system_error>
 
@@ -16,6 +17,9 @@ namespace
 {
 
 template <typename T, typename Parse>
+/** Look up an optional dotted JSON key and parse it into a configuration field, preserving the
+ * existing default when the key is absent.
+ */
 void
 Overlay(const JsonNode& root, const char* path, T& field, Parse parse)
 {
@@ -25,14 +29,21 @@ Overlay(const JsonNode& root, const char* path, T& field, Parse parse)
     }
 }
 
+/** Overlay application/workload parameters from JSON, parse time/rate/enum fields, and validate the
+ * selected workload before installation.
+ */
 void
 LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
 {
     if (const std::optional<std::string> workload = JsonGet(root, "application.workload"))
     {
+        if (*workload == "voip" || *workload == "iperf" || *workload == "cbr" || *workload == "onoff")
+        {
+            cfg.directWorkload = *workload;
+        }
         cfg.workload.workload = ParseAppWorkload(*workload);
         NS_ABORT_MSG_IF(workload != "probe" && workload != "file" && workload != "rpc" &&
-                            workload != "stream" && workload != "iot",
+                            workload != "stream" && workload != "iot" && cfg.directWorkload.empty(),
                         "Unknown application.workload '"
                             << *workload << "' (try probe, file, rpc, stream, iot)");
     }
@@ -57,6 +68,7 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
         cfg.workload.tcpVariant = *tcpVariant;
     }
     Overlay(root, "application.queueSizeBdp", cfg.workload.queueSizeBdp, JsonDouble);
+    Overlay(root, "application.computeDelayUs", cfg.workload.computeDelayUs, JsonUint);
     if (const std::optional<std::string> aqm = JsonGet(root, "application.aqm"))
     {
         cfg.workload.aqm = ParseAqmType(*aqm);
@@ -199,23 +211,18 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
 
 } // namespace
 
+/** Start from ScenarioConfig defaults, apply JSON overrides and legacy aliases, then validate
+ * timing, visibility, hardware, and handover constraints.
+ */
 ScenarioConfig
 LoadScenarioConfig(const std::string& path)
 {
     ScenarioConfig cfg;
-    ApplyBentPipePreset(cfg.frequencyHz,
-                        cfg.bandwidthHz,
-                        cfg.satEIRP,
-                        cfg.ueTxPower,
-                        cfg.ueAntennaGainDb,
-                        cfg.gnbAntennaGainDb,
-                        cfg.gnbNoiseFigureDb);
-    cfg.dlFrequencyHz = cfg.frequencyHz;
-    cfg.ulFrequencyHz = 30e9;
-    cfg.dlBandwidthHz = cfg.bandwidthHz;
-    cfg.ulBandwidthHz = cfg.bandwidthHz;
-
     const JsonNode root = LoadJsonFile(path);
+    if (const auto profile = JsonGet(root, "radio.ueProfile"))
+    {
+        cfg.ueProfile = *profile;
+    }
     Overlay(root, "time.simTime", cfg.simTime, JsonDouble);
     Overlay(root, "time.warmUp", cfg.warmUp, JsonDouble);
     Overlay(root, "time.appDrain", cfg.appDrain, JsonDouble);
@@ -225,6 +232,15 @@ LoadScenarioConfig(const std::string& path)
     Overlay(root, "satellite.altitudeKm", cfg.satAltitudeKm, JsonDouble);
     Overlay(root, "satellite.inclinationDeg", cfg.satInclinationDeg, JsonDouble);
     Overlay(root, "satellite.antennaUpdateMs", cfg.antennaUpdateMs, JsonUint);
+    Overlay(root, "satellite.feederMinElevationDeg", cfg.feederMinElevationDeg, JsonDouble);
+    Overlay(root, "satellite.serviceMinElevationDeg", cfg.serviceMinElevationDeg, JsonDouble);
+    Overlay(root, "satellite.count", cfg.satelliteCount, JsonUint);
+    Overlay(root, "satellite.spacingDeg", cfg.satelliteSpacingDeg, JsonDouble);
+    Overlay(root, "handover.enabled", cfg.handoverEnabled, JsonBool);
+    Overlay(root, "handover.checkIntervalMs", cfg.handoverCheckMs, JsonUint);
+    Overlay(root, "handover.timeToTriggerMs", cfg.handoverTriggerMs, JsonUint);
+    Overlay(root, "handover.interruptionMs", cfg.handoverInterruptionMs, JsonUint);
+    Overlay(root, "handover.hysteresisKm", cfg.handoverHysteresisKm, JsonDouble);
 
     if (const std::optional<std::string> scenario = JsonGet(root, "radio.ntnScenario"))
     {
@@ -239,18 +255,67 @@ LoadScenarioConfig(const std::string& path)
     Overlay(root, "radio.ulFrequencyHz", cfg.ulFrequencyHz, JsonDouble);
     Overlay(root, "radio.dlBandwidthHz", cfg.dlBandwidthHz, JsonDouble);
     Overlay(root, "radio.ulBandwidthHz", cfg.ulBandwidthHz, JsonDouble);
+    // Feeder defaults remain Ka-band independently of the handset service band.
+    Overlay(root, "radio.feederUlFrequencyHz", cfg.feederUlFrequencyHz, JsonDouble);
+    Overlay(root, "radio.feederDlFrequencyHz", cfg.feederDlFrequencyHz, JsonDouble);
     Overlay(root, "radio.satEIRP", cfg.satEIRP, JsonDouble);
     Overlay(root, "radio.ueTxPower", cfg.ueTxPower, JsonDouble);
     Overlay(root, "radio.ueAntennaGainDb", cfg.ueAntennaGainDb, JsonDouble);
     Overlay(root, "radio.gnbAntennaGainDb", cfg.gnbAntennaGainDb, JsonDouble);
     Overlay(root, "radio.gnbNoiseFigureDb", cfg.gnbNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.gnbTxPower", cfg.gnbTxPower, JsonDouble);
+    // Legacy shared values remain accepted for explicit custom/older budgets.
+    Overlay(root, "radio.satRxGainDb", cfg.satServiceRxGainDb, JsonDouble);
+    Overlay(root, "radio.satRxGainDb", cfg.satFeederRxGainDb, JsonDouble);
+    Overlay(root, "radio.satNoiseFigureDb", cfg.satServiceNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.satNoiseFigureDb", cfg.satFeederNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.satServiceRxGainDb", cfg.satServiceRxGainDb, JsonDouble);
+    Overlay(root, "radio.satFeederRxGainDb", cfg.satFeederRxGainDb, JsonDouble);
+    Overlay(root, "radio.satServiceNoiseFigureDb", cfg.satServiceNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.satFeederNoiseFigureDb", cfg.satFeederNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.ueNoiseFigureDb", cfg.ueNoiseFigureDb, JsonDouble);
+    Overlay(root, "radio.serviceExcessLossDb", cfg.serviceExcessLossDb, JsonDouble);
+    Overlay(root, "radio.feederExcessLossDb", cfg.feederExcessLossDb, JsonDouble);
+    cfg.satServiceEirpDbwMhz = cfg.satEIRP;
+    // Legacy satEIRP overrides both directions only when explicitly supplied.
+    if (JsonGet(root, "radio.satEIRP"))
+    {
+        cfg.satFeederEirpDbwMhz = cfg.satEIRP;
+    }
+    Overlay(root, "radio.satServiceEirpDbwMhz", cfg.satServiceEirpDbwMhz, JsonDouble);
+    Overlay(root, "radio.satFeederEirpDbwMhz", cfg.satFeederEirpDbwMhz, JsonDouble);
     Overlay(root, "radio.realisticPower", cfg.realisticPower, JsonBool);
     Overlay(root, "radio.nrTraces", cfg.nrTraces, JsonBool);
+    Overlay(root, "radio.linkMarginDb", cfg.linkMarginDb, JsonDouble);
+    cfg.satEIRP += cfg.linkMarginDb;
+    cfg.gnbTxPower += cfg.linkMarginDb;
+    cfg.satServiceEirpDbwMhz += cfg.linkMarginDb;
+    cfg.satFeederEirpDbwMhz += cfg.linkMarginDb;
 
     Overlay(root, "topology.ueDistanceM", cfg.ueDistanceM, JsonDouble);
     Overlay(root, "topology.receiverMobility", cfg.receiverMobility, JsonBool);
+    Overlay(root, "topology.ueSpeedMps", cfg.ueSpeedMps, JsonDouble);
+    Overlay(root, "topology.bsNorthOffsetKm", cfg.bsNorthOffsetKm, JsonDouble);
+    Overlay(root, "topology.bsEastOffsetKm", cfg.bsEastOffsetKm, JsonDouble);
 
     LoadApplication(root, cfg);
+    if (auto v = JsonGet(root, "application.transport")) cfg.transport = *v;
+    if (auto v = JsonGet(root, "application.direction")) cfg.direction = *v;
+    cfg.workload.transport = cfg.transport;
+    Overlay(root, "background.count", cfg.backgroundCount, JsonUint);
+    Overlay(root, "background.distanceM", cfg.backgroundDistanceM, JsonDouble);
+    Overlay(root, "background.relay", cfg.backgroundRelay, JsonUint);
+    if (auto v = JsonGet(root, "background.dataRate")) cfg.backgroundRate = DataRate(*v);
+    Overlay(root, "metrics.physical", cfg.physicalTraces, JsonBool);
+    Overlay(root, "metrics.payload", cfg.payloadTraces, JsonBool);
+    Overlay(root, "metrics.intervalS", cfg.kpiIntervalS, JsonDouble);
+    NS_ABORT_MSG_IF(cfg.transport != "tcp" && cfg.transport != "udp", "transport must be tcp or udp");
+    NS_ABORT_MSG_IF(cfg.direction != "ul" && cfg.direction != "dl", "direction must be ul or dl");
+    NS_ABORT_MSG_IF(cfg.directWorkload.empty() && cfg.direction != "ul", "legacy request/reply workloads originate UL");
+    NS_ABORT_MSG_IF(cfg.backgroundCount > 16 || cfg.backgroundRelay >= cfg.satelliteCount ||
+                    !std::isfinite(cfg.backgroundDistanceM) || cfg.backgroundDistanceM < 0 ||
+                    cfg.backgroundDistanceM > 200000, "invalid background geometry/count");
+    NS_ABORT_MSG_IF(!std::isfinite(cfg.kpiIntervalS) || cfg.kpiIntervalS <= 0, "metrics.intervalS must be positive");
 
     if (const std::optional<std::string> prefix = JsonGet(root, "output.prefix"))
     {
@@ -271,11 +336,75 @@ LoadScenarioConfig(const std::string& path)
                         cfg.dlFrequencyHz <= 0.0 || cfg.ulFrequencyHz <= 0.0,
                     "radio FDD frequencies and bandwidths must be > 0");
     NS_ABORT_MSG_IF(cfg.antennaUpdateMs == 0, "satellite.antennaUpdateMs must be > 0");
+    NS_ABORT_MSG_IF(cfg.satelliteCount < 1 || cfg.satelliteCount > 16 ||
+                        (cfg.handoverEnabled && cfg.satelliteCount < 2),
+                    "satellite.count must be 1..16, and >=2 for handover");
+    NS_ABORT_MSG_IF(!std::isfinite(cfg.satelliteSpacingDeg) || cfg.satelliteSpacingDeg <= 0 ||
+                        cfg.satelliteSpacingDeg >= 180 || cfg.handoverCheckMs == 0 ||
+                        cfg.handoverInterruptionMs < 50 || !std::isfinite(cfg.handoverHysteresisKm) ||
+                        cfg.handoverHysteresisKm < 0,
+                    "Invalid relay spacing/handover parameters; interruption must be >=50 ms");
+    NS_ABORT_MSG_IF(!std::isfinite(cfg.ueSpeedMps) || cfg.ueSpeedMps <= 0 ||
+                        cfg.ueSpeedMps > 50,
+                    "topology.ueSpeedMps must be in (0,50]");
+    for (double loss : {cfg.serviceExcessLossDb, cfg.feederExcessLossDb})
+    {
+        NS_ABORT_MSG_IF(!std::isfinite(loss) || loss < 0 || loss > 30,
+                        "Excess hop loss must be in [0,30] dB");
+    }
+    for (double mask : {cfg.feederMinElevationDeg, cfg.serviceMinElevationDeg})
+    {
+        NS_ABORT_MSG_IF(!std::isfinite(mask) || mask < 0 || mask > 90,
+                        "satellite elevation masks must be finite and in [0, 90] degrees");
+    }
+    for (double frequency : {cfg.dlFrequencyHz, cfg.ulFrequencyHz,
+                             cfg.feederUlFrequencyHz, cfg.feederDlFrequencyHz})
+    {
+        NS_ABORT_MSG_IF(!std::isfinite(frequency) || frequency < 0.5e9 || frequency > 100e9,
+                        "NTN hop frequencies must be finite and in [0.5, 100] GHz");
+    }
+    for (double budget : {cfg.gnbTxPower, cfg.ueTxPower, cfg.ueAntennaGainDb,
+                          cfg.gnbAntennaGainDb, cfg.satServiceRxGainDb, cfg.satFeederRxGainDb,
+                          cfg.satServiceEirpDbwMhz, cfg.satFeederEirpDbwMhz,
+                          cfg.satServiceNoiseFigureDb, cfg.satFeederNoiseFigureDb, cfg.ueNoiseFigureDb,
+                          cfg.gnbNoiseFigureDb})
+    {
+        NS_ABORT_MSG_IF(!std::isfinite(budget) || std::abs(budget) > 300,
+                        "Radio link-budget values must be finite and within +/-300 dB");
+    }
+    NS_ABORT_MSG_IF(cfg.satServiceNoiseFigureDb < 0 || cfg.satFeederNoiseFigureDb < 0 ||
+                        cfg.ueNoiseFigureDb < 0 ||
+                        cfg.gnbNoiseFigureDb < 0,
+                    "Receiver noise figures must be >= 0 dB");
+    NS_ABORT_MSG_IF(cfg.ueProfile != "handheld-n256" && cfg.ueProfile != "custom",
+                    "radio.ueProfile must be handheld-n256 or custom");
+    if (cfg.ueProfile == "handheld-n256")
+    {
+        NS_ABORT_MSG_IF(cfg.ueTxPower > 23.0,
+                        "handheld-n256 UE transmit power must be <= 23 dBm; use custom for other hardware");
+        NS_ABORT_MSG_IF(cfg.ueAntennaGainDb > 0.0,
+                        "handheld-n256 uses <= 0 dBi total antenna gain; use custom for directional terminals");
+        const bool validDl = cfg.dlFrequencyHz - cfg.dlBandwidthHz / 2 >= 2170e6 &&
+                             cfg.dlFrequencyHz + cfg.dlBandwidthHz / 2 <= 2200e6;
+        const bool validUl = cfg.ulFrequencyHz - cfg.ulBandwidthHz / 2 >= 1980e6 &&
+                             cfg.ulFrequencyHz + cfg.ulBandwidthHz / 2 <= 2010e6;
+        NS_ABORT_MSG_IF(!validDl || !validUl ||
+                            std::abs(cfg.dlFrequencyHz - cfg.ulFrequencyHz - 190e6) > 1,
+                        "handheld-n256 requires UL 1980..2010 MHz, DL 2170..2200 MHz and 190 MHz spacing");
+        for (double bw : {cfg.dlBandwidthHz, cfg.ulBandwidthHz})
+        {
+            NS_ABORT_MSG_IF(bw != 5e6 && bw != 10e6 && bw != 15e6 && bw != 20e6,
+                            "handheld-n256 carrier bandwidth must be 5, 10, 15 or 20 MHz");
+        }
+    }
     NS_ABORT_MSG_IF(cfg.ntnScenario.empty(), "radio.ntnScenario must be set");
     NS_ABORT_MSG_IF(cfg.outputPrefix.empty(), "output.prefix must be set");
     return cfg;
 }
 
+/** Validate the relative output prefix, create its results directory, and construct the TCP, PHY,
+ * geometry, and summary artifact paths.
+ */
 MetricOutputPaths
 PrepareMetricOutput(const std::string& prefix)
 {
@@ -304,6 +433,7 @@ PrepareMetricOutput(const std::string& prefix)
     paths.sinrUlCsv = (dir / (prefix + "-sinr-ul.csv")).string();
     paths.summaryTxt = (dir / (prefix + "-summary.txt")).string();
     paths.appTxt = (dir / (prefix + "-app.txt")).string();
+    paths.geometryCsv = (dir / (prefix + "-geometry.csv")).string();
     return paths;
 }
 

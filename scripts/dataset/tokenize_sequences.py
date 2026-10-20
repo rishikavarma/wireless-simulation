@@ -15,7 +15,6 @@ Default vector layout is UNUM multi-head style for **all** collected features:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import pickle
 import sys
@@ -23,29 +22,15 @@ from pathlib import Path
 
 import numpy as np
 
+from metric_io import read_commented_csv
+
 META_KEYS = {"token", "t_start_s", "t_end_s", "window_s", "n_samples"}
 
 
-def read_commented_csv(path: Path) -> tuple[list[str], list[dict]]:
-    with open(path, newline="", encoding="utf-8") as handle:
-        lines = [line for line in handle if line.strip() and not line.startswith("#")]
-    reader = csv.DictReader(lines)
-    rows = []
-    for row in reader:
-        parsed = {}
-        for key, value in row.items():
-            if key is None:
-                continue
-            text = (value or "").strip()
-            if text == "":
-                parsed[key] = None
-            else:
-                parsed[key] = float(text)
-        rows.append(parsed)
-    return list(reader.fieldnames or []), rows
-
-
 def continuous_feature_names(fieldnames: list[str]) -> list[str]:
+    """Select nonmetadata columns without bucket suffixes and move base_rtt to the first feature
+    position.
+    """
     names = []
     for name in fieldnames:
         if name in META_KEYS or name.endswith("_bucket"):
@@ -60,7 +45,9 @@ def continuous_feature_names(fieldnames: list[str]) -> list[str]:
 def build_matrix(
     rows: list[dict], feature_names: list[str], mode: str
 ) -> tuple[np.ndarray, list[str]]:
-    """Return (T, F) matrix and the per-column names used in the vectors."""
+    """Build a time-by-feature array in continuous, bucket-only, or mixed mode; keep base_rtt
+    continuous in mixed mode and preserve missing cells as NaN.
+    """
     if mode == "values":
         cols = list(feature_names)
         data = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
@@ -107,7 +94,9 @@ def build_matrix(
 def window_sequences(
     matrix: np.ndarray, seq_len: int, stride: int
 ) -> np.ndarray:
-    """Slide windows of length seq_len over time axis → (N, seq_len, F)."""
+    """Stack consecutive time-axis slices at the requested stride into a window-by-time-by-
+    feature tensor; return an empty tensor when fewer than seq_len tokens exist.
+    """
     t_len, n_feat = matrix.shape
     if t_len < seq_len:
         return np.zeros((0, seq_len, n_feat), dtype=matrix.dtype)
@@ -116,6 +105,9 @@ def window_sequences(
 
 
 def main() -> int:
+    """Parse a continuous or bucketed token table, build the requested value/head matrix, cut
+    history/future windows, and save sequence artifacts.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--bucketized",

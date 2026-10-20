@@ -10,6 +10,8 @@ Pipeline:
 Meta columns (token timing) stay continuous. Feature columns each get a
 ``*_bucket`` index via np.searchsorted(..., side='right'), matching UNUM's
 offline ``bucket_tokenize.py`` (training path).
+TCP loss features reserve class zero for zero loss; their remaining classes
+use quantiles of positive observations only.
 """
 
 from __future__ import annotations
@@ -44,6 +46,9 @@ def quantile_boundaries(arr: np.ndarray, num_buckets: int) -> list[float]:
 
 
 def bucketize_value(value: float | None, edges: list[float]) -> int | None:
+    """Map an observed value to its right-sided quantile interval with searchsorted; preserve
+    missing values and map constant heads to bucket zero.
+    """
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return None
     if not edges:
@@ -51,8 +56,42 @@ def bucketize_value(value: float | None, edges: list[float]) -> int | None:
     return int(np.searchsorted(edges, float(value), side="right"))
 
 
+def has_zero_loss_class(name: str) -> bool:
+    """Identify nonnegative TCP loss features that reserve bucket zero for exact zero loss."""
+    return name in ("lost", "loss_db") or name.startswith("lost_")
+
+
+def feature_quantile_boundaries(
+    name: str, values: np.ndarray, num_buckets: int
+) -> list[float]:
+    """Fit ordinary quantiles, or reserve zero plus at most N-1 positive-loss buckets.
+
+    Loss quantiles use positive observations only. The smallest positive float
+    separates zero from every representable positive value with the existing
+    right-sided lookup, so saved edge-only JSON/pickle loaders remain compatible.
+    Reserve the separation even for an all-zero training feature, allowing unseen
+    positive test loss to remain distinct. Missing values are excluded from fitting.
+    """
+    if not has_zero_loss_class(name):
+        return quantile_boundaries(values, num_buckets)
+    if num_buckets < 2:
+        raise ValueError("loss bucketization requires at least two buckets")
+    observed = values[np.isfinite(values)]
+    if np.any(observed < 0):
+        raise ValueError(f"{name}: loss observations must be nonnegative")
+    positive = observed[observed > 0]
+    edges = quantile_boundaries(positive, num_buckets - 1)
+    if positive.size:
+        # Ties at the minimum/maximum do not provide interior severity splits.
+        lo, hi = positive.min(), positive.max()
+        edges = [edge for edge in edges if lo < edge < hi]
+    return [float(np.nextafter(0.0, 1.0)), *edges]
+
+
 def sinr_series(path: Path | None) -> np.ndarray:
-    """All ``sinr_db`` samples from a PHY SINR CSV (empty if missing)."""
+    """Read the dedicated PHY CSV, collect observed SINR values into a NumPy array, and return an
+    empty array for a missing trace.
+    """
     if path is None or not path.exists():
         return np.asarray([], dtype=float)
     _, rows = read_csv(path)
@@ -69,7 +108,9 @@ def sinr_series(path: Path | None) -> np.ndarray:
 
 
 def feature_keys_from_tokens(tokens: list[dict]) -> list[str]:
-    """All numeric metric columns, with base_rtt inserted after meta."""
+    """Select metric columns from the first token, omit timing metadata, and order derived
+    base_rtt first and downlink/uplink SINR last.
+    """
     if not tokens:
         return []
     keys = []
@@ -110,6 +151,9 @@ def enrich_token(token: dict) -> dict:
 
 
 def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg: dict):
+    """Read TCP and optional PHY traces, fold the TCP rows into time windows, and return both
+    original and base-RTT-enriched tokens.
+    """
     _, tcp_rows = read_csv(tcp_path)
     if not tcp_rows:
         return [], []
@@ -129,7 +173,7 @@ def fit_boundaries(
     sinr_dl: Path | None = None,
     sinr_ul: Path | None = None,
 ) -> dict[str, list[float]]:
-    """Fit one independent Quantile-N head per feature.
+    """Fit one independent Quantile-N head per feature, with a dedicated zero loss class.
 
     ``sinr_dl_db`` and ``sinr_ul_db`` are always separate heads. Their edges
     are fit from the dedicated PHY CSVs when present (more samples than the
@@ -156,13 +200,16 @@ def fit_boundaries(
                 (uniques[i] + uniques[i + 1]) / 2.0 for i in range(len(uniques) - 1)
             ]
             continue
-        boundaries[name] = quantile_boundaries(values, num_buckets)
+        boundaries[name] = feature_quantile_boundaries(name, values, num_buckets)
     return boundaries
 
 
 def apply_boundaries(
     rows: list[dict], feature_keys: list[str], boundaries: dict[str, list[float]]
 ) -> list[dict]:
+    """Copy token timing and continuous features into new rows, appending one bucket ID per
+    feature using the supplied edges.
+    """
     out = []
     for row in rows:
         item = {key: row.get(key) for key in META_KEYS}
@@ -174,6 +221,9 @@ def apply_boundaries(
 
 
 def write_csv(path: Path, rows: list[dict], fieldnames: list[str], comment: str) -> None:
+    """Write rows in a specified column order with a leading comment; serialize missing
+    observations as empty CSV cells.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(comment if comment.endswith("\n") else comment + "\n")
@@ -188,6 +238,9 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str], comment: str)
 def write_boundaries(
     path: Path, feature_keys: list[str], boundaries: dict[str, list[float]], num_buckets: int
 ) -> None:
+    """Save named and indexed quantile edges as JSON and pickle, including each feature index and
+    realized bucket count.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "method": "quantile",
@@ -198,6 +251,8 @@ def write_boundaries(
                 "edges": boundaries.get(name, []),
                 "n_edges": len(boundaries.get(name, [])),
                 "n_buckets": len(boundaries.get(name, [])) + 1,
+                "zero_class": has_zero_loss_class(name)
+                and boundaries.get(name, [])[:1] == [float(np.nextafter(0.0, 1.0))],
             }
             for i, name in enumerate(feature_keys)
         },
@@ -216,6 +271,9 @@ def write_boundaries(
 
 
 def load_boundaries(path: Path, feature_keys: list[str]) -> dict[str, list[float]]:
+    """Load named JSON/pickle edges or legacy index-keyed pickle edges; give missing feature
+    names an empty edge list.
+    """
     if path.suffix == ".json":
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -240,6 +298,9 @@ def load_boundaries(path: Path, feature_keys: list[str]) -> dict[str, list[float
 
 
 def main() -> int:
+    """Fold configured traces, load or fit feature quantiles, and write continuous features,
+    diagnostic buckets, boundaries, and the UNUM-6 view.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",

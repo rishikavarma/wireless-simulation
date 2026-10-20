@@ -1,4 +1,5 @@
 #include "ue/ue-tcp-client.h"
+#include "ns3/udp-socket-factory.h"
 
 #include "ns3/abort.h"
 #include "ns3/inet-socket-address.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <vector>
 
 namespace ns3
@@ -15,6 +17,8 @@ namespace ns3
 
 NS_OBJECT_ENSURE_REGISTERED(UeTcpClient);
 
+/** Register the ns-3 runtime type, parent, and constructor through a lazily initialized TypeId.
+ */
 TypeId
 UeTcpClient::GetTypeId()
 {
@@ -25,6 +29,9 @@ UeTcpClient::GetTypeId()
     return tid;
 }
 
+/** Copy the server and workload configuration, allocate the workload random generators, and
+ * validate the sizes and distributions needed by the selected application.
+ */
 void
 UeTcpClient::Setup(Ipv4Address serverAddr, uint16_t serverPort, const UeWorkloadConfig& cfg)
 {
@@ -72,30 +79,52 @@ UeTcpClient::Setup(Ipv4Address serverAddr, uint16_t serverPort, const UeWorkload
     }
 }
 
+/** Open the TCP metric CSV through the UE collector before traffic begins.
+ */
 void
 UeTcpClient::SetTcpTrace(const std::string& path)
 {
     m_metrics.OpenTcpTrace(path);
 }
 
+/** Attach the shared PHY collector so TCP rows can include the most recently reported
+ * downlink/uplink SINR.
+ */
 void
 UeTcpClient::SetPhyMetrics(Ptr<NrPhyMetricsCollector> phy)
 {
     m_metrics.SetPhyMetrics(phy);
 }
 
+/** Pass the inclusive metric recording interval to the UE collector without changing application
+ * start/stop times.
+ */
 void
 UeTcpClient::SetRecordWindow(Time start, Time end)
 {
     m_metrics.SetRecordWindow(start, end);
 }
 
+/** Return whether the current TCP socket has completed connection establishment.
+ */
 bool
 UeTcpClient::Connected() const
 {
     return m_connected;
 }
 
+/** Return whether any socket established a connection during this run, retaining the flag across
+ * later reconnect failures.
+ */
+bool
+UeTcpClient::EverConnected() const
+{
+    return m_everConnected;
+}
+
+/** Combine application/TCP counters with file/RPC progress and evaluate the selected workload
+ * success criterion.
+ */
 UeAppMetrics
 UeTcpClient::GetMetrics() const
 {
@@ -123,6 +152,9 @@ UeTcpClient::GetMetrics() const
     return m;
 }
 
+/** Convert a message byte count into its nominal pacing interval using the configured application
+ * data rate.
+ */
 Time
 UeTcpClient::RateInterval(uint32_t bytes) const
 {
@@ -130,6 +162,8 @@ UeTcpClient::RateInterval(uint32_t bytes) const
     return Seconds(bits / m_cfg.dataRate.GetBitRate());
 }
 
+/** Draw an unbounded exponential duration with the supplied positive mean in seconds.
+ */
 Time
 UeTcpClient::Exponential(double meanSeconds)
 {
@@ -137,6 +171,9 @@ UeTcpClient::Exponential(double meanSeconds)
     return Seconds(m_exponential->GetValue(meanSeconds, 0.0));
 }
 
+/** Use the nominal byte-rate interval for CBR/ON-OFF probes, or draw exponential interarrival times
+ * for bursty probes.
+ */
 Time
 UeTcpClient::ProbeGap(uint32_t bytes)
 {
@@ -148,6 +185,9 @@ UeTcpClient::ProbeGap(uint32_t bytes)
     return Seconds(mean);
 }
 
+/** Draw an exponential ON duration for ON/OFF traffic or a Pareto duration scaled to the configured
+ * mean for bursty traffic.
+ */
 Time
 UeTcpClient::OnDuration()
 {
@@ -161,12 +201,17 @@ UeTcpClient::OnDuration()
     return Exponential(mean);
 }
 
+/** Draw an exponential OFF duration using the configured mean idle time.
+ */
 Time
 UeTcpClient::OffDuration()
 {
     return Exponential(m_cfg.offTime.GetSeconds());
 }
 
+/** Reject lognormal draws outside one byte through the file cap; return the integer size or abort
+ * after 100000 failed draws.
+ */
 uint64_t
 UeTcpClient::SampleFileSize()
 {
@@ -182,6 +227,9 @@ UeTcpClient::SampleFileSize()
     return 0;
 }
 
+/** Draw from a bounded Pareto distribution, round to an integer, and enforce the caller minimum and
+ * configured maximum.
+ */
 uint32_t
 UeTcpClient::SampleParetoInt(double scale, double shape, double maxValue, uint32_t floor)
 {
@@ -199,6 +247,9 @@ UeTcpClient::SampleParetoInt(double scale, double shape, double maxValue, uint32
     return value;
 }
 
+/** Sample one plus a geometric failure count using inverse transform sampling; rpcObjectsMean
+ * describes the count before the added one.
+ */
 uint32_t
 UeTcpClient::SampleObjectCount()
 {
@@ -212,12 +263,17 @@ UeTcpClient::SampleObjectCount()
     return static_cast<uint32_t>(failures) + 1;
 }
 
+/** Draw an integer report size uniformly between the configured inclusive payload bounds.
+ */
 uint32_t
 UeTcpClient::SampleIotSize()
 {
     return m_uniform->GetInteger(m_cfg.iotPayloadMin, m_cfg.iotPayloadMax);
 }
 
+/** Allocate a zero-filled body and write its type, sequence, simulation timestamp, flags, and
+ * workload-specific parameters into the fixed header.
+ */
 std::vector<uint8_t>
 UeTcpClient::MakeBody(AppMsgType type,
                       uint64_t seq,
@@ -239,6 +295,9 @@ UeTcpClient::MakeBody(AppMsgType type,
     return buf;
 }
 
+/** Count and frame a generated message, then flush it into TCP; remember the workload continuation
+ * when socket backpressure leaves bytes queued.
+ */
 bool
 UeTcpClient::Transmit(const std::vector<uint8_t>& body, SendResume resume)
 {
@@ -254,6 +313,9 @@ UeTcpClient::Transmit(const std::vector<uint8_t>& body, SendResume resume)
     return false;
 }
 
+/** Schedule the appropriate workload next-send event after a blocked frame drains, using that
+ * workload pacing rule and current phase/progress.
+ */
 void
 UeTcpClient::ScheduleResume()
 {
@@ -294,61 +356,130 @@ UeTcpClient::ScheduleResume()
     m_resume = SendResume::None;
 }
 
+/** Mark the client running and begin its first TCP connection attempt.
+ */
 void
 UeTcpClient::StartApplication()
 {
     m_running = true;
-    m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+    OpenConnection();
+}
+
+/** Create a socket only while running and no socket exists, register connection/read/send/close
+ * callbacks, and connect to the configured server.
+ */
+void
+UeTcpClient::OpenConnection()
+{
+    if (!m_running || m_socket)
+    {
+        return;
+    }
+    m_socket = Socket::CreateSocket(GetNode(), m_cfg.transport == "udp" ? UdpSocketFactory::GetTypeId() : TcpSocketFactory::GetTypeId());
     EnableTcpNoDelay(m_socket);
     m_socket->Bind();
     m_socket->SetConnectCallback(MakeCallback(&UeTcpClient::ConnectionSucceeded, this),
                                  MakeCallback(&UeTcpClient::ConnectionFailed, this));
+    m_socket->SetCloseCallbacks(MakeCallback(&UeTcpClient::ConnectionClosed, this),
+                                MakeCallback(&UeTcpClient::ConnectionClosed, this));
     m_socket->SetSendCallback(MakeCallback(&UeTcpClient::NotifySend, this));
     m_socket->SetRecvCallback(MakeCallback(&UeTcpClient::HandleReply, this));
     m_socket->Connect(InetSocketAddress(m_serverAddr, m_serverPort));
+    if (m_cfg.transport == "udp" && !m_connected) ConnectionSucceeded(m_socket);
 }
 
+/** Stop future retries and reuse the common connection teardown to stop metrics, cancel workload
+ * events, clear buffers, and close the socket.
+ */
 void
 UeTcpClient::StopApplication()
 {
     m_running = false;
+    Simulator::Cancel(m_retryEvent);
+    ResetConnection();
+}
+
+/** Stop per-socket sampling, cancel workload events, clear transient workload/framing state, and
+ * close the socket while retaining cumulative run counters.
+ */
+void
+UeTcpClient::ResetConnection()
+{
+    m_metrics.Stop();
+    m_connected = false;
     m_sending = false;
     m_sendBlocked = false;
     m_rpcInFlight = false;
+    m_fileGapPending = false;
     m_resume = SendResume::None;
+    m_slicesLeft = 0;
     Simulator::Cancel(m_sendEvent);
     Simulator::Cancel(m_phaseEvent);
-    m_metrics.Stop();
+    m_pipe = TcpPipe{};
     if (m_socket)
     {
+        m_socket->SetCloseCallbacks(MakeNullCallback<void, Ptr<Socket>>(),
+                                    MakeNullCallback<void, Ptr<Socket>>());
         m_socket->Close();
         m_socket = nullptr;
     }
 }
 
+/** Ignore stale callbacks; log loss of the active connection, tear it down, and schedule a new
+ * connection attempt one second later.
+ */
+void
+UeTcpClient::ConnectionClosed(Ptr<Socket> socket)
+{
+    if (!m_running || socket != m_socket)
+    {
+        return;
+    }
+    std::cout << "warn: UE TCP connection closed at t="
+              << Simulator::Now().GetSeconds() << "s; retrying\n";
+    ResetConnection();
+    m_retryEvent = Simulator::Schedule(Seconds(1), &UeTcpClient::OpenConnection, this);
+}
+
+/** Accept success only for the active running socket, retain the ever-connected flag, start TCP
+ * sampling, and launch the selected workload.
+ */
 void
 UeTcpClient::ConnectionSucceeded(Ptr<Socket> socket)
 {
-    if (!m_running)
+    if (!m_running || socket != m_socket)
     {
         return;
     }
     m_connected = true;
-    m_socket = socket;
+    m_everConnected = true;
     m_metrics.Start(m_socket);
     StartWorkload();
 }
 
+/** Ignore stale failures; reset the current socket and schedule another attempt after one second
+ * while retaining prior run history.
+ */
 void
-UeTcpClient::ConnectionFailed(Ptr<Socket> /*socket*/)
+UeTcpClient::ConnectionFailed(Ptr<Socket> socket)
 {
-    NS_ABORT_MSG("UE TCP connect to the base station failed");
+    if (!m_running || socket != m_socket)
+    {
+        return;
+    }
+    std::cout << "warn: UE TCP connect/reconnect failed at t="
+              << Simulator::Now().GetSeconds() << "s; retrying\n";
+    ResetConnection();
+    m_retryEvent = Simulator::Schedule(Seconds(1), &UeTcpClient::OpenConnection, this);
 }
 
+/** Flush queued bytes when the active socket becomes writable; resume workload pacing only after
+ * the complete blocked frame has drained.
+ */
 void
 UeTcpClient::NotifySend(Ptr<Socket> socket, uint32_t /*available*/)
 {
-    if (!m_running)
+    if (!m_running || !m_connected || socket != m_socket)
     {
         return;
     }
@@ -364,6 +495,9 @@ UeTcpClient::NotifySend(Ptr<Socket> socket, uint32_t /*available*/)
     ScheduleResume();
 }
 
+/** Dispatch the selected application to its first probe phase, file transfer, RPC page, video
+ * frame, or IoT report.
+ */
 void
 UeTcpClient::StartWorkload()
 {
@@ -399,6 +533,9 @@ UeTcpClient::StartWorkload()
     }
 }
 
+/** Enable probe generation on an established socket, send the first probe, and schedule the
+ * transition to the next OFF phase.
+ */
 void
 UeTcpClient::EnterOn()
 {
@@ -411,6 +548,9 @@ UeTcpClient::EnterOn()
     m_phaseEvent = Simulator::Schedule(OnDuration(), &UeTcpClient::EnterOff, this);
 }
 
+/** Disable probes and cancel the outstanding send event, then schedule the next ON phase after a
+ * sampled idle duration.
+ */
 void
 UeTcpClient::EnterOff()
 {
@@ -419,6 +559,9 @@ UeTcpClient::EnterOff()
     m_phaseEvent = Simulator::Schedule(OffDuration(), &UeTcpClient::EnterOn, this);
 }
 
+/** Generate one numbered probe when connected and unblocked, then schedule its next interarrival
+ * unless TCP backpressure defers continuation.
+ */
 void
 UeTcpClient::SendProbe()
 {
@@ -435,6 +578,9 @@ UeTcpClient::SendProbe()
     m_sendEvent = Simulator::Schedule(ProbeGap(m_cfg.packetSize), &UeTcpClient::SendProbe, this);
 }
 
+/** Reset per-file ACK/progress state, sample the file size, compute its payload-chunk count,
+ * advance the file ID, and send the first chunk.
+ */
 void
 UeTcpClient::BeginFile()
 {
@@ -453,6 +599,9 @@ UeTcpClient::BeginFile()
     SendFileChunk();
 }
 
+/** Queue the next bounded payload chunk with its index/count/file ID and pace further chunks
+ * exponentially, pausing on socket backpressure.
+ */
 void
 UeTcpClient::SendFileChunk()
 {
@@ -486,6 +635,9 @@ UeTcpClient::SendFileChunk()
     }
 }
 
+/** Start a page while running and below the RPC count limit, sample its object count, and request
+ * its first object.
+ */
 void
 UeTcpClient::StartRpcPage()
 {
@@ -501,6 +653,9 @@ UeTcpClient::StartRpcPage()
     SendRpc();
 }
 
+/** Request one sampled-size RPC object only when none is in flight; decrement page progress and
+ * wait for its response before requesting another.
+ */
 void
 UeTcpClient::SendRpc()
 {
@@ -524,6 +679,9 @@ UeTcpClient::SendRpc()
     Transmit(body, SendResume::None);
 }
 
+/** Cancel leftover slice scheduling, reset the frame slice count, send its first slice, and
+ * schedule the next fixed-interval frame.
+ */
 void
 UeTcpClient::StartFrame()
 {
@@ -537,6 +695,9 @@ UeTcpClient::StartFrame()
     m_phaseEvent = Simulator::Schedule(m_cfg.frameInterval, &UeTcpClient::StartFrame, this);
 }
 
+/** Send one Pareto-sized frame slice, then schedule remaining slices with bounded Pareto gaps
+ * unless TCP backpressure pauses generation.
+ */
 void
 UeTcpClient::SendStreamChunk()
 {
@@ -564,6 +725,9 @@ UeTcpClient::SendStreamChunk()
     }
 }
 
+/** Queue a uniformly sized numbered report and schedule the next report with an exponential
+ * interarrival time, deferring when TCP is blocked.
+ */
 void
 UeTcpClient::SendIot()
 {
@@ -582,9 +746,16 @@ UeTcpClient::SendIot()
         Simulator::Schedule(Exponential(m_cfg.iotInterval.GetSeconds()), &UeTcpClient::SendIot, this);
 }
 
+/** Drain the active socket into the framing pipe and dispatch all complete reply bodies while the
+ * client is running.
+ */
 void
 UeTcpClient::HandleReply(Ptr<Socket> socket)
 {
+    if (!m_running || socket != m_socket)
+    {
+        return;
+    }
     while (Ptr<Packet> packet = socket->Recv())
     {
         m_pipe.Ingest(packet);
@@ -596,6 +767,9 @@ UeTcpClient::HandleReply(Ptr<Socket> socket)
     }
 }
 
+/** Count a decoded reply, track unique ACKs for the current file, and schedule file reading pauses
+ * or RPC object/page continuation as responses complete.
+ */
 void
 UeTcpClient::DispatchReply(const std::vector<uint8_t>& body)
 {

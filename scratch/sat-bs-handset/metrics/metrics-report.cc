@@ -9,6 +9,9 @@ namespace
 {
 
 const char*
+/** Translate the numeric TCP congestion state into its readable log label, using Unknown for
+ * unsupported states.
+ */
 CaStateName(double state)
 {
     switch (static_cast<int>(state))
@@ -28,6 +31,9 @@ CaStateName(double state)
     }
 }
 
+/** Write the short, middle, and long sample-window average/minimum/maximum values under one metric
+ * name.
+ */
 void
 WriteWindow(std::ostream& os, const char* name, const SageWindow& w)
 {
@@ -36,6 +42,8 @@ WriteWindow(std::ostream& os, const char* name, const SageWindow& w)
        << " l.avg=" << w.lAvg << " l.min=" << w.lMin << " l.max=" << w.lMax << '\n';
 }
 
+/** Write a PHY series sample count and mean/minimum/maximum in decibels.
+ */
 void
 WriteSinr(std::ostream& os, const char* name, const SinrSeriesStats& s)
 {
@@ -45,6 +53,9 @@ WriteSinr(std::ostream& os, const char* name, const SinrSeriesStats& s)
 
 } // namespace
 
+/** Serialize UE application/TCP features, server counters, and PHY summaries to the common
+ * console/summary-text format.
+ */
 void
 WriteRunMetrics(std::ostream& os,
                 Ipv4Address ueAddr,
@@ -84,6 +95,9 @@ WriteRunMetrics(std::ostream& os,
     WriteSinr(os, "ul", phy.ul);
 }
 
+/** Write the workload success flag, delivery/byte counters, and file/RPC-specific completion
+ * criterion to the application report.
+ */
 void
 WriteAppOutcome(std::ostream& os, const UeAppMetrics& ue)
 {

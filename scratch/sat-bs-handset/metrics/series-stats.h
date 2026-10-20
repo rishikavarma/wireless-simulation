@@ -20,6 +20,9 @@ struct SeriesStats
     double mean{0.0};
 };
 
+/** Scan the samples once to compute count, minimum, maximum, and arithmetic mean; return zeros for
+ * an empty series.
+ */
 inline SeriesStats
 SummarizeSeries(const std::vector<double>& samples)
 {

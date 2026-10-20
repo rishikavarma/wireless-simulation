@@ -1,4 +1,5 @@
 #include "common/tcp-pipe.h"
+#include "ns3/udp-socket.h"
 
 #include "common/app-protocol.h"
 
@@ -18,12 +19,18 @@ constexpr uint32_t kMaxBodyBytes = 16u * 1024u * 1024u;
 
 } // namespace
 
+/** Disable Nagle buffering on the supplied TCP socket so small application messages can be sent
+ * immediately.
+ */
 void
 EnableTcpNoDelay(Ptr<Socket> socket)
 {
-    socket->SetAttribute("TcpNoDelay", BooleanValue(true));
+    if (!DynamicCast<UdpSocket>(socket)) socket->SetAttribute("TcpNoDelay", BooleanValue(true));
 }
 
+/** Reclaim consumed buffer bytes after the buffer empties or a large consumed prefix reaches half
+ * its size, resetting the cursor after compaction.
+ */
 void
 TcpPipe::Compact(std::vector<uint8_t>& buf, std::size_t& pos)
 {
@@ -44,6 +51,9 @@ TcpPipe::Compact(std::vector<uint8_t>& buf, std::size_t& pos)
     }
 }
 
+/** Append the body length as a host-endian four-byte prefix followed by the complete application
+ * body; reject bodies shorter than the app header.
+ */
 void
 TcpPipe::Enqueue(const uint8_t* body, uint32_t bodyLen)
 {
@@ -54,6 +64,8 @@ TcpPipe::Enqueue(const uint8_t* body, uint32_t bodyLen)
     m_tx.insert(m_tx.end(), body, body + bodyLen);
 }
 
+/** Append the bytes of a received TCP packet to the framing buffer, ignoring an empty packet.
+ */
 void
 TcpPipe::Ingest(Ptr<Packet> packet)
 {
@@ -67,9 +79,28 @@ TcpPipe::Ingest(Ptr<Packet> packet)
     packet->CopyData(m_rx.data() + off, n);
 }
 
+/** Send queued bytes while the socket has capacity, honoring partial sends; return false when
+ * backpressure leaves bytes queued.
+ */
 bool
 TcpPipe::Flush(Ptr<Socket> socket)
 {
+    if (DynamicCast<UdpSocket>(socket))
+    {
+        while (m_txPos < m_tx.size())
+        {
+            uint32_t size = 0;
+            std::memcpy(&size, m_tx.data() + m_txPos, kFrameLenBytes);
+            size += kFrameLenBytes;
+            NS_ABORT_MSG_IF(size > 65507, "UDP framed application message exceeds datagram limit");
+            auto packet = Create<Packet>(m_tx.data() + m_txPos, size);
+            // A UDP send failure drops this complete datagram; it must not block later messages.
+            socket->Send(packet);
+            m_txPos += size;
+        }
+        Compact(m_tx, m_txPos);
+        return true;
+    }
     while (m_txPos < m_tx.size())
     {
         const uint32_t avail = socket->GetTxAvailable();
@@ -91,6 +122,9 @@ TcpPipe::Flush(Ptr<Socket> socket)
     return true;
 }
 
+/** Decode one bounded length-prefixed frame if complete, copy its body out, and compact consumed
+ * bytes; return false while the next frame is incomplete.
+ */
 bool
 TcpPipe::Pop(std::vector<uint8_t>& body)
 {

@@ -11,11 +11,14 @@ set(sat_bs_handset_sources
   common/sim-config.cc
   common/app-config.cc
   common/ntn-helpers.cc
+  metrics/radio-telemetry.cc
+  metrics/direct-traffic.cc
   metrics/phy-metrics.cc
   metrics/ue-metrics.cc
   metrics/bs-metrics.cc
   metrics/metrics-report.cc
   topology/mobility.cc
+  topology/relay-handover.cc
   topology/bent-pipe-channel.cc
   topology/nr-ntn-feeder.cc
 )

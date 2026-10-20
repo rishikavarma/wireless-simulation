@@ -21,6 +21,8 @@ smoothed RTT. ``tokenAggregate`` may be ``weighted`` (default), ``mean``, or
 
 import argparse
 import csv
+
+from metric_io import read_commented_csv
 import json
 import sys
 from pathlib import Path
@@ -30,11 +32,17 @@ MINRTT_ALIASES = ("minrtt", "min_rtt", "base_rtt")
 
 
 def load_config(path):
+    """Load the experiment JSON using the standard decoder; return its nested configuration
+    dictionary.
+    """
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
 
 def cfg_get(root, dotted, default=None):
+    """Follow a dotted key through nested dictionaries, returning the supplied default if any
+    component is absent.
+    """
     node = root
     for part in dotted.split("."):
         if not isinstance(node, dict) or part not in node:
@@ -44,27 +52,18 @@ def cfg_get(root, dotted, default=None):
 
 
 def read_csv(path):
-    with open(path, newline="", encoding="utf-8") as handle:
-        lines = [line for line in handle if line.strip() and not line.startswith("#")]
-    reader = csv.DictReader(lines)
-    rows = []
-    for row in reader:
-        parsed = {}
-        for key, value in row.items():
-            if key is None:
-                continue
-            text = (value or "").strip()
-            if text == "":
-                parsed[key] = None
-            else:
-                parsed[key] = float(text)
-        rows.append(parsed)
+    """Decode numeric metric rows with the shared comment-aware reader, then sort them by
+    simulation time.
+    """
+    fields, rows = read_commented_csv(Path(path))
     rows.sort(key=lambda row: row["time_s"])
-    return list(reader.fieldnames or []), rows
+    return fields, rows
 
 
 def hold_last(samples, end_us):
-    """Latest sinr_db at or before end_us. None if none yet."""
+    """Scan time-ordered PHY samples up to the requested microsecond boundary and return the last
+    observed SINR, or None before the first report.
+    """
     found = None
     for sample in samples:
         if microseconds(sample["time_s"]) <= end_us:
@@ -75,10 +74,16 @@ def hold_last(samples, end_us):
 
 
 def microseconds(seconds):
+    """Round a seconds value to integer microseconds so token boundary comparisons avoid
+    floating-point drift.
+    """
     return int(round(seconds * 1e6))
 
 
 def mean(values):
+    """Average the observed values, excluding None entries; return None when the window contains
+    no observations.
+    """
     present = [value for value in values if value is not None]
     if not present:
         return None
@@ -86,7 +91,9 @@ def mean(values):
 
 
 def weighted_mean(values, weights):
-    """Time-weighted mean; falls back to unweighted if all weights are zero."""
+    """Average observed values using positive time weights; if their total is zero, use the
+    arithmetic mean of the observed values.
+    """
     total_w = 0.0
     total = 0.0
     present = 0
@@ -107,7 +114,9 @@ def weighted_mean(values, weights):
 
 
 def most_frequent(values):
-    """Most common value. A tie keeps the one that appears latest in the window."""
+    """Count the observed values and choose the most frequent; resolve equal counts in favor of
+    the value appearing latest in the window.
+    """
     present = [value for value in values if value is not None]
     if not present:
         return None
@@ -125,7 +134,9 @@ def most_frequent(values):
 
 
 def difference(values):
-    """Increase from the first sample in the window to the last."""
+    """Subtract the first observed value from the last, returning zero for one sample and None
+    when all values are missing.
+    """
     present = [value for value in values if value is not None]
     if not present:
         return None
@@ -151,7 +162,9 @@ def window_rtt_units(row, rtt_column):
 
 
 def sample_dts_s(times_us):
-    """Per-sample dt in seconds (time since previous sample), UNUM-style."""
+    """Compute seconds since each preceding timestamp, using the next gap for the first sample or
+    5 ms for a singleton and flooring gaps at one microsecond.
+    """
     if not times_us:
         return []
     dts = []
@@ -167,7 +180,10 @@ def sample_dts_s(times_us):
 
 
 def collapse_group(group, dts, feature_keys, aggregate, locked_base_rtt_units):
-    """Aggregate one UNUM token from a sample buffer."""
+    """Build one token from a sample group: record its time span, use mode for congestion state
+    and first-to-last change for cumulative loss, and aggregate other fields by the selected
+    mean/last rule.
+    """
     start_us = microseconds(group[0]["time_s"])
     end_us = microseconds(group[-1]["time_s"]) + microseconds(dts[-1])
     token = {
@@ -195,6 +211,9 @@ def collapse_group(group, dts, feature_keys, aggregate, locked_base_rtt_units):
 
 
 def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
+    """Partition time-sorted TCP rows into fixed or RTT-sized windows, aggregate each signal with
+    its configured rule, and attach available SINR samples.
+    """
     mode = cfg_get(cfg, "output.tokenMode", "rtt")
     fixed_s = float(cfg_get(cfg, "output.tokenFixedS", 0.1))
     min_s = float(cfg_get(cfg, "output.tokenMinS", 0.005))
@@ -294,6 +313,9 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
 
 
 def write_tokens(path, tokens, feature_keys, cfg):
+    """Write token timing and aggregated metrics to CSV with comments recording the tokenization
+    configuration.
+    """
     mode = cfg_get(cfg, "output.tokenMode", "rtt")
     aggregate = cfg_get(cfg, "output.tokenAggregate", "weighted")
     rtt_column = cfg_get(cfg, "output.tokenRttColumn", "minrtt")
@@ -330,6 +352,9 @@ def write_tokens(path, tokens, feature_keys, cfg):
 
 
 def main():
+    """Parse raw TCP/SINR paths and token settings, fold the traces into windows, and write the
+    resulting token CSV.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",

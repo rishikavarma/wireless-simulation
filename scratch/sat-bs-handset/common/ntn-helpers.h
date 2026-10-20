@@ -1,5 +1,5 @@
 /*
- * NTN bent-pipe RF presets and panel tracking toward the LEO satellite.
+ * NTN altitude bounds and panel tracking toward the selected LEO relay.
  */
 
 #ifndef SAT_BS_HANDSET_NTN_HELPERS_H
@@ -16,14 +16,6 @@ class Node;
 
 constexpr double kSatAltitudeMinKm = 550.0;
 constexpr double kSatAltitudeMaxKm = 1200.0;
-
-void ApplyBentPipePreset(double& frequencyHz,
-                         double& bandwidthHz,
-                         double& satEIRP,
-                         double& ueTxPower,
-                         double& ueAntennaGainDb,
-                         double& gnbAntennaGainDb,
-                         double& gnbNoiseFigureDb);
 
 void UpdateAntennaToward(Ptr<Node> observer,
                          Ptr<Node> target,

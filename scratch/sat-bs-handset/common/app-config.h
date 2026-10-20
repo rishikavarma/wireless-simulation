@@ -63,7 +63,7 @@ struct UeWorkloadConfig
 {
     AppWorkload workload{AppWorkload::Probe};
     uint32_t packetSize{1400};
-    DataRate dataRate{"30Mbps"};
+    DataRate dataRate{"100kbps"};
     /** cbr: fixed packet spacing. onoff: exponential phases. bursty: Pareto ON. */
     UeTrafficType trafficType{UeTrafficType::OnOff};
     /** Mean ON duration. Exponential for onoff; Pareto mean for bursty. */
@@ -106,9 +106,12 @@ struct UeWorkloadConfig
     uint32_t iotPayloadMax{128};
     Time iotInterval{Seconds(1.0)};
 
+    std::string transport{"tcp"};
     std::string tcpVariant{"TcpNewReno"};
     double queueSizeBdp{2.0};
     AqmType aqm{AqmType::DropTail};
+    /** Server think time before the reply is enqueued. 0 = immediate. */
+    uint64_t computeDelayUs{0};
 };
 
 } // namespace ns3

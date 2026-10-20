@@ -9,24 +9,9 @@
 namespace ns3
 {
 
-void
-ApplyBentPipePreset(double& frequencyHz,
-                    double& bandwidthHz,
-                    double& satEIRP,
-                    double& ueTxPower,
-                    double& ueAntennaGainDb,
-                    double& gnbAntennaGainDb,
-                    double& gnbNoiseFigureDb)
-{
-    frequencyHz = 20e9;
-    bandwidthHz = 400e6;
-    satEIRP = 20;
-    ueTxPower = 40;
-    ueAntennaGainDb = 38.5;
-    gnbAntennaGainDb = 50;
-    gnbNoiseFigureDb = 5.0;
-}
-
+/** Convert the target ECEF position to the observer local topocentric frame, point the array at its
+ * azimuth/inclination, and schedule the next update.
+ */
 void
 UpdateAntennaToward(Ptr<Node> observer,
                     Ptr<Node> target,

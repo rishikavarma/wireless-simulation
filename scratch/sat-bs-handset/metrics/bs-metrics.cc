@@ -3,6 +3,8 @@
 namespace ns3
 {
 
+/** Add one complete request and its body bytes to the server receive counters.
+ */
 void
 BsMetrics::NoteRequest(uint32_t size)
 {
@@ -10,6 +12,8 @@ BsMetrics::NoteRequest(uint32_t size)
     ++m_requests;
 }
 
+/** Add one submitted reply and its body bytes to the server transmit counters.
+ */
 void
 BsMetrics::NoteReply(uint32_t size)
 {
@@ -17,6 +21,8 @@ BsMetrics::NoteReply(uint32_t size)
     ++m_replies;
 }
 
+/** Copy server request, reply, and byte counters into a value snapshot.
+ */
 BsAppMetrics
 BsMetrics::GetMetrics() const
 {

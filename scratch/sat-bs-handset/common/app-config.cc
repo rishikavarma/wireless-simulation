@@ -22,6 +22,9 @@ namespace ns3
 namespace
 {
 
+/** Normalize a configuration token by lowercasing each byte with the unsigned-char ctype
+ * convention.
+ */
 std::string
 Lower(std::string s)
 {
@@ -32,6 +35,8 @@ Lower(std::string s)
     return s;
 }
 
+/** Map the AQM enum to its ns-3 root queue-disc TypeId name; reject unsupported enum values.
+ */
 std::string
 QueueDiscTypeId(AqmType aqm)
 {
@@ -54,6 +59,9 @@ QueueDiscTypeId(AqmType aqm)
 
 } // namespace
 
+/** Normalize a traffic name and map CBR, ON/OFF, or bursty aliases to their enum; abort on unknown
+ * input.
+ */
 UeTrafficType
 ParseUeTrafficType(const std::string& name)
 {
@@ -74,6 +82,8 @@ ParseUeTrafficType(const std::string& name)
     return UeTrafficType::Cbr;
 }
 
+/** Map a probe traffic enum to the canonical string used in configuration logs.
+ */
 std::string
 UeTrafficTypeToString(UeTrafficType type)
 {
@@ -89,6 +99,9 @@ UeTrafficTypeToString(UeTrafficType type)
     return "unknown";
 }
 
+/** Normalize the configured queue name and map supported aliases to the AQM enum, aborting on
+ * invalid names.
+ */
 AqmType
 ParseAqmType(const std::string& name)
 {
@@ -118,6 +131,8 @@ ParseAqmType(const std::string& name)
     return AqmType::DropTail;
 }
 
+/** Map the AQM enum to the canonical queue name written to run logs.
+ */
 std::string
 AqmTypeToString(AqmType aqm)
 {
@@ -137,6 +152,9 @@ AqmTypeToString(AqmType aqm)
     return "DropTail";
 }
 
+/** Resolve and validate a TCP congestion-control TypeId, then configure it as the default before
+ * sockets are created.
+ */
 void
 ApplyTcpVariant(const std::string& tcpVariant)
 {
@@ -155,6 +173,9 @@ ApplyTcpVariant(const std::string& tcpVariant)
     Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(tid));
 }
 
+/** Compute ceil(capacity times RTT times BDP multiplier divided by eight), with a 10 KiB minimum
+ * and parameter validation.
+ */
 uint64_t
 ComputeQueueBytes(double capacityBps, Time baseRtt, double queueSizeBdp)
 {
@@ -170,6 +191,9 @@ ComputeQueueBytes(double capacityBps, Time baseRtt, double queueSizeBdp)
     return std::max<uint64_t>(queueBytes, kMinQueueBytes);
 }
 
+/** Apply the byte budget to default device queues and AM/UM RLC transmit buffers before devices are
+ * installed.
+ */
 void
 ApplyQueueBudgetDefaults(uint64_t queueBytes)
 {
@@ -180,6 +204,9 @@ ApplyQueueBudgetDefaults(uint64_t queueBytes)
     Config::SetDefault("ns3::NrRlcAm::MaxTxBufferSize", UintegerValue(queueBytes));
 }
 
+/** Replace existing root queue discs on the supplied devices with the selected AQM and apply its
+ * byte limit.
+ */
 void
 InstallAqmOnDevices(AqmType aqm, uint64_t queueBytes, const NetDeviceContainer& devices)
 {

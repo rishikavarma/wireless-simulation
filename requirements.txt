@@ -1,0 +1,3 @@
+# Dataset planning, processing, validation, and scientific figures.
+numpy>=1.24
+matplotlib>=3.5

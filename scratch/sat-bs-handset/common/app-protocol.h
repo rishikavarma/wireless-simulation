@@ -38,6 +38,8 @@ enum class AppWorkload : uint8_t
 };
 
 inline const char*
+/** Return the canonical workload label for an enum, using unknown for an invalid enum value.
+ */
 AppWorkloadToString(AppWorkload w)
 {
     switch (w)
@@ -56,6 +58,9 @@ AppWorkloadToString(AppWorkload w)
     return "unknown";
 }
 
+/** Map a validated workload label to its enum; unknown names fall back to Probe, so callers must
+ * validate input first.
+ */
 inline AppWorkload
 ParseAppWorkload(const std::string& name)
 {
@@ -93,6 +98,9 @@ struct AppHeader
     uint32_t param1{0}; // file: total chunks
 };
 
+/** Serialize the 32-byte application header at explicit host-endian offsets, returning false if the
+ * destination is too short.
+ */
 inline bool
 WriteAppHeader(uint8_t* dst, uint32_t dstLen, const AppHeader& h)
 {
@@ -111,6 +119,9 @@ WriteAppHeader(uint8_t* dst, uint32_t dstLen, const AppHeader& h)
     return true;
 }
 
+/** Decode the fixed header fields with memcpy and return whether its magic matches; reject input
+ * shorter than the header.
+ */
 inline bool
 ReadAppHeader(const uint8_t* src, uint32_t srcLen, AppHeader& h)
 {

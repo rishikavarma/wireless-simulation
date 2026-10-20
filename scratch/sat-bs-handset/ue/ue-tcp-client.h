@@ -41,6 +41,7 @@ class UeTcpClient : public Application
     void SetRecordWindow(Time start, Time end);
 
     bool Connected() const;
+    bool EverConnected() const;
     UeAppMetrics GetMetrics() const;
 
   private:
@@ -56,6 +57,9 @@ class UeTcpClient : public Application
     void StartApplication() override;
     void StopApplication() override;
 
+    void OpenConnection();
+    void ConnectionClosed(Ptr<Socket> socket);
+    void ResetConnection();
     void ConnectionSucceeded(Ptr<Socket> socket);
     void ConnectionFailed(Ptr<Socket> socket);
     void NotifySend(Ptr<Socket> socket, uint32_t available);
@@ -98,6 +102,7 @@ class UeTcpClient : public Application
 
     bool m_running{false};
     bool m_connected{false};
+    bool m_everConnected{false};
     bool m_sending{false};
     bool m_sendBlocked{false};
     bool m_rpcInFlight{false};
@@ -108,6 +113,7 @@ class UeTcpClient : public Application
     Ptr<Socket> m_socket;
     EventId m_sendEvent;
     EventId m_phaseEvent;
+    EventId m_retryEvent;
     TcpPipe m_pipe;
     UeMetrics m_metrics;
 

@@ -1,6 +1,6 @@
 /*
  * NR PHY SINR samples. DL data comes from NrUePhy DlDataSinr; UL from
- * NrGnbPhy UlSinrTrace.
+ * the allocated-RB TB report, filtered to the primary RNTI.
  */
 
 #ifndef SAT_BS_HANDSET_COMMON_PHY_METRICS_H
@@ -19,6 +19,8 @@
 
 namespace ns3
 {
+struct RxPacketTraceParams;
+class BentPipePropagationLossModel;
 
 struct SinrSeriesStats
 {
@@ -47,7 +49,9 @@ struct HeldSinr
 class NrPhyMetricsCollector : public SimpleRefCount<NrPhyMetricsCollector>
 {
   public:
+    ~NrPhyMetricsCollector();
     void Connect(Ptr<NetDevice> ueNrDevice, Ptr<NetDevice> gnbDevice);
+    void SetVisibility(Ptr<BentPipePropagationLossModel> visibility);
     void OpenSinrTraces(const std::string& dlPath, const std::string& ulPath);
     /** Trace files keep reports inside [start, end]. Held values still update. */
     void SetRecordWindow(Time start, Time end);
@@ -58,6 +62,7 @@ class NrPhyMetricsCollector : public SimpleRefCount<NrPhyMetricsCollector>
 
   private:
     void DlDataSinr(uint16_t cellId, uint16_t rnti, double avgSinrLinear, uint16_t bwpId);
+    void UlTb(Ptr<NetDevice> ue, RxPacketTraceParams p);
     void UlSinr(uint64_t imsi, SpectrumValue& sinr, SpectrumValue& power);
 
     bool Recording(Time now) const;
@@ -75,6 +80,7 @@ class NrPhyMetricsCollector : public SimpleRefCount<NrPhyMetricsCollector>
     Time m_recordEnd;
     std::ofstream m_dlTrace;
     std::ofstream m_ulTrace;
+    Ptr<BentPipePropagationLossModel> m_visibility;
 };
 
 } // namespace ns3

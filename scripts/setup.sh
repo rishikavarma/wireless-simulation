@@ -14,10 +14,6 @@
 
 set -euo pipefail
 
-# Drop leftover ns-3 scenario processes from a previous run.
-pkill -f 'sat-bs-handset-optimized' >/dev/null 2>&1 || true
-pkill -f 'ns3 run sat-bs-handset' >/dev/null 2>&1 || true
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 NS3_DIR="${NS3_DIR:-$ROOT_DIR/ns-3-dev}"
@@ -27,6 +23,7 @@ SCENARIO_LINK="$NS3_DIR/scratch/sat-bs-handset"
 SKIP_DEPS=0
 SKIP_VERIFY=0
 
+# Print setup options and supported environment variables from a literal help block.
 usage() {
     cat <<'EOF'
 Usage: ./scripts/setup.sh [options]
@@ -59,6 +56,7 @@ done
 export PATH="$HOME/.local/bin:$PATH"
 
 # Persist that PATH so later shells (and ns-3's cmake lookup) find pip tools.
+# Persist the user-local binary directory in .bashrc only if an equivalent PATH entry is absent.
 ensure_local_bin_on_path() {
     local rc="$HOME/.bashrc"
     local marker="# wireless-simulation: user-local pip binaries (cmake)"
@@ -79,6 +77,7 @@ ensure_local_bin_on_path() {
     echo "    appended PATH export to $rc (new shells pick this up)"
 }
 
+# Return success when the available CMake version tuple meets the supplied minimum.
 cmake_version_ok() {
     command -v cmake >/dev/null 2>&1 || return 1
     python3 - "$1" <<'PY'
@@ -125,13 +124,22 @@ ensure_local_bin_on_path
 NS3_TAG="ns-3.48"
 NR_TAG="v5.1"
 
+# Clone the requested upstream tag or verify an existing checkout matches it, preserving local work.
 pin_checkout() {
     local dir="$1"
     local tag="$2"
     local url="$3"
     if [[ -d "$dir/.git" ]]; then
-        git -C "$dir" fetch --depth 1 origin tag "$tag"
-        git -C "$dir" checkout -f "$tag"
+        if ! git -C "$dir" rev-parse -q --verify "$tag^{commit}" >/dev/null; then
+            git -C "$dir" fetch --depth 1 origin tag "$tag"
+        fi
+        local expected actual
+        expected="$(git -C "$dir" rev-parse "$tag^{commit}")"
+        actual="$(git -C "$dir" rev-parse HEAD)"
+        if [[ "$actual" != "$expected" ]]; then
+            echo "error: $dir is at $actual, expected $tag ($expected); refusing to replace local work" >&2
+            exit 1
+        fi
     elif [[ -e "$dir" ]]; then
         echo "error: $dir exists but is not a git checkout" >&2
         exit 1
@@ -141,12 +149,31 @@ pin_checkout() {
     echo "    $dir at $(git -C "$dir" describe --tags --always)"
 }
 
+# Apply a local patch when cleanly applicable, accept an already applied patch, and reject conflicting trees.
+ensure_patch() {
+    local dir="$1"
+    local patch="$2"
+    if git -C "$dir" apply --reverse --check "$patch"; then
+        echo "    already applied: $patch"
+    elif git -C "$dir" apply --check "$patch"; then
+        git -C "$dir" apply "$patch"
+        echo "    applied: $patch"
+    else
+        echo "error: $patch neither applies cleanly nor matches $dir; refusing to overwrite local work" >&2
+        exit 1
+    fi
+}
+
 echo "==> Checking out ns-3 $NS3_TAG into $NS3_DIR"
 pin_checkout "$NS3_DIR" "$NS3_TAG" https://gitlab.com/nsnam/ns-3-dev.git
 
 echo "==> Checking out 5G-LENA nr $NR_TAG into $NS3_DIR/contrib/nr"
 mkdir -p "$NS3_DIR/contrib"
 pin_checkout "$NS3_DIR/contrib/nr" "$NR_TAG" https://gitlab.com/cttc-lena/nr.git
+
+echo "==> Applying local ns-3 and NR NTN patches"
+ensure_patch "$NS3_DIR" "$ROOT_DIR/patches/ns3-v3.48-local-ntn.patch"
+ensure_patch "$NS3_DIR/contrib/nr" "$ROOT_DIR/patches/nr-v5.1-local-ntn.patch"
 
 echo "==> Symlinking scratch scenario into ns-3 scratch/"
 mkdir -p "$NS3_DIR/scratch"
@@ -182,14 +209,14 @@ else
     smoke_cfg="$SCENARIO_SRC/config/smoke.json"
     prefix="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"]["prefix"])' "$smoke_cfg")"
     results="$ROOT_DIR/results/$prefix"
-    python3 "$ROOT_DIR/scripts/bucketize_metrics.py" \
+    python3 "$ROOT_DIR/scripts/dataset/bucketize_metrics.py" \
         --config "$smoke_cfg" \
         --tcp "$results/${prefix}-tcp.csv" \
         --sinr-dl "$results/${prefix}-sinr-dl.csv" \
         --sinr-ul "$results/${prefix}-sinr-ul.csv" \
         --num-buckets 50
     # Smoke runs are short (< 20 RTT tokens); longer runs produce non-empty seq20 files.
-    python3 "$ROOT_DIR/scripts/tokenize_sequences.py" \
+    python3 "$ROOT_DIR/scripts/dataset/tokenize_sequences.py" \
         --bucketized "$results/${prefix}-bucketized.csv" || true
 fi
 

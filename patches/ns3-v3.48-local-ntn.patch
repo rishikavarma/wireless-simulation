@@ -1,0 +1,74 @@
+diff --git a/src/internet/model/tcp-socket-base.cc b/src/internet/model/tcp-socket-base.cc
+index 37f7317..4ab7e9e 100644
+--- a/src/internet/model/tcp-socket-base.cc
++++ b/src/internet/model/tcp-socket-base.cc
+@@ -3324,6 +3324,12 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
+     header.SetFlags(flags);
+     header.SetSequenceNumber(seq);
+     header.SetAckNumber(m_tcb->m_rxBuffer->NextRxSequence());
++    // m_highTxAck is the highest acknowledgement sent (RFC 7323 Last.ACK.sent).
++    // Pure ACKs update it in SendEmptyPacket; piggybacked ACKs must as well.
++    if (withAck && m_highTxAck < header.GetAckNumber())
++    {
++        m_highTxAck = header.GetAckNumber();
++    }
+     if (m_endPoint)
+     {
+         header.SetSourcePort(m_endPoint->GetLocalPort());
+@@ -4597,7 +4603,15 @@ TcpSocketBase::ProcessOptionTimestamp(const Ptr<const TcpOption> option,
+     m_tcb->m_rcvTimestampValue = ts->GetTimestamp();
+     m_tcb->m_rcvTimestampEchoReply = ts->GetEcho();
+ 
+-    if (seq == m_tcb->m_rxBuffer->NextRxSequence() && seq <= m_highTxAck)
++    // RFC 7323 section 4.3: echo TSval from the segment that contains the next
++    // expected octet, so the acknowledgement measures that segment's RTT.
++    // The previous test also required seq <= m_highTxAck ("highest ack sent"),
++    // but that variable advances only in SendEmptyPacket. Data segments carry
++    // the ACK without updating it, so once the peer sends past the last pure
++    // ACK the echo freezes and every later sample equals the age of that old
++    // timestamp. RTO then grows to tens of seconds and a short loss leaves the
++    // sender idle, with nothing left for this endpoint to acknowledge.
++    if (seq == m_tcb->m_rxBuffer->NextRxSequence())
+     {
+         m_timestampToEcho = ts->GetTimestamp();
+     }
+diff --git a/src/propagation/model/three-gpp-propagation-loss-model.cc b/src/propagation/model/three-gpp-propagation-loss-model.cc
+index 7876329..ab179de 100644
+--- a/src/propagation/model/three-gpp-propagation-loss-model.cc
++++ b/src/propagation/model/three-gpp-propagation-loss-model.cc
+@@ -299,6 +299,12 @@ ThreeGppPropagationLossModel::GetTypeId()
+                 BooleanValue(true),
+                 MakeBooleanAccessor(&ThreeGppPropagationLossModel::m_buildingPenLossesEnabled),
+                 MakeBooleanChecker())
++            .AddAttribute("VehicularPenetrationLossesEnabled",
++                          "Enable/disable vehicle penetration inferred from terminal speed.",
++                          BooleanValue(true),
++                          MakeBooleanAccessor(
++                              &ThreeGppPropagationLossModel::m_vehicularPenetrationLossesEnabled),
++                          MakeBooleanChecker())
+             .AddAttribute("MeanVehicularLoss",
+                           "9dB for standard cars, 20dB for cars with "
+                           "metal coated glass panels.",
+@@ -827,6 +833,10 @@ ThreeGppPropagationLossModel::GetO2iVehicularLoss(Ptr<MobilityModel> a,
+                                                   ChannelCondition::O2iConditionValue cond) const
+ {
+     NS_LOG_FUNCTION(this);
++    if (!m_vehicularPenetrationLossesEnabled)
++    {
++        return 0.0;
++    }
+     double o2iVehicularLoss = 0.0;
+ 
+     // O2I penetration loss for vehicles only applies between 600 MHz and 60 GHz.
+diff --git a/src/propagation/model/three-gpp-propagation-loss-model.h b/src/propagation/model/three-gpp-propagation-loss-model.h
+index b7d1f0e..ebaaec5 100644
+--- a/src/propagation/model/three-gpp-propagation-loss-model.h
++++ b/src/propagation/model/three-gpp-propagation-loss-model.h
+@@ -314,6 +314,7 @@ class ThreeGppPropagationLossModel : public PropagationLossModel
+     bool m_shadowingEnabled;                            //!< enable/disable shadowing
+     bool m_enforceRanges;            //!< strictly enforce TR 38.901 parameter ranges
+     bool m_buildingPenLossesEnabled; //!< enable/disable building penetration losses
++    bool m_vehicularPenetrationLossesEnabled; //!< enable/disable speed-inferred vehicle loss
+     double m_meanVehicleO2iLoss; //!< normal cars (9dB), cars with metal coated glass panels (20dB)
+     Ptr<NormalRandomVariable> m_normRandomVariable; //!< normal random variable
+ 

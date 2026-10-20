@@ -9,27 +9,41 @@
   "satellite": {
     "altitudeKm": 550,
     "inclinationDeg": 53,
-    "antennaUpdateMs": 1000
+    "antennaUpdateMs": 1000,
+    "feederMinElevationDeg": 30,
+    "serviceMinElevationDeg": 30
   },
   "radio": {
     "ntnScenario": "NTN-Rural",
-    "frequencyHz": 20e9,
-    "bandwidthHz": 400e6,
-    "dlFrequencyHz": 20e9,
-    "ulFrequencyHz": 30e9,
-    "dlBandwidthHz": 400e6,
-    "ulBandwidthHz": 400e6,
-    "satEIRP": 20,
-    "ueTxPower": 40,
-    "ueAntennaGainDb": 38.5,
+    "frequencyHz": 2185000000.0,
+    "bandwidthHz": 10000000.0,
+    "dlFrequencyHz": 2185000000.0,
+    "ulFrequencyHz": 1995000000.0,
+    "dlBandwidthHz": 10000000.0,
+    "ulBandwidthHz": 10000000.0,
+    "ueTxPower": 23,
+    "ueAntennaGainDb": 0,
     "gnbAntennaGainDb": 50,
     "gnbNoiseFigureDb": 5,
-    "realisticPower": false,
-    "nrTraces": false
+    "linkMarginDb": 0,
+    "nrTraces": false,
+    "gnbTxPower": 40,
+    "ueNoiseFigureDb": 7,
+    "feederUlFrequencyHz": 30000000000.0,
+    "feederDlFrequencyHz": 20000000000.0,
+    "ueProfile": "handheld-n256",
+    "satServiceEirpDbwMhz": 34,
+    "satFeederEirpDbwMhz": 4,
+    "satServiceRxGainDb": 30,
+    "satFeederRxGainDb": 38.5,
+    "satServiceNoiseFigureDb": 4.276020021,
+    "satFeederNoiseFigureDb": 0.876020021
   },
   "topology": {
     "ueDistanceM": 100,
-    "receiverMobility": false
+    "receiverMobility": false,
+    "bsNorthOffsetKm": 0,
+    "bsEastOffsetKm": 0
   },
   "application": {
     "workload": "probe",
@@ -39,8 +53,9 @@
     "tcpVariant": "TcpNewReno",
     "queueSizeBdp": 2,
     "aqm": "DropTail",
+    "computeDelayUs": 0,
     "probe": {
-      "traffic": "onoff",
+      "traffic": "cbr",
       "onTime": "1s",
       "offTime": "1s",
       "burstShape": 1.5

@@ -24,7 +24,7 @@ class BsEchoServer : public Application
   public:
     static TypeId GetTypeId();
 
-    void Setup(uint16_t port);
+    void Setup(uint16_t port, uint64_t computeDelayUs = 0, bool udp = false);
 
     BsAppMetrics GetMetrics() const;
 
@@ -33,11 +33,15 @@ class BsEchoServer : public Application
     void StopApplication() override;
     bool HandleRequest(Ptr<Socket> socket, const Address& from);
     void HandleAccept(Ptr<Socket> socket, const Address& from);
+    void HandleClose(Ptr<Socket> socket);
     void HandleRead(Ptr<Socket> socket);
     void NotifySend(Ptr<Socket> socket, uint32_t available);
     void DispatchRequest(const std::vector<uint8_t>& body);
+    void SendReply(Ptr<Socket> socket, std::vector<uint8_t> reply);
 
+    bool m_udp{false};
     uint16_t m_port{0};
+    uint64_t m_computeDelayUs{0};
     Ptr<Socket> m_listen;
     Ptr<Socket> m_conn;
     TcpPipe m_pipe;

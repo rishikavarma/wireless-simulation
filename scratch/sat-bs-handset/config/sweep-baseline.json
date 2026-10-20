@@ -1,0 +1,117 @@
+{
+  "time": {
+    "simTime": 90,
+    "warmUp": 15,
+    "appDrain": 10,
+    "measureStart": 5,
+    "measureEnd": 1
+  },
+  "satellite": {
+    "altitudeKm": 800,
+    "inclinationDeg": 53,
+    "antennaUpdateMs": 100,
+    "feederMinElevationDeg": 30,
+    "serviceMinElevationDeg": 30,
+    "count": 2,
+    "spacingDeg": 8
+  },
+  "radio": {
+    "ntnScenario": "NTN-Rural",
+    "frequencyHz": 2185000000.0,
+    "bandwidthHz": 10000000.0,
+    "dlFrequencyHz": 2185000000.0,
+    "ulFrequencyHz": 1995000000.0,
+    "dlBandwidthHz": 10000000.0,
+    "ulBandwidthHz": 10000000.0,
+    "ueTxPower": 23,
+    "ueAntennaGainDb": 0,
+    "gnbAntennaGainDb": 50,
+    "gnbNoiseFigureDb": 5,
+    "linkMarginDb": 0,
+    "nrTraces": false,
+    "gnbTxPower": 40,
+    "ueNoiseFigureDb": 7,
+    "feederUlFrequencyHz": 30000000000.0,
+    "feederDlFrequencyHz": 20000000000.0,
+    "ueProfile": "handheld-n256",
+    "satServiceEirpDbwMhz": 34,
+    "satFeederEirpDbwMhz": 4,
+    "satServiceRxGainDb": 30,
+    "satFeederRxGainDb": 38.5,
+    "satServiceNoiseFigureDb": 4.276020021,
+    "satFeederNoiseFigureDb": 0.876020021,
+    "serviceExcessLossDb": 0,
+    "feederExcessLossDb": 0
+  },
+  "topology": {
+    "ueDistanceM": 100,
+    "receiverMobility": false,
+    "bsNorthOffsetKm": 0,
+    "bsEastOffsetKm": 0,
+    "ueSpeedMps": 1.4
+  },
+  "application": {
+    "workload": "probe",
+    "serverPort": 9,
+    "dataRate": "10kbps",
+    "packetSize": 512,
+    "tcpVariant": "TcpNewReno",
+    "queueSizeBdp": 2,
+    "aqm": "DropTail",
+    "computeDelayUs": 0,
+    "probe": {
+      "traffic": "cbr",
+      "onTime": "1s",
+      "offTime": "1s",
+      "burstShape": 1.5
+    },
+    "file": {
+      "sizeMu": 9.680344001221918,
+      "sizeSigma": 0.5,
+      "sizeMax": 1000000,
+      "readingMean": "3s"
+    },
+    "rpc": {
+      "reqSize": 128,
+      "objectScale": 128,
+      "objectShape": 1.6,
+      "objectMax": 4096,
+      "objectsMean": 2,
+      "objectGap": "0.2s",
+      "readingMean": "1.5s",
+      "count": 0
+    },
+    "stream": {
+      "frameInterval": "100ms",
+      "slicesPerFrame": 8,
+      "sliceScale": 40,
+      "sliceShape": 2,
+      "sliceMax": 500,
+      "sliceGapScale": 0.0025,
+      "sliceGapShape": 1.2,
+      "sliceGapMax": 0.01
+    },
+    "iot": {
+      "payloadMin": 64,
+      "payloadMax": 256,
+      "interval": "1.5s"
+    }
+  },
+  "output": {
+    "prefix": "sweep-baseline",
+    "tokenMode": "rtt",
+    "tokenFixedS": 0.1,
+    "tokenMinS": 0.005,
+    "tokenAggregate": "weighted",
+    "tokenRttColumn": "minrtt",
+    "tokenRttLock": false,
+    "tokenRttSecondsPerUnit": 0.1
+  },
+  "handover": {
+    "enabled": false,
+    "checkIntervalMs": 100,
+    "timeToTriggerMs": 1000,
+    "hysteresisKm": 5,
+    "interruptionMs": 100
+  }
+}
