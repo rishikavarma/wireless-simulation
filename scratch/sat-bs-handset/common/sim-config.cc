@@ -258,7 +258,7 @@ LoadScenarioConfig(const std::string& path)
     Overlay(root, "radio.ulFrequencyHz", cfg.ulFrequencyHz, JsonDouble);
     Overlay(root, "radio.dlBandwidthHz", cfg.dlBandwidthHz, JsonDouble);
     Overlay(root, "radio.ulBandwidthHz", cfg.ulBandwidthHz, JsonDouble);
-    // Feeder defaults remain Ka-band independently of the handset service band.
+    // Feeder carriers can be configured independently of the service carriers.
     Overlay(root, "radio.feederUlFrequencyHz", cfg.feederUlFrequencyHz, JsonDouble);
     Overlay(root, "radio.feederDlFrequencyHz", cfg.feederDlFrequencyHz, JsonDouble);
     Overlay(root, "radio.satEIRP", cfg.satEIRP, JsonDouble);
@@ -379,14 +379,22 @@ LoadScenarioConfig(const std::string& path)
                         cfg.ueNoiseFigureDb < 0 ||
                         cfg.gnbNoiseFigureDb < 0,
                     "Receiver noise figures must be >= 0 dB");
-    NS_ABORT_MSG_IF(cfg.ueProfile != "handheld-n256" && cfg.ueProfile != "custom",
-                    "radio.ueProfile must be handheld-n256 or custom");
-    if (cfg.ueProfile == "handheld-n256")
+    NS_ABORT_MSG_IF(!cfg.IsHandheld() && cfg.ueProfile != "custom",
+                    "radio.ueProfile must be handheld, handheld-n256 or custom");
+    if (cfg.IsHandheld())
     {
         NS_ABORT_MSG_IF(cfg.ueTxPower > 23.0,
-                        "handheld-n256 UE transmit power must be <= 23 dBm; use custom for other hardware");
+                        "handheld UE transmit power must be <= 23 dBm; use custom for other hardware");
         NS_ABORT_MSG_IF(cfg.ueAntennaGainDb > 0.0,
-                        "handheld-n256 uses <= 0 dBi total antenna gain; use custom for directional terminals");
+                        "handheld uses <= 0 dBi total antenna gain; use custom for directional terminals");
+        for (double bw : {cfg.dlBandwidthHz, cfg.ulBandwidthHz})
+        {
+            NS_ABORT_MSG_IF(bw != 5e6 && bw != 10e6 && bw != 15e6 && bw != 20e6,
+                            "handheld carrier bandwidth must be 5, 10, 15 or 20 MHz");
+        }
+    }
+    if (cfg.ueProfile == "handheld-n256")
+    {
         const bool validDl = cfg.dlFrequencyHz - cfg.dlBandwidthHz / 2 >= 2170e6 &&
                              cfg.dlFrequencyHz + cfg.dlBandwidthHz / 2 <= 2200e6;
         const bool validUl = cfg.ulFrequencyHz - cfg.ulBandwidthHz / 2 >= 1980e6 &&
@@ -394,11 +402,6 @@ LoadScenarioConfig(const std::string& path)
         NS_ABORT_MSG_IF(!validDl || !validUl ||
                             std::abs(cfg.dlFrequencyHz - cfg.ulFrequencyHz - 190e6) > 1,
                         "handheld-n256 requires UL 1980..2010 MHz, DL 2170..2200 MHz and 190 MHz spacing");
-        for (double bw : {cfg.dlBandwidthHz, cfg.ulBandwidthHz})
-        {
-            NS_ABORT_MSG_IF(bw != 5e6 && bw != 10e6 && bw != 15e6 && bw != 20e6,
-                            "handheld-n256 carrier bandwidth must be 5, 10, 15 or 20 MHz");
-        }
     }
     NS_ABORT_MSG_IF(cfg.ntnScenario.empty(), "radio.ntnScenario must be set");
     NS_ABORT_MSG_IF(cfg.outputPrefix.empty(), "output.prefix must be set");

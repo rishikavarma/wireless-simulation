@@ -12,8 +12,8 @@ The receiver uses 5G-LENA's analytical PHY error model, NR scheduling, HARQ and
 RLC AM. TCP or UDP runs above the same radio stack.
 
 The reference uses an 800 km orbit at 53° inclination, two relays separated by
-8°, paired 10 MHz service carriers at 2185 MHz DL / 1995 MHz UL, and a handheld
-UE with 23 dBm conducted power and 0 dBi gain. Both ground-to-satellite paths
+8°, paired 10 MHz carriers at 2135 MHz DL / 1945 MHz UL on both service and
+feeder links, and a handheld UE with 23 dBm conducted power and 0 dBi gain. Both ground-to-satellite paths
 must meet a 30° elevation mask. Planning checks the complete run at 0.5 s
 intervals with a conservative movement envelope and a 5° visibility margin.
 It also checks initial uplink budget and the expected relay-switch timing.

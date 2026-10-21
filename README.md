@@ -9,8 +9,9 @@ UE (NR) -- selected LEO relay -- ground gNB and application server
 
 The satellite carries no NR device or IP application. Propagation uses live
 feeder/service ranges and a two-hop composite-SNR model. The handheld reference
-uses paired 10 MHz carriers at 2185 MHz DL / 1995 MHz UL, 23 dBm UE power and
-0 dBi UE antenna gain. UE slot timing follows the moving propagation delay.
+uses paired 10 MHz carriers at 2135 MHz DL / 1945 MHz UL for both service and
+feeder links, 23 dBm UE power and 0 dBi UE antenna gain. The `handheld` profile
+retains handset behavior without the band limits of `handheld-n256`. UE slot timing follows the moving propagation delay.
 Relay switching selects between two satellites within the same NR cell.
 
 The maintained end-to-end experiment and its plots live together in

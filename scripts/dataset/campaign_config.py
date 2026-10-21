@@ -144,9 +144,10 @@ def draw(base, rng, workload, handover, mobile, condition, service_loss=None):
     # Service attenuation moves SINR against fixed receiver noise; feeder loss is
     # a constant per-run weather-fade proxy, not a fabricated rain time series.
     feeder_loss = {'clear':0, 'moderate':12, 'degraded':24}[condition]
-    dl = 2.185e9
-    cfg['radio'].update(ueProfile='handheld-n256', frequencyHz=dl, dlFrequencyHz=dl,
-                        ulFrequencyHz=dl-190e6, bandwidthHz=10e6,
+    dl, ul = 2.135e9, 1.945e9
+    cfg['radio'].update(ueProfile='handheld', frequencyHz=dl, dlFrequencyHz=dl,
+                        ulFrequencyHz=ul, feederDlFrequencyHz=dl,
+                        feederUlFrequencyHz=ul, bandwidthHz=10e6,
                         dlBandwidthHz=10e6, ulBandwidthHz=10e6,
                         ueTxPower=23, ueAntennaGainDb=0, ueNoiseFigureDb=7,
                         ntnScenario='NTN-Rural', linkMarginDb=0,

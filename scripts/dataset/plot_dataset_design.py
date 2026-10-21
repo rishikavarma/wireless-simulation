@@ -124,9 +124,9 @@ def draw_setup(ax):
             transform=ax.transAxes, zorder=5)
     text(ax, .094, .695, "NR UE", size=11, weight="bold")
     text(ax, .511, .695, "ground gNB + app server", size=10.4, weight="bold")
-    text(ax, .145, .784, "service: UL 1995 / DL 2185 MHz", size=10.0, color=TEAL,
+    text(ax, .145, .784, "service: UL 1945 / DL 2135 MHz", size=10.0, color=TEAL,
          weight="bold")
-    text(ax, .395, .770, "feeder: UL 30 / DL 20 GHz", size=10.0, color=ORANGE,
+    text(ax, .395, .770, "feeder: UL 1945 / DL 2135 MHz", size=10.0, color=ORANGE,
          weight="bold")
 
     text(ax, .687, .891, "FIXED REFERENCE", size=15, weight="bold")
@@ -183,7 +183,7 @@ def draw_knobs(ax):
         "Admit exactly 1 switch in record window",
     ], accent=PURPLE, tint="#f9f7fc")
     detail_card(ax, .669, "RADIO + LINK CONDITIONS", [
-        "n256 centers fixed: UL 1995 / DL 2185 MHz",
+        "Both links: UL 1945 / DL 2135 MHz",
         "Width: 10 MHz; UE power: 23 dBm",
         "Service attenuation: 0 / 1.5 / 3 dB",
         "Feeder fade: clear 0 dB",

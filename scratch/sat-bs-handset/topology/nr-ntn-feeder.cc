@@ -91,7 +91,7 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     out.nrHelper->SetEpcHelper(out.epcHelper);
     out.nrHelper->SetGnbSpectrumAttribute("NtnRxBoundaryTolerance", TimeValue(NanoSeconds(100)));
     out.nrHelper->SetUeSpectrumAttribute("NtnRxBoundaryTolerance", TimeValue(NanoSeconds(100)));
-    if (sim.ueProfile == "handheld-n256")
+    if (sim.IsHandheld())
     {
         // Reliable mobile data bearer: recover radio losses below TCP. Timers
         // accommodate the NTN scheduling delay rather than terrestrial 10/20 ms.
@@ -124,12 +124,12 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
                                          TypeIdValue(DirectPathBeamforming::GetTypeId()));
     // Handset power is limited: allocate frequency resources rather than
     // spreading a low-rate uplink burst over the entire carrier as TDMA does.
-    out.nrHelper->SetSchedulerTypeId(sim.ueProfile == "handheld-n256"
+    out.nrHelper->SetSchedulerTypeId(sim.IsHandheld()
                                         ? NrMacSchedulerOfdmaRR::GetTypeId()
                                         : NrMacSchedulerTdmaRR::GetTypeId());
 
-    const uint32_t ueNumRows = sim.ueProfile == "handheld-n256" ? 1 : 2;
-    const uint32_t ueNumCols = sim.ueProfile == "handheld-n256" ? 1 : 4;
+    const uint32_t ueNumRows = sim.IsHandheld() ? 1 : 2;
+    const uint32_t ueNumCols = sim.IsHandheld() ? 1 : 4;
     const uint32_t gnbNumRows = 8;
     const uint32_t gnbNumCols = 8;
     const double ueArrayFactorDb = 10 * std::log10(ueNumRows * ueNumCols);
@@ -293,7 +293,7 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
         Ptr<NrSpectrumPhy> gnbSpectrum =
             NrHelper::GetGnbPhy(out.gnbNetDev.Get(0), bwpId)->GetSpectrumPhy();
         Ptr<SpectrumChannel> channel = gnbSpectrum->GetSpectrumChannel();
-        const bool outdoorHandheld = sim.ueProfile == "handheld-n256";
+        const bool outdoorHandheld = sim.IsHandheld();
         auto firstHop = MakeNtnHopLoss(ntnScenario,
             downlink ? sim.feederUlFrequencyHz : ulFrequencyHz, outdoorHandheld);
         auto secondHop = MakeNtnHopLoss(ntnScenario,

@@ -37,15 +37,15 @@ struct ScenarioConfig
     double handoverHysteresisKm{5.0};
 
     std::string ntnScenario{"NTN-Rural"};
-    std::string ueProfile{"handheld-n256"};
-    double frequencyHz{2.185e9};
+    std::string ueProfile{"handheld"};
+    double frequencyHz{2.135e9};
     double bandwidthHz{10e6};
-    double dlFrequencyHz{2.185e9};
-    double ulFrequencyHz{1.995e9};
+    double dlFrequencyHz{2.135e9};
+    double ulFrequencyHz{1.945e9};
     double dlBandwidthHz{10e6};
     double ulBandwidthHz{10e6};
-    double feederUlFrequencyHz{30e9};
-    double feederDlFrequencyHz{20e9};
+    double feederUlFrequencyHz{1.945e9};
+    double feederDlFrequencyHz{2.135e9};
     double satEIRP{34.0};
     double satServiceEirpDbwMhz{34.0};
     double satFeederEirpDbwMhz{4.0};
@@ -91,6 +91,11 @@ struct ScenarioConfig
 
     /** Directory and file-name prefix for periodic traces. */
     std::string outputPrefix{"sat-bs-handset"};
+
+    bool IsHandheld() const
+    {
+        return ueProfile == "handheld" || ueProfile == "handheld-n256";
+    }
 };
 
 struct MetricOutputPaths
