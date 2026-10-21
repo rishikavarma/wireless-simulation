@@ -308,8 +308,8 @@ def report(out, manifest, rows, summaries, details):
         'Queue budgets use a fresh clear-link reference and a 10 KiB floor; equal low-factor byte '
         'budgets can produce identical results. Full saved configurations are authoritative.', '',
         '**Background sweep scope:** relay switching is held disabled for every background level, '
-        'including its zero-background control. The broader pilot exposed an NR PHY abort when '
-        'switching overlaps uplink control/data or SRS reception. Those failed pilot logs are '
+        'including its zero-background control. The broader pilot exposed a relay-switch uplink '
+        'timing bug, now fixed and covered by `experiments/relay-switch-regression/`. Failed pilot logs are '
         'preserved under `reused-provenance/` when prior results are reused. The separate switching '
         'sweep retains enabled/disabled controls without background UEs. These plots do not establish '
         'behavior for the combined switching/background interaction.', '',

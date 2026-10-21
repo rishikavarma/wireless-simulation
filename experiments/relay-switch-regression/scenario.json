@@ -1,0 +1,98 @@
+{
+  "time": {
+    "simTime": 84,
+    "warmUp": 15,
+    "appDrain": 5,
+    "measureStart": 5,
+    "measureEnd": 1
+  },
+  "satellite": {
+    "altitudeKm": 800,
+    "inclinationDeg": 53,
+    "antennaUpdateMs": 100,
+    "feederMinElevationDeg": 30,
+    "serviceMinElevationDeg": 30,
+    "count": 2,
+    "spacingDeg": 8
+  },
+  "radio": {
+    "ntnScenario": "NTN-Rural",
+    "frequencyHz": 2135000000.0,
+    "bandwidthHz": 10000000.0,
+    "dlFrequencyHz": 2135000000.0,
+    "ulFrequencyHz": 1945000000.0,
+    "dlBandwidthHz": 10000000.0,
+    "ulBandwidthHz": 10000000.0,
+    "ueTxPower": 23,
+    "ueAntennaGainDb": 0,
+    "gnbAntennaGainDb": 50,
+    "gnbNoiseFigureDb": 5,
+    "linkMarginDb": 0,
+    "nrTraces": false,
+    "gnbTxPower": 40,
+    "ueNoiseFigureDb": 7,
+    "feederUlFrequencyHz": 1945000000.0,
+    "feederDlFrequencyHz": 2135000000.0,
+    "ueProfile": "handheld",
+    "satServiceEirpDbwMhz": 34,
+    "satFeederEirpDbwMhz": 4,
+    "satServiceRxGainDb": 30,
+    "satFeederRxGainDb": 38.5,
+    "satServiceNoiseFigureDb": 4.276020021,
+    "satFeederNoiseFigureDb": 0.876020021,
+    "serviceExcessLossDb": 0,
+    "feederExcessLossDb": 0
+  },
+  "topology": {
+    "ueDistanceM": 500,
+    "receiverMobility": false,
+    "bsNorthOffsetKm": 0,
+    "bsEastOffsetKm": 0,
+    "ueSpeedMps": 1.4
+  },
+  "application": {
+    "workload": "cbr",
+    "serverPort": 9,
+    "dataRate": "32kbps",
+    "packetSize": 512,
+    "tcpVariant": "TcpNewReno",
+    "queueSizeBdp": 2,
+    "aqm": "DropTail",
+    "computeDelayUs": 0,
+    "probe": {
+      "traffic": "cbr",
+      "onTime": "1s",
+      "offTime": "1s",
+      "burstShape": 1.5
+    },
+    "queueSizeBytes": 28402
+  },
+  "output": {
+    "prefix": "relay-switch-regression",
+    "tokenMode": "fixed",
+    "tokenFixedS": 0.1,
+    "tokenMinS": 0.005,
+    "tokenAggregate": "weighted",
+    "tokenRttColumn": "minrtt",
+    "tokenRttLock": false,
+    "tokenRttSecondsPerUnit": 0.1
+  },
+  "handover": {
+    "enabled": true,
+    "checkIntervalMs": 100,
+    "timeToTriggerMs": 1000,
+    "hysteresisKm": 5,
+    "interruptionMs": 100
+  },
+  "metrics": {
+    "physical": true,
+    "payload": false,
+    "intervalS": 1
+  },
+  "background": {
+    "count": 3,
+    "dataRate": "32kbps",
+    "relay": 0,
+    "distanceM": 500
+  }
+}

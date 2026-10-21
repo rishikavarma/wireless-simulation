@@ -1081,7 +1081,7 @@ index 390bdcb..a328397 100644
      }
  }
 diff --git a/model/nr-ue-phy.cc b/model/nr-ue-phy.cc
-index d1a8e89..b45a171 100644
+index d1a8e89..5fb4c79 100644
 --- a/model/nr-ue-phy.cc
 +++ b/model/nr-ue-phy.cc
 @@ -627,7 +627,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
@@ -1202,7 +1202,31 @@ index d1a8e89..b45a171 100644
      NS_LOG_INFO("UE" << m_rnti << " RXing DL DATA frame for symbols " << +dci->m_symStart << "-"
                       << +(dci->m_symStart + dci->m_numSym - 1) << " num of rbg assigned: "
                       << FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask).size()
-@@ -1338,7 +1371,23 @@ NrUePhy::EndVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
+@@ -1282,6 +1315,23 @@ void
+ NrUePhy::StartVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
+ {
+     NS_LOG_FUNCTION(this);
++    const Time ntnDelay = GetNtnOneWayDelay();
++    const Time delayChange = ntnDelay - m_lastNtnOneWayDelay;
++    if (m_ntnPhaseDirection < 0 && dci->m_format == DciInfoElementTdma::UL &&
++        delayChange < Time(0) - MicroSeconds(1))
++    {
++        // A shorter relay path can be selected after this allocation was
++        // scheduled. Using the old advance would deliver CTRL, DATA or SRS
++        // before its gNB symbol and collide with other UEs' valid reception.
++        // Move the unfinished slot onto the new transmit clock BEFORE sending.
++        // Update both references so EndVarTti applies only subsequent drift.
++        const Time adjustment = Time(0) - delayChange;
++        m_lastSlotStart += adjustment;
++        m_lastNtnOneWayDelay = ntnDelay;
++        NS_LOG_INFO("Rephasing pending NTN UL allocation by " << adjustment);
++        Simulator::Schedule(adjustment, &NrUePhy::StartVarTti, this, dci);
++        return;
++    }
+     Time varTtiDuration;
+ 
+     m_currTbs = dci->m_tbSize;
+@@ -1338,7 +1388,23 @@ NrUePhy::EndVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
          // stale boundary to the current instant so the slot machine keeps
          // running on the target BWP instead of asserting; StartSlot() detects
          // the numerology change and cleanly re-stamps the loop from there.
@@ -1227,7 +1251,7 @@ index d1a8e89..b45a171 100644
          if (delay.IsNegative())
          {
              NS_LOG_WARN("Clamping next-slot start "
-@@ -1437,8 +1486,10 @@ void
+@@ -1437,8 +1503,10 @@ void
  NrUePhy::GenerateDlCqiReport(const SpectrumValue& sinr)
  {
      NS_LOG_FUNCTION(this);
@@ -1240,7 +1264,7 @@ index d1a8e89..b45a171 100644
      {
          m_dlDataSinrTrace(GetCellId(), m_rnti, ComputeAvgSinr(sinr), GetBwpId());
  
-@@ -1556,17 +1607,56 @@ NrUePhy::GetBeamId([[maybe_unused]] uint16_t rnti) const
+@@ -1556,17 +1624,56 @@ NrUePhy::GetBeamId([[maybe_unused]] uint16_t rnti) const
      NS_FATAL_ERROR("ERROR");
  }
  

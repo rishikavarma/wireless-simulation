@@ -196,6 +196,12 @@ calibration_link="$NS3_DIR/scratch/queue-calibration"
 calibration_target="$(realpath --relative-to="$NS3_DIR/scratch" "$calibration_src")"
 ln -sfn "$calibration_target" "$calibration_link"
 
+# Relay-switch regression uses the production scenario with transmit observers.
+regression_src="$ROOT_DIR/experiments/relay-switch-regression"
+regression_link="$NS3_DIR/scratch/relay-switch-regression"
+regression_target="$(realpath --relative-to="$NS3_DIR/scratch" "$regression_src")"
+ln -sfn "$regression_target" "$regression_link"
+
 echo "==> Configuring and building ns-3 (optimized; examples off)"
 echo "    this can take several minutes to around an hour depending on hardware"
 cd "$NS3_DIR"

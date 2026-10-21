@@ -107,7 +107,7 @@ def sweeps(settings, calibration):
         values = sorted(set(ranges[key]) | {5, 20, 80}) if key == 'backgroundRateKbps' else ranges[key]
         add(key, title, values, base(background=True), setter, reference,
             'Other background settings fixed at 3 UEs, 32 kbit/s each, 500 m, relay 0; only the named factor changes. '
-            'Relay switching is disabled for these controls: concurrent switching/background traffic can abort the NR PHY.')
+            'Relay switching is disabled to isolate contention; the separate relay-switch regression covers concurrent switching/background traffic.')
     add('probeTraffic', 'Probe traffic pattern', ranges['probeTraffic'], base('probe'),
         nested('probe', 'traffic'), 'cbr')
     add('fileMedianBytes', 'Median file content size (bytes)', ranges['fileMedianBytes'], base('file'),

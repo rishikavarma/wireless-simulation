@@ -157,12 +157,25 @@ are included and flagged. Seven crashes from the earlier switching/background
 pilot are preserved separately in its `reused-provenance/` audit.
 
 Background sweeps hold relay switching **disabled at every level**, including
-the zero-background control, to isolate contention. An expanded pilot exposed
-an NR PHY abort when relay switching overlaps UL control/data or SRS reception;
-the separate switching sweep still compares enabled/disabled operation without
-background UEs. The combined switching/background interaction remains a model
-limitation. Failed pilot logs are preserved rather than included as completed
-measurements.
+the zero-background control, to isolate contention. The earlier pilot exposed
+an NR PHY timing bug when a switch shortened the relay path: an already scheduled
+uplink allocation retained the old timing advance and arrived during another
+UE's data or SRS reception. The maintained NR patch now rephases pending uplink
+allocations before transmission, updating both the slot origin and stored path
+delay. The receiver's 100 ns boundary tolerance is unchanged. Failed pilot logs
+and existing plots retain their original provenance.
+
+[`experiments/relay-switch-regression/`](experiments/relay-switch-regression/)
+replays all seven original failing settings through the production scenario and
+checks actual uplink transmit timing plus post-switch delivery for every UE:
+
+```bash
+python3 experiments/relay-switch-regression/run.py --out-dir results/relay-switch-check --jobs 4
+```
+
+Four additional controls cover fixed-relay operation, a single UE, and short CBR
+and backlogged TCP runs. Use a new output directory after changing the model;
+the runner saves source/binary hashes and rejects a changed experiment on resume.
 
 Outputs remain under the chosen directory:
 
@@ -262,22 +275,21 @@ measurements use 20–119 s and exclude five seconds on either side of the switc
   separately. This is sustainable service in this model, including its
   scheduler, errors, RLC AM and 120 B new-PDU limit; it is not peak radio bitrate.
 
-Measured reference (three RNG runs per case; 80 completed calibration runs,
-including an earlier buffer control retained when extending the load sweep):
+Measured reference after the relay-switch timing fix (three RNG runs per case;
+[79 completed calibration runs](results/relay-switch-calibration-20261021/summary.json)):
 
 | Bandwidth | Direction | PDCP service capacity | Minimum data RTT | Directional BDP |
 | --- | --- | ---: | ---: | ---: |
 | 10 MHz | UL | 337.1 kbit/s | 337 ms | 13.87 KiB |
-| 10 MHz | DL | 251.8 kbit/s | 308 ms | 9.47 KiB |
+| 10 MHz | DL | 251.8 kbit/s | 307 ms | 9.44 KiB |
 | 20 MHz | UL | 715.2 kbit/s | 337 ms | 29.42 KiB |
-| 20 MHz | DL | 251.8 kbit/s | 308 ms | 9.47 KiB |
+| 20 MHz | DL | 251.8 kbit/s | 307 ms | 9.44 KiB |
 
 The final two offered loads change delivery by less than **0.02%** in every
 case; doubling the buffer produces the same delivered rate for the control RNG.
-All 80 runs completed successfully with one relay switch each. The separate
-12-run pilot is retained under ignored results. An additional legacy-default
-regression reproduced saved application, TCP, SINR, TB, event and KPI traces
-byte for byte. All 2,000 full-preset profiles also passed geometry admission
+All 79 runs completed successfully with one relay switch each. Earlier
+calibration runs and the separate 12-run pilot remain under ignored results.
+All 2,000 full-preset profiles also passed geometry admission
 and calibrated-budget checks, with switching enabled and altitude fixed at
 800 km. The full dataset was not executed.
 
@@ -285,7 +297,7 @@ Actual full-preset per-buffer budgets are:
 
 | Bandwidth | 0.5× | 1× | 2× | 4× | 8× | 16× |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 MHz | 10,240 B | 14,199 B | 28,398 B | 56,795 B | 113,589 B | 227,177 B |
+| 10 MHz | 10,240 B | 14,201 B | 28,402 B | 56,803 B | 113,605 B | 227,210 B |
 | 20 MHz | 15,065 B | 30,129 B | 60,258 B | 120,516 B | 241,032 B | 482,063 B |
 
 At 10 MHz, the nominal 0.5× budget is clamped to 10 KiB (about 0.72× the
