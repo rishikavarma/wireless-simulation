@@ -1,0 +1,9 @@
+{
+  "rngRuns": [30001, 30002, 30003],
+  "windowMs": 50,
+  "displayBinS": 1,
+  "referenceSourceRateKbps": 32,
+  "backgroundReferenceCount": 3,
+  "backgroundReferenceRateKbps": 32,
+  "backgroundRelaySwitchEnabled": false
+}

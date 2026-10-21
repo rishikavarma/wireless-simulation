@@ -119,6 +119,106 @@ ns-3 experiments; the broader cross-factor configurations still need a pilot
 before collecting all 40,000 runs. Raw trace storage and runtime grow with traffic/load;
 sharding bounds processing memory, not total disk use.
 
+## Repeatable knob comparison experiment
+
+[`experiments/knob-sweep/`](experiments/knob-sweep/) is a separate controlled
+experiment for inspecting every full-dataset knob. It does not launch the
+40,000-run dataset. Run it from the repository root:
+
+```bash
+python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --jobs 8
+```
+
+Use a fresh directory after changing the model. The command builds the scenario
+and calibration observer, measures a fresh clear-link queue reference, runs the
+sweeps, and renders the report. If a matching accepted reference already exists,
+provide `--reference path/to/reference.json` on the initial command to reuse it.
+The versioned older reference must be recalibrated after the carrier-frequency
+change; the runner rejects stale references rather than relabeling old results.
+
+The design covers **30 sweeps**, using all candidate values from
+[`full_dataset.json`](scripts/dataset/full_dataset.json), plus separate north/east
+gateway offsets, all applications, TCP/UDP, six TCP algorithms, data direction
+and relay-switching controls. The background-rate sweep also includes the
+comparison anchors' 5/20/80 kbit/s levels. Each sweep holds its other settings
+fixed; queue and TCP-algorithm comparisons use backlogged bulk traffic, while
+shared network sweeps use native TCP CBR at 32 kbit/s. Application-specific
+sweeps use the corresponding workload. Identical configurations are shared
+between sweeps. Three matched independent RNG runs (30001–30003) are used per
+unique configuration; each simulation is 130 s with measurements over 20–119 s.
+Both service and feeder links use **2135 MHz DL / 1945 MHz UL**.
+
+The preserved [controlled run](results/knob-sweep-controls-20261020/report.md)
+contains 97 configurations × three seeds = **291 observations**. Open its
+[summary pages](results/knob-sweep-controls-20261020/figures/knob-comparisons.pdf)
+or [time/value heatmaps](results/knob-sweep-controls-20261020/figures/knob-timeseries.pdf).
+Three 1 MB file cases remain unfinished at the run cutoff; their measurements
+are included and flagged. Seven crashes from the earlier switching/background
+pilot are preserved separately in its `reused-provenance/` audit.
+
+Background sweeps hold relay switching **disabled at every level**, including
+the zero-background control, to isolate contention. An expanded pilot exposed
+an NR PHY abort when relay switching overlaps UL control/data or SRS reception;
+the separate switching sweep still compares enabled/disabled operation without
+background UEs. The combined switching/background interaction remains a model
+limitation. Failed pilot logs are preserved rather than included as completed
+measurements.
+
+Outputs remain under the chosen directory:
+
+- `report.md`: metric definitions, PHY-metric rationale, observations and plots.
+- `figures/overview.png`: largest paired effect of each knob, with physical units.
+- `figures/knob-comparisons.pdf`: eight summary panels per knob, showing medians,
+  individual seed results and their full range; the reference level is marked.
+- `figures/knob-timeseries.pdf`: time-versus-value heatmaps, with shared scales
+  within each panel and relay-switch times marked. Individual PNG/PDF pages
+  are saved alongside the combined PDFs.
+- `run-summary.csv` and `level-summary.csv`: per-run measurements, observation
+  counts, and matched-seed differences from each sweep's reference.
+- `manifest.json`, `source-snapshot/`, `calibration-reference.json`, `configs/`,
+  `logs/`, `raw/`, `series/`: provenance, exact inputs, compressed original
+  traces and selected metric curves. Raw CSV compression is lossless.
+- `analysis-provenance.json` and `analysis-code/`: the exact plotting revision
+  and its standalone `render.py --out-dir ...` entry point. Each presentation
+  revision gets its own snapshot alongside the original collection sources.
+
+Transport panels show **50 ms rolling mean SRTT**, **50 ms rolling mean RTTVAR**,
+**new TCP loss detections over the trailing 50 ms**, and cumulative detections
+since measurement start. RTTVAR is an absolute-error estimator in ms, not
+variance in ms²; loss is detected lost bytes divided by MSS, not permanent
+application packet loss. PHY panels show primary-UE UL/DL received SINR,
+scheduled MCS and observed TB decode-failure fraction in the data direction.
+MCS reveals adaptation to link quality; decode failures reveal residual radio
+errors that RLC/TCP may recover. Direction-specific measurements and PDCP rates
+are also exported. TCP fields remain unavailable for UDP, and missing PHY
+attempts are never plotted as zero errors. Heatmaps display 1 s bins; selected
+TCP curves sampled every 5 ms with 50 ms windows remain in `series/*.npz`.
+
+Resume an unchanged experiment by repeating its command **without** initial
+`--reference`, `--seeds` or `--only` options. Completed runs are reused; changed
+sources/binaries/configs are rejected. Replot without rebuilding or simulating:
+
+```bash
+python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --analyze-only
+# Also verify metric extraction against the preserved compressed raw traces:
+python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --analyze-only --reextract
+# A smaller new experiment, using a current accepted queue reference:
+python3 experiments/knob-sweep/run.py --out-dir results/knob-links-new --reference path/to/reference.json --only serviceExcessLossDb feederExcessLossDb --jobs 8
+# Reuse exact configuration/seed matches from an earlier experiment:
+python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-next --reference path/to/reference.json --reuse results/knob-sweep-previous --jobs 8
+python3 -m unittest discover -s experiments/knob-sweep -p 'test_*.py'
+```
+
+`--seeds` overrides the RNG list for a new plan; `--plan-only` saves a plan
+without running its sweeps (a current queue reference is still required or
+automatically measured). Seed ranges are descriptive, not confidence intervals.
+Complete low/zero-delivery runs stay in the plots and validation results.
+Movement changes geometry; this model does not introduce Doppler/fast fading.
+`--reuse` checks physical source/library/binary hashes, exact configuration and
+seed, measurement definitions, metric-extractor hashes, and raw/cache checksums.
+It keeps original run identities and provenance; immutable raw traces are
+hard-linked where possible. Changed physical models require fresh simulations.
+
 ## Queue calibration experiments
 
 [`experiments/queue-calibration/`](experiments/queue-calibration/) contains a
