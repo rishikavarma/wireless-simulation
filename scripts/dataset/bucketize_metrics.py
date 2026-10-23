@@ -154,10 +154,15 @@ def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg
     """Read TCP and optional PHY traces, fold the TCP rows into time windows, and return both
     original and base-RTT-enriched tokens.
     """
-    _, tcp_rows = read_csv(tcp_path)
-    if not tcp_rows:
-        return [], []
-    sage_keys = [k for k in tcp_rows[0].keys() if k != "time_s"]
+    fields, tcp_rows = read_csv(tcp_path)
+    sage_keys = [k for k in fields if k != "time_s"]
+    for row in tcp_rows:
+        # A socket without any RTT observation has no zero-millisecond RTT.
+        srtt = row.get('srtt')
+        if srtt is None or not np.isfinite(srtt) or srtt <= 0:
+            for key in sage_keys:
+                if key == 'srtt' or key.startswith('rtt'):
+                    row[key] = None
     _, dl = read_csv(sinr_dl) if sinr_dl and sinr_dl.exists() else ([], [])
     _, ul = read_csv(sinr_ul) if sinr_ul and sinr_ul.exists() else ([], [])
     tokens = fold(tcp_rows, sage_keys, dl, ul, cfg)
@@ -372,8 +377,8 @@ def main() -> int:
     bucketed = apply_boundaries(rows, feature_keys, boundaries)
 
     # Refresh full Sage RTT token CSV.
-    _, tcp_rows = read_csv(tcp_path)
-    sage_keys = [k for k in (tcp_rows[0].keys() if tcp_rows else []) if k != "time_s"]
+    fields, _ = read_csv(tcp_path)
+    sage_keys = [k for k in fields if k != "time_s"]
     tokens_path = out_dir / f"{prefix}-tokens.csv"
     write_tokens(tokens_path, tokens, sage_keys, cfg)
 

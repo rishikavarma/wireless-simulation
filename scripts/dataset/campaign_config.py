@@ -56,9 +56,10 @@ def link(observer, target):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elevation)))), distance
 
 
-def preflight(cfg):
+def preflight(cfg, require_service=True):
     """Sample the full orbit every 0.5 seconds, bound the UE movement disk, and follow relay
-    selection; reject inadequate visibility, bootstrap budget, or switch timing.
+    selection. Clear-link controls require service; datasets retain adverse
+    geometry and weak startup budgets as diagnostics, not rejection criteria.
     """
     sat, topo, ho = cfg['satellite'], cfg['topology'], cfg['handover']
     radius = EARTH_M + sat['altitudeKm']*1000
@@ -74,6 +75,7 @@ def preflight(cfg):
     events = []
     min_elevation = 90
     bootstrap_cnr = math.inf
+    low_margin_ticks = invisible_ticks = 0
     for tick in range(math.ceil(cfg['time']['simTime']*2)+1):
         t = tick/2
         elevations, paths, ranges = [], [], []
@@ -103,7 +105,10 @@ def preflight(cfg):
         min_elevation = min(min_elevation, *elevations[active])
         if (elevations[active][0] < sat['feederMinElevationDeg']+5 or
                 elevations[active][1] < sat['serviceMinElevationDeg']+5):
-            return None
+            low_margin_ticks += 1
+        if (elevations[active][0] < sat['feederMinElevationDeg'] or
+                elevations[active][1] < sat['serviceMinElevationDeg']):
+            invisible_ticks += 1
         if t <= cfg['time']['warmUp']:
             # Approximate two-RB (360 kHz at mu=0) bootstrap budget, with a
             # 2.3 dB S-band atmosphere/scintillation allowance. Not a PHY oracle.
@@ -112,16 +117,24 @@ def preflight(cfg):
             noise = -174+10*math.log10(360000)+radio['satServiceNoiseFigureDb']
             cnr = radio['ueTxPower']+radio['satServiceRxGainDb']-loss-radio['serviceExcessLossDb']-noise
             bootstrap_cnr = min(bootstrap_cnr, cnr)
+    warnings = []
+    if low_margin_ticks:
+        warnings.append('visibility_margin_below_5deg')
     if bootstrap_cnr < 2:
-        return None
+        warnings.append('weak_bootstrap_budget')
     if ho['enabled']:
         record_start = cfg['time']['warmUp']+cfg['time']['measureStart']
         record_end = cfg['time']['simTime']-cfg['time']['appDrain']-cfg['time']['measureEnd']
         if len(events)!=1 or not record_start+10 <= events[0] <= record_end-20:
-            return None
+            warnings.append('switch_count_or_timing_outside_control')
+    if require_service and warnings:
+        return None
     return {'minElevationBoundDeg': round(min_elevation,3),
             'bootstrapCnrEstimateDb': round(bootstrap_cnr,3),
-            'predictedHandoverTimesS': events, 'geometryStepS': 0.5}
+            'predictedHandoverTimesS': events, 'geometryStepS': 0.5,
+            'predictedInvisibleFraction': invisible_ticks/(tick+1),
+            'serviceWarnings': warnings,
+            'admissionPolicy': 'clear-link-control' if require_service else 'retain-network-failures'}
 
 
 def draw(base, rng, workload, handover, mobile, condition, service_loss=None):

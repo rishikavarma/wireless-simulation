@@ -16,7 +16,9 @@ RADIO_FEATURES=['pdcp_volume_dl_kB','pdcp_volume_ul_kB','rlc_sdu_delay_dl_us','p
                 'mcs_dl','mcs_ul','tb_decode_fail_dl_fraction','tb_decode_fail_ul_fraction',
                 'harq_nack_dl_count','harq_nack_ul_count','bsr_max_reported_level',
                 'propagation_delay_s','timing_advance_s','ul_slot_phase_error_ns',
-                'ue_speed_mps','relay_index','ues_sharing_feeder','ues_sharing_scheduler']
+                'ue_speed_mps','relay_index','ues_sharing_feeder','ues_sharing_scheduler',
+                'rlc_tx_drop_dl_pdus','rlc_tx_drop_ul_pdus','rlc_tx_drop_dl_bytes','rlc_tx_drop_ul_bytes',
+                'path_visible']
 
 def records(path):
  with path.open() as f:return list(csv.DictReader(line for line in f if line.strip() and not line.startswith('#')))
@@ -34,12 +36,24 @@ def slot_phase_error(value):
  """Resolve the SFN/start-time transition ambiguity modulo the 1 ms mu=0 slot."""
  return (float(value)+500000)%1000000-500000
 
+def rnti_ids(rows):
+ """Resolve stable UE identity across RRC reconnects; support historical logs."""
+ return {identity for r in rows for identity in r.get('rnti_history',r['rnti']).split('|') if identity and int(identity)>0}
+
 def application_summary(directory):
  """Measure native source/sink payload bytes, independently of PDCP overhead."""
  result={key:math.nan for key in ('application_goodput_kbps','application_source_kbps',
          'application_delivery_shortfall_pct','application_tx_bytes','application_rx_bytes')}
  path=directory/'primary-application.csv'
- if not path.is_file():return result
+ if not path.is_file():
+  reports=list(directory.glob('*-app.txt'))
+  if len(reports)!=1:raise ValueError(f'{directory}: missing application outcome report')
+  counts=re.search(r'bytesTx=(\d+) bytesRx=(\d+)',reports[0].read_text())
+  if not counts:raise ValueError(f'{directory}: missing application byte counters')
+  tx,rx=map(int,counts.groups())
+  result.update(application_tx_bytes=tx,application_rx_bytes=rx,
+                application_delivery_shortfall_pct=100*(tx-rx)/tx if tx else math.nan)
+  return result
  samples=records(path)
  # Cumulative counters at the two exact boundaries avoid counting warm-up traffic.
  boundaries={float(r['time_s']):r for r in samples}
@@ -64,21 +78,35 @@ def summarize(rec):
  p=rec['prefix'];d=ROOT/'results'/p;cfg=json.loads(Path(rec['config']).read_text())
  k=records(d/(p+'-kpis.csv'));primary=[r for r in k if r['ue_index']=='0' and 20<float(r['time_s'])<=119]
  assert len(primary)==99,(p,'incomplete KPI interval coverage',len(primary))
- rnti=primary[0]['rnti'];tb=records(d/(p+'-transport-blocks.csv'));ev=records(d/(p+'-radio-events.csv'))
+ primary_ids=rnti_ids(primary)
+ tb=records(d/(p+'-transport-blocks.csv'));ev=records(d/(p+'-radio-events.csv'))
  paths=records(d/'ue-paths.csv');assert len(paths)>=130*(1+cfg.get('background',{}).get('count',0)),p
- assert all(r['visible']=='1' for r in paths),(p,'unexpected outage')
  # Reconcile cumulative SDU bytes and actual scheduled PRB counts for every UE.
- for identity in {r['rnti'] for r in k if int(r['rnti'])>0}:
+ for ue in {r['ue_index'] for r in k}:
+  ue_rows=[r for r in k if r['ue_index']==ue]
+  identities=rnti_ids(ue_rows)
   for direction,suffix in [('DL','Dl'),('UL','Ul')]:
-   measured=sum(float(r['RRU.PrbTot'+suffix]) for r in k if r['rnti']==identity)
-   expected=sum(float(r['prbs']) for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti']==identity)
-   assert math.isclose(measured,expected),(p,'PRB accounting',identity,direction)
-   measured=sum(float(r['DRB.PdcpSduVolume'+direction+'_kB'])*1000 for r in k if r['rnti']==identity)
-   expected=sum(int(r['size_bytes'])-2 for r in ev if r['event']=='PDCP_TX' and r['rnti']==identity and r['direction']==direction and int(r['lcid'])>2)
-   assert math.isclose(measured,expected,abs_tol=1e-5),(p,'SDU accounting',identity,direction)
+   measured=sum(float(r['RRU.PrbTot'+suffix]) for r in ue_rows)
+   expected=sum(float(r['prbs']) for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti'] in identities)
+   assert math.isclose(measured,expected),(p,'PRB accounting',ue,direction)
+   measured=sum(float(r['DRB.PdcpSduVolume'+direction+'_kB'])*1000 for r in ue_rows)
+   expected=sum(int(r['size_bytes'])-2 for r in ev if r['event']=='PDCP_TX' and r['rnti'] in identities and r['direction']==direction and int(r['lcid'])>2)
+   assert math.isclose(measured,expected,abs_tol=1e-5),(p,'SDU accounting',ue,direction)
+   for unit in ('pdus','bytes'):
+    column=f'rlc_tx_drop_{direction.lower()}_{unit}'
+    if column not in k[0]:continue  # Historical traces did not measure drops.
+    measured=sum(int(r[column]) for r in ue_rows)
+    drops=[r for r in ev if r['event']=='RLC_TX_DROP' and r['rnti'] in identities and r['direction']==direction]
+    expected=len(drops) if unit=='pdus' else sum(int(r['size_bytes']) for r in drops)
+    assert measured==expected,(p,'RLC drop accounting',ue,direction,unit)
  result={key:rec[key] for key in ('prefix','case','group','replicate','rngRun')}
  result['exit']=rec['exit'];result.update(workload=cfg['application']['workload'],transport=cfg['application'].get('transport','tcp'),tcp=cfg['application']['tcpVariant'],direction=cfg['application'].get('direction','ul'))
+ result['socket-enlargement']=cfg['application'].get('socket-enlargement','default')
+ result['tcpSocketBufferBytes']=cfg['application'].get('tcpSocketBufferBytes')
  result.update(application_summary(d))
+ result['application_zero_delivery']=result['application_rx_bytes']==0
+ result['application_no_source_bytes']=result['application_tx_bytes']==0
+ result['radio_link_failure_events']=sum(r['event']=='RadioLinkFailure' for r in ev)
  result.update(speed_mps=cfg['topology']['ueSpeedMps'] if cfg['topology']['receiverMobility'] else 0,radius_m=cfg['topology']['ueDistanceM'],background_count=cfg.get('background',{}).get('count',0),background_relay=cfg.get('background',{}).get('relay',0),background_distance_m=cfg.get('background',{}).get('distanceM',0))
  result['background_offered_kbps']=float(cfg.get('background',{}).get('dataRate','0kbps').removesuffix('kbps'))*result['background_count']
  for direction in ('Dl','Ul'):
@@ -87,8 +115,8 @@ def summarize(rec):
  result['dl_sdu_delay_ms']=sum(float(r['DRB.RlcSduDelayDl_us'])*int(r['dl_delay_samples']) for r in primary if int(r['dl_delay_samples']))/delay_n/1000 if delay_n else math.nan
  result['background_pdcp_throughput_kbps']=sum(float(r['DRB.UEThpUl_Mbps'])*1000 for r in k if r['ue_index']!='0' and 20<float(r['time_s'])<=119)/99
  for direction in ('DL','UL'):
-  received=[r for r in tb if r['event']=='RX' and r['direction']==direction and r['rnti']==rnti and 20<=float(r['time_s'])<119]
-  sent=[r for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti']==rnti and 20<=float(r['time_s'])<119]
+  received=[r for r in tb if r['event']=='RX' and r['direction']==direction and r['rnti'] in primary_ids and 20<=float(r['time_s'])<119]
+  sent=[r for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti'] in primary_ids and 20<=float(r['time_s'])<119]
   result[direction.lower()+'_sinr_db']=finite_mean([float(r['sinr_db']) for r in received])
   result[direction.lower()+'_tb_fail_pct']=finite_mean([100*(1-float(r['crc_pass_model'])) for r in received])
   result[direction.lower()+'_mcs']=finite_mean([float(r['mcs']) for r in sent])
@@ -101,6 +129,11 @@ def summarize(rec):
  srtt=np.array([float(r['srtt'])*100 for r in rows]);times=np.array([float(r['time_s']) for r in rows]);srtt[srtt<=0]=np.nan
  result['srtt_ms']=finite_mean(srtt);result['srtt_p90_ms']=percentile(srtt,90)
  primary_paths=[r for r in paths if r['ue_index']=='0' and 20<=float(r['time_s'])<=119]
+ result['path_visible_fraction']=finite_mean([float(r['visible']) for r in primary_paths])
+ for direction in ('dl','ul'):
+  for unit in ('pdus','bytes'):
+   column=f'rlc_tx_drop_{direction}_{unit}'
+   result[column]=sum(int(r[column]) for r in primary) if column in primary[0] else math.nan
  result['propagation_rtt_ms']=finite_mean([2000*float(r['propagation_delay_s']) for r in primary_paths])
  result['primary_movement_m']=float(np.linalg.norm(np.array([float(primary_paths[-1][x]) for x in ('x_m','y_m','z_m')])-np.array([float(primary_paths[0][x]) for x in ('x_m','y_m','z_m')])))
  result['max_ul_slot_arrival_error_ns']=max(abs(slot_phase_error(r['ul_slot_arrival_error_ns'])) for r in paths if float(r['time_s'])>1)
@@ -109,7 +142,6 @@ def summarize(rec):
  bg_delivered=[]
  for i in range(result['background_count']):
   a=records(d/f'background-{i}-application.csv');bg_delivered.append(int(a[-1]['rx_bytes']))
- if rec['group']!='interaction':assert all(n>0 for n in bg_delivered),(p,'background UE delivered nothing')
  result['background_zero_delivery_ues']=sum(n==0 for n in bg_delivered)
  result['background_bytes_delivered']=sum(bg_delivered)
  # An independent 1 s tensor exposes new numeric radio/KPI data without changing legacy heads.
@@ -120,33 +152,35 @@ def summarize(rec):
  tb_bins=[[] for _ in range(99)];event_bins=[[] for _ in range(99)]
  for r in tb:
   b=int(float(r['time_s']))-20
-  if r['rnti']==rnti and 0<=b<99:tb_bins[b].append(r)
+  if r['rnti'] in primary_ids and 0<=b<99:tb_bins[b].append(r)
  for r in ev:
   b=int(float(r['time_s']))-20
-  if r['rnti']==rnti and 0<=b<99:event_bins[b].append(r)
+  if r['rnti'] in primary_ids and 0<=b<99:event_bins[b].append(r)
  for b in range(99):
   start=20+b
   for j,direction in enumerate(('DL','UL')):
-   rx=[r for r in tb_bins[b] if r['event']=='RX' and r['direction']==direction and r['rnti']==rnti and start<=float(r['time_s'])<start+1]
-   tx=[r for r in tb_bins[b] if r['event']=='TX' and r['direction']==direction and r['rnti']==rnti and start<=float(r['time_s'])<start+1]
+   rx=[r for r in tb_bins[b] if r['event']=='RX' and r['direction']==direction and start<=float(r['time_s'])<start+1]
+   tx=[r for r in tb_bins[b] if r['event']=='TX' and r['direction']==direction and start<=float(r['time_s'])<start+1]
    radio[b,7+j]=finite_mean([float(r['sinr_db']) for r in rx])
    radio[b,9+j]=finite_mean([float(r['mcs']) for r in tx])
    radio[b,11+j]=finite_mean([1-float(r['crc_pass_model']) for r in rx])
-   radio[b,13+j]=sum(r['event']=='HARQ_GENERATED' and r['direction']==direction and r['rnti']==rnti and r['value']=='0' and start<=float(r['time_s'])<start+1 for r in event_bins[b])
+   radio[b,13+j]=sum(r['event']=='HARQ_GENERATED' and r['direction']==direction and r['value']=='0' and start<=float(r['time_s'])<start+1 for r in event_bins[b])
   levels=[]
   for r in event_bins[b]:
-   if r['rnti']==rnti and 'bsr_levels=' in r['details'] and start<=float(r['time_s'])<start+1:
+   if 'bsr_levels=' in r['details'] and start<=float(r['time_s'])<start+1:
     levels.extend(int(x) for x in r['details'].split('bsr_levels=')[-1].split(':') if x)
   if levels:radio[b,15]=max(levels)
   path=next(r for r in primary_paths if float(r['time_s'])==start)
-  radio[b,16:]=[slot_phase_error(path[x]) if x=='ul_slot_arrival_error_ns' else float(path[x]) for x in ('propagation_delay_s','timing_advance_s','ul_slot_arrival_error_ns',
+  radio[b,16:23]=[slot_phase_error(path[x]) if x=='ul_slot_arrival_error_ns' else float(path[x]) for x in ('propagation_delay_s','timing_advance_s','ul_slot_arrival_error_ns',
                'speed_mps','relay_index','ues_sharing_feeder','ues_sharing_scheduler')]
+  radio[b,23:27]=[float(primary[b].get(x,math.nan)) for x in RADIO_FEATURES[23:27]]
+  radio[b,27]=float(path['visible'])
  with (d/'radio-kpi-features.csv').open('w') as f:
   w=csv.writer(f);w.writerow(['start_s','end_s']+RADIO_FEATURES)
   for i,values_ in enumerate(radio):w.writerow([20+i,21+i]+list(values_))
  log=(Path(rec['config']).parent.parent/'logs'/(p+'.log')).read_text()
  switches=re.findall(r'handover complete timeS=([0-9.]+)',log);result['switches']=len(switches)
- assert len(switches)==int(cfg['handover']['enabled']),(p,'switch count')
+ result['switch_count_matches_control']=len(switches)==int(cfg['handover']['enabled'])
  event=float(switches[0]) if switches else math.nan
  for label,start,end in [('pre',-10,-2),('post',2,10)]:
   result['propagation_rtt_'+label+'_switch_ms']=finite_mean([2000*float(r['propagation_delay_s']) for r in primary_paths if event+start<=float(r['time_s'])<event+end])
@@ -296,6 +330,9 @@ def main():
   'kpiAccounting':'all UE volume and PRB totals reconciled','udpTcpFields':'all NaN','trainRuns':len(train_ids),'testRuns':len(test_ids),
   'trainWindows':splits['train']['windows'],'testWindows':splits['test']['windows'],'features':splits['train']['features'],'radioFeatures':len(RADIO_FEATURES),'auditedMetricRunPairs':audit_count,
   'preset':manifest.get('preset','comparison'),'figurePages':page_count,'testReplicates':sorted(test_replicates(manifest)),
+  'zeroDeliveryRuns':sum(r['application_zero_delivery'] for r in rows),
+  'outageRuns':sum(r['path_visible_fraction']<1 for r in rows),
+  'rlcOverflowRuns':sum(r['rlc_tx_drop_dl_pdus']>0 or r['rlc_tx_drop_ul_pdus']>0 for r in rows),
   'maxUlSlotPhaseErrorNs':max(r['max_ul_slot_arrival_error_ns'] for r in rows),'maxBoundaryOverlapNs':max(r['max_boundary_overlap_ns'] for r in rows),'minElevationDeg':min(r['min_elevation_deg'] for r in rows)}
  (campaign/'validation.json').write_text(json.dumps(audit_summary,indent=2)+'\n')
  result={'validation':audit_summary,'caseMedians':{name:{key:med(name,key) for key in ('ul_pdcp_throughput_kbps','dl_pdcp_throughput_kbps','srtt_ms','srtt_p90_ms','ul_sinr_db','ul_tb_fail_pct','dl_sdu_delay_ms','propagation_rtt_ms','primary_movement_m','background_pdcp_throughput_kbps','ul_mcs','application_goodput_kbps','application_source_kbps','application_delivery_shortfall_pct')} for name in cases}}

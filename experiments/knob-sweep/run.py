@@ -17,6 +17,8 @@ import time
 
 from design import HERE, ROOT, sweeps
 from metrics import summarize
+import dataset_presets
+from experiment_cleanup import clean_experiment, mark_experiment
 
 BIN = ROOT / 'ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized'
 
@@ -49,7 +51,7 @@ def sources():
     paths += list((ROOT/'patches').glob('*.patch'))
     paths += list(HERE.glob('*.py')) + list(HERE.glob('*.json'))
     paths += [ROOT/'scripts/dataset'/name for name in
-              ('full_dataset.json', 'campaign_config.py', 'dataset_presets.py', 'run_dataset.py')]
+              ('full_dataset.json', 'campaign_config.py', 'dataset_presets.py', 'run_dataset.py', 'experiment_cleanup.py')]
     paths += list((ROOT/'experiments/queue-calibration').glob('*.py'))
     paths += [BIN]
     paths += list((ROOT/'ns-3-dev/build/lib').glob('libns3*.so'))
@@ -58,7 +60,7 @@ def sources():
 
 def verify(out, manifest):
     if sources() != manifest['sourceHashes']:
-        raise RuntimeError('Sources/binary changed. Use a fresh --out-dir for a new experiment; '
+        raise RuntimeError('Sources/binary changed. Use --clean to restart in this directory or choose a fresh --out-dir; '
                            '--analyze-only can still render the preserved run.')
     for rec in manifest['runs']:
         if digest(out/rec['config']) != rec['configSha256']:
@@ -96,6 +98,14 @@ def plan(out, settings, reference_path, calibration, only=None):
         if unknown:
             raise ValueError('Unknown groups: '+', '.join(sorted(unknown)))
         groups = [g for g in groups if g['key'] in only]
+    mark_experiment(out, 'knob-sweep')
+    settings = dict(settings)
+    policy = settings.get('tcpBufferPolicy', 'default')
+    settings['tcpBufferPolicy'] = policy
+    settings['tcpSocketBufferBytes'] = tcp_socket_buffer_bytes(groups, calibration) if policy == 'socket-enlargement' else None
+    settings['tcpSocketBufferPolicy'] = (
+        'common power-of-two buffer >= 2*(largest planned/calibrated queue + path BDP)'
+        if policy == 'socket-enlargement' else 'configured defaults except explicit socket-enlargement levels')
     configs = {}
     run_rows = []
     for group in groups:
@@ -139,6 +149,19 @@ def plan(out, settings, reference_path, calibration, only=None):
     return manifest
 
 
+def tcp_socket_buffer_bytes(groups, calibration):
+    """Cover planned queues and the largest calibrated multiplier at every bandwidth."""
+    largest_queue = max(level['config']['application']['queueSizeBytes']
+                        for group in groups for level in group['levels'])
+    return dataset_presets.enlarged_socket_bytes(calibration, largest_queue)
+
+
+def simulation_command(out, rec, config, settings):
+    command = [str(BIN), '--config='+str(out/rec['config']), '--RngRun='+str(rec['rngRun'])]
+    command += dataset_presets.socket_buffer_arguments(config, settings.get('tcpSocketBufferBytes'))
+    return command
+
+
 def compress_raw(directory):
     for path in sorted(directory.glob('*.csv')):
         target = path.with_suffix('.csv.gz')
@@ -156,6 +179,10 @@ def reuse_completed(out, manifest, previous):
         raise ValueError('--reuse must name a different experiment')
     old_path = previous/'manifest.json'
     old = json.loads(old_path.read_text())
+    old_buffers = old.get('settings', {}).get('tcpSocketBufferBytes') or 131072
+    new_buffers = manifest.get('settings', {}).get('tcpSocketBufferBytes') or 131072
+    if old_buffers != new_buffers:
+        raise ValueError('Cannot reuse runs: TCP endpoint buffer policies differ')
     def physical(hashes):
         return {name: value for name, value in hashes.items()
                 if name.startswith(('ns-3-dev/', 'patches/')) or
@@ -258,10 +285,11 @@ def run(out, manifest, jobs):
                 raise RuntimeError(prefix+': incomplete simulation output exists; preserve it and use a fresh experiment directory')
             out.joinpath('logs').mkdir(exist_ok=True)
             before = time.monotonic()
+            command = simulation_command(out, rec, config, settings)
             with (out/'logs'/(prefix+'.log')).open('w') as log:
-                result = subprocess.run([str(BIN), '--config='+str(out/rec['config']),
-                    '--RngRun='+str(rec['rngRun'])], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-            write_json(exit_path, dict(exit=result.returncode, wallS=time.monotonic()-before))
+                result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+            write_json(exit_path, dict(exit=result.returncode, wallS=time.monotonic()-before,
+                                      command=command))
         exit_info = json.loads(exit_path.read_text())
         if exit_info['exit'] not in (0, 1):
             raise RuntimeError(prefix+': simulation crashed; inspect log')
@@ -299,13 +327,17 @@ def run(out, manifest, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--out-dir', type=Path, default=ROOT/'results'/datetime.now(timezone.utc).strftime('knob-sweep-%Y%m%d-%H%M%S'))
+    parser.add_argument('--out-dir', type=Path, default=ROOT/'results/knob-sweep',
+                        help='fixed experiment directory (default: results/knob-sweep); existing plans resume')
+    parser.add_argument('--clean', action='store_true', help='delete this experiment and its recorded raw outputs before planning again; omit to resume')
     parser.add_argument('--reference', type=Path, help='accepted queue reference for the current model; otherwise calibrate automatically')
     parser.add_argument('--reuse', type=Path, nargs='+', help='reuse completed exact config/seed matches with an identical physical model and metric extractor')
     parser.add_argument('--jobs', type=int, default=8)
     parser.add_argument('--seeds', type=int, nargs='+', help='override independent RNG runs for a new plan')
-    parser.add_argument('--only', nargs='+', help='new plan: select sweep keys (default: all 30)')
+    parser.add_argument('--only', nargs='+', help='new plan: select sweep keys (default: all configured sweeps)')
     parser.add_argument('--plan-only', action='store_true')
+    parser.add_argument('--tcp-buffer-policy', choices=['default', 'socket-enlargement'],
+                        help='new plan: configured TCP limits except the socket knob (default), or enlarge sockets across other sweeps')
     parser.add_argument('--analyze-only', action='store_true')
     parser.add_argument('--reextract', action='store_true', help='analysis: recompute metrics from preserved compressed raw traces')
     args = parser.parse_args()
@@ -314,6 +346,16 @@ def main():
     out = args.out_dir.resolve()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', out.name):
         parser.error('output directory name must contain only letters, digits, dots, underscores or hyphens')
+    if args.clean:
+        if args.analyze_only or args.reextract:
+            parser.error('--clean cannot be combined with analysis-only options')
+        for protected in ([args.reference] if args.reference else []) + (args.reuse or []):
+            if protected.resolve().is_relative_to(out):
+                parser.error('--reference/--reuse must be outside the directory being cleaned')
+        try:
+            clean_experiment(out, ROOT/'results', 'knob-sweep')
+        except ValueError as error:
+            parser.error(str(error))
     if args.analyze_only:
         from plot import analyze
         analyze(out, reextract=args.reextract)
@@ -321,13 +363,14 @@ def main():
     subprocess.run(['./ns3', 'build', 'sat-bs-handset', 'queue-calibration', '-j', str(min(args.jobs, 4))], cwd=ROOT/'ns-3-dev', check=True)
     manifest_path = out/'manifest.json'
     if manifest_path.exists():
-        if args.seeds or args.only or args.reference:
-            parser.error('existing plan: omit --seeds/--only/--reference; use a fresh --out-dir to change the design')
+        if args.seeds or args.only or args.reference or args.tcp_buffer_policy:
+            parser.error('existing plan: omit --seeds/--only/--reference/--tcp-buffer-policy to resume; add --clean to restart')
         manifest = json.loads(manifest_path.read_text())
         verify(out, manifest)
     else:
         out.mkdir(parents=True, exist_ok=True)
         settings = json.loads((HERE/'settings.json').read_text())
+        settings['tcpBufferPolicy'] = args.tcp_buffer_policy or 'default'
         if args.seeds:
             if len(set(args.seeds)) != len(args.seeds) or min(args.seeds) < 1:
                 parser.error('--seeds must be unique positive integers')

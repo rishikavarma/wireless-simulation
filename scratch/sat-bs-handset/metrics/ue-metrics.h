@@ -87,6 +87,8 @@ struct SageFeatures
 
 struct UeAppMetrics
 {
+    std::string workloadLabel; ///< Native workload label when enum describes only synthetic apps.
+    std::string criterion; ///< Explicit native byte-progress criterion; empty uses workload policy.
     AppWorkload workload{AppWorkload::Probe};
     uint64_t sent{0};
     uint64_t received{0};
@@ -159,6 +161,11 @@ class UeMetrics
     uint32_t m_mss{1};
     Time m_srtt;
     Time m_lastRecord;
+    Time m_lastAckProgress, m_progressOrigin; ///< Last forward ACK and current backlogged interval.
+    Time m_lastRttUpdate; ///< Last changed positive LastRTT trace value.
+    bool m_haveRttUpdate{false}; ///< Whether an RTT trace update was observed.
+    bool m_haveAckProgress{false}, m_progressPending{false}; ///< Per-socket progress availability.
+    uint32_t m_pendingBytes{0}; ///< Accepted TCP bytes still queued or awaiting ACK.
     double m_rttvarUs{0.0};
     double m_minRttUs{0.0};
     bool m_haveVar{false};

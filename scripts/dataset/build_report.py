@@ -33,7 +33,7 @@ def main():
  coverage_note=''
  if v.get('preset')=='full':
   interactions=sum(r['group']=='interaction' for r in runs)
-  anchor_count=sum(records[0]['group']!='interaction' for records in cases.values())
+  anchor_count=sum(records[0]['group'] not in ('interaction','stress') for records in cases.values())
   switching_note=' Automatic relay switching is enabled in every configuration; the switching plot shows observed before/after behavior without a switch-disabled control.' if all(r['switches']>0 for r in runs) else ''
   coverage_note=f'\nThe full preset includes **{interactions:,} interaction runs**. The controlled comparisons below use the {anchor_count} anchor profiles; [full-dataset distributions](figures/full-coverage.png) also show the broader mixed conditions. These distributions do not isolate causal effects of a single knob.{switching_note}\n'
  report=f'''# Dataset: results so far
@@ -51,11 +51,11 @@ Completed **{total:,} simulations** ({v['profiles']:,} profiles × {n_replicates
 
 5. **Applications and rates.** Probe/file profiles use 10 kbit/s pacing while active. Stream averages about **7.89 kbit/s body / 8.21 kbit/s framed**, IoT **0.512 / 0.533 kbit/s**, and RPC is completion/think-time limited. Native profiles include **NGMN VoIP** (12.2 kbit/s speech, 0.75 kbit/s silence), **CBR**, **OnOff** (configured rate during ON; 50% duty here), and **iperf-style BulkSend/PacketSink** (unpaced TCP; paced UDP). Native CBR also runs downlink. [All application rate details]({rates_link}), [application comparison](figures/applications.png).
 
-PDCP volumes and PRB totals reconcile for every UE in every audited run. Maximum accommodated RX overlap is **{v['maxBoundaryOverlapNs']:g} ns**, within the retained 100 ns bound. All recorded paths remain visible (minimum elevation **{v['minElevationDeg']:.2f}°**).
+PDCP volumes and PRB totals reconcile for every UE in every audited run. Maximum accommodated RX overlap is **{v['maxBoundaryOverlapNs']:g} ns**, within the retained 100 ns bound. Minimum elevation is **{v['minElevationDeg']:.2f}°**. Retained outcomes include **{v.get('zeroDeliveryRuns',0)} zero-delivery runs**, **{v.get('outageRuns',0)} runs with visibility gaps**, and **{v.get('rlcOverflowRuns',0)} runs with observed RLC overflow**. Missing RTT stays missing and does not remove a run from the dataset.
 
 A link-condition result worth highlighting: at +24 dB feeder attenuation, median UL SINR is **{m['feeder-loss-24']['ul_sinr_db']:.2f} dB** and SRTT **{m['feeder-loss-24']['srtt_ms']:.2f} ms**, versus **{m['baseline']['ul_sinr_db']:.2f} dB / {m['baseline']['srtt_ms']:.2f} ms** in clear conditions. The simulator switches to MCS 0 and reports fewer TB failures; SRTT is therefore not a monotonic RF-quality indicator.
 
-The dataset keeps **73 transport features** and adds a separate **23-feature radio/KPI tensor**; all **{v['auditedMetricRunPairs']:,} metric/run pairs** are audited. Splits hold out complete RNG replicates: **{v['trainRuns']:,} training / {v['testRuns']:,} test runs**, {v['trainWindows']:,}/{v['testWindows']:,} transport windows. Original logs and hashes are retained. This is a selected-profile experiment, not an exhaustive factorial sweep or a live FlexRIC/E2 connection.
+The dataset keeps **{v['features']} transport features** and adds a separate **{v['radioFeatures']}-feature radio/KPI tensor**; all **{v['auditedMetricRunPairs']:,} metric/run pairs** are audited. Splits hold out complete RNG replicates: **{v['trainRuns']:,} training / {v['testRuns']:,} test runs**, {v['trainWindows']:,}/{v['testWindows']:,} transport windows. Original logs and hashes are retained. This is a selected-profile experiment, not an exhaustive factorial sweep or a live FlexRIC/E2 connection.
 
 [All {v.get('figurePages',7)} comparison pages](figures/important-comparisons.pdf), including [switching](figures/switching.png) and [link conditions](figures/link-conditions.png). [Machine-readable validation]({validation_link}), [run summaries]({summaries_link}).
 '''

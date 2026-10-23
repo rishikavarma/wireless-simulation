@@ -36,6 +36,31 @@ def apply_queue_budget(cfg, config):
         math.ceil(cfg['application']['queueSizeBdp'] * bdp))
 
 
+def enlarged_socket_bytes(calibration, largest_queue=0):
+    """Use one finite buffer covering the calibrated queues and path pipeline."""
+    budgets = calibration['bandwidthBudgets'].values()
+    largest_bdp = max(b['referenceBdpBytes'] for b in budgets)
+    largest_queue = max(largest_queue, max((q for b in budgets
+        for q in b.get('bytesByMultiplier', {}).values()), default=0))
+    required = max(131072, math.ceil(2*(largest_queue+largest_bdp)))
+    size = 1 << (required-1).bit_length()
+    if size >= 2**32:
+        raise ValueError('planned queue budget exceeds supported TCP endpoint buffer range')
+    return size
+
+
+def socket_buffer_arguments(cfg, fallback=None):
+    """Apply saved per-run socket limits in both experiment runners."""
+    app = cfg['application']
+    if app.get('transport', 'tcp') != 'tcp':
+        return []
+    size = app.get('tcpSocketBufferBytes', fallback)
+    if not size:
+        return []
+    return ['--ns3::TcpSocket::SndBufSize='+str(size),
+            '--ns3::TcpSocket::RcvBufSize='+str(size)]
+
+
 def settings(preset='comparison', profile_count=None, replicates=None, design_seed=None, target_windows=None):
     if preset == 'full':
         result = json.loads(FULL_SETTINGS.read_text())
@@ -52,8 +77,9 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
             result[key] = value
     # Enabling selection in every full profile merges baseline/relay-switch.
     result['anchorProfileCount'] = 49 if preset == 'full' else 50
-    if result['profileCount'] < result['anchorProfileCount'] or (preset == 'comparison' and result['profileCount'] != 50):
-        raise ValueError('comparison has 50 profiles; full requires at least 49 anchor profiles')
+    result['stressProfileCount'] = 14 if preset == 'full' and result.get('includeStressProfiles', False) else 0
+    if result['profileCount'] < result['anchorProfileCount'] + result['stressProfileCount'] or (preset == 'comparison' and result['profileCount'] != 50):
+        raise ValueError('comparison has 50 profiles; full requires 49 anchors plus any enabled stress profiles')
     if preset == 'full' and result.get('relaySwitchEnabled') is not True:
         raise ValueError('the full preset requires relaySwitchEnabled: true')
     if preset == 'full' and result.get('satelliteAltitudeKm') != 800:
@@ -85,12 +111,52 @@ def test_replicates(manifest):
     return set(manifest.get('settings', {}).get('testReplicates', [3]))
 
 
-def preflight(cfg):
+def preflight(cfg, require_service=False):
     """Check the primary disk and the conservative envelope of stationary background UEs."""
+    # Match LoadScenarioConfig's hard input bounds, independently of whether
+    # weak service is retained as a valid network outcome.
+    for field in ('serviceExcessLossDb', 'feederExcessLossDb'):
+        loss = cfg['radio'].get(field, 0)
+        if not math.isfinite(loss) or not 0 <= loss <= 30:
+            raise ValueError(f'radio.{field} must be finite and in [0,30] dB')
     envelope = copy.deepcopy(cfg)
     if cfg.get('background', {}).get('count', 0):
         envelope['topology']['ueDistanceM'] += cfg['background']['distanceM']
-    return campaign_config.preflight(envelope)
+    return campaign_config.preflight(envelope, require_service=require_service)
+
+
+def stress_profiles(base, config):
+    """Deliberately cover overload, endpoint limits, severe attenuation and outages.
+
+    These are experiment strata, not estimates of their population frequency.
+    Finite calibrated queues and configured TCP defaults remain in force.
+    """
+    result = []
+    for bandwidth in (10, 20):
+        for direction in ('ul', 'dl'):
+            for regime in ('udp-overload', 'tcp-small-queue', 'tcp-endpoint-limit'):
+                cfg = copy.deepcopy(base)
+                cfg['handover']['enabled'] = True
+                hz = bandwidth * 1e6
+                cfg['radio'].update(bandwidthHz=hz, dlBandwidthHz=hz, ulBandwidthHz=hz)
+                cfg['application'].update(workload='cbr' if regime == 'udp-overload' else 'iperf',
+                    transport='udp' if regime == 'udp-overload' else 'tcp', direction=direction,
+                    tcpVariant='TcpNewReno', packetSize=512,
+                    dataRate='2048kbps' if direction == 'ul' else '32768kbps',
+                    queueSizeBdp=16 if regime == 'tcp-endpoint-limit' else 0.125)
+                apply_queue_budget(cfg, config)
+                result.append((f'stress-{regime}-{bandwidth}-{direction}', 'stress', cfg))
+    for regime in ('connection-failure', 'visibility-gap'):
+        cfg = copy.deepcopy(base)
+        cfg['handover']['enabled'] = True
+        if regime == 'connection-failure':
+            # Constant obstruction/fade proxy. This is not a time-varying fade model.
+            cfg['radio']['serviceExcessLossDb'] = 20
+        else:
+            cfg['satellite'].update(feederMinElevationDeg=70, serviceMinElevationDeg=70)
+        apply_queue_budget(cfg, config)
+        result.append(('stress-'+regime, 'stress', cfg))
+    return result
 
 
 def expand_profiles(anchors, config):
@@ -124,20 +190,31 @@ def expand_profiles(anchors, config):
             raise ValueError(f'unsupported application: {app}')
         for transport, variant in [('tcp', x) for x in config['tcpVariants']] + [('udp', 'TcpNewReno')]:
             for direction in (('ul', 'dl') if app in ('voip', 'iperf', 'cbr', 'onoff') else ('ul',)):
-                strata.append((app, transport, variant, direction))
+                for sockets in (config['ranges']['socket-enlargement'] if transport == 'tcp' else ['default']):
+                    strata.append((app, transport, variant, direction, sockets))
     rng = random.Random(config['designSeed'])
     rng.shuffle(strata)
     ranges = config['ranges']
     choose = lambda key: rng.choice(ranges[key])
-    result = list(anchors)
+    stress = stress_profiles(templates['probe'], config) if config.get('includeStressProfiles', False) else []
+    if len(anchors) + len(stress) > config['profileCount']:
+        raise ValueError('full preset needs room for controlled and stress profiles')
+    result = list(anchors) + stress
+    config['stressProfileCount'] = len(stress)
+    config['networkFailurePolicy'] = 'retain completed runs, zero delivery, outages and missing observations; reject simulator crashes'
+    config['tcpBufferPolicy'] = 'socket-enlargement sampled for TCP; anchors retain configured defaults'
+    config['enlargedSocketBufferBytes'] = enlarged_socket_bytes(config['queueCalibration'])
     signatures = {json.dumps(cfg, sort_keys=True) for _, _, cfg in result}
     rejected = 0
     while len(result) < config['profileCount']:
-        app, transport, variant, direction = strata[(len(result) - len(anchors)) % len(strata)]
+        app, transport, variant, direction, sockets = strata[(len(result) - len(anchors) - len(stress)) % len(strata)]
         cfg = copy.deepcopy(templates[app])
         application = cfg['application']
         application.update(transport=transport, tcpVariant=variant, direction=direction,
                            queueSizeBdp=choose('queueSizeBdp'))
+        application['socket-enlargement'] = sockets
+        # The scenario's minimal JSON parser supports numbers, but not null.
+        application['tcpSocketBufferBytes'] = config['enlargedSocketBufferBytes'] if sockets == 'socket-enlargement' else 0
         if app in ('probe', 'file', 'iperf', 'cbr', 'onoff'):
             application['packetSize'] = choose('packetBytes')
         if app in ('probe', 'file', 'cbr', 'onoff') or (app == 'iperf' and transport == 'udp'):
@@ -173,7 +250,7 @@ def expand_profiles(anchors, config):
             dataRate=f"{choose('backgroundRateKbps'):g}kbps" if count else '2kbps',
             distanceM=choose('backgroundDistanceM') if count else 500)
         signature = json.dumps(cfg, sort_keys=True)
-        if signature in signatures or not preflight(cfg):
+        if signature in signatures:
             rejected += 1
             if rejected > config['profileCount'] * 100:
                 raise ValueError('cannot admit enough unique profiles; review full_dataset.json ranges')

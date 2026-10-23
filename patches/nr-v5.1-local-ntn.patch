@@ -1,3 +1,109 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index de84590..f61e9a2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -462,6 +462,10 @@ set(test_sources
+     ${eigen_tests}
+     ${opengym_tests}
+     test/nr-amc-tb-size-test.cc
++    test/nr-gnb-mac-grant-fill-test.cc
++    test/nr-connected-ra-test.cc
++    test/nr-ul-grant-power-test.cc
++    test/nr-spectrum-phy-power-matrix-test.cc
+     test/nr-antenna-3gpp-model-conf.cc
+     test/nr-cc-bwp-configuration.cc
+     test/nr-channel-setup-test.cc
+@@ -509,6 +513,7 @@ set(test_sources
+     test/nr-test-resource-assignment-matrix.cc
+     test/nr-test-rlc-am-e2e.cc
+     test/nr-test-rlc-am-status.cc
++    test/nr-test-rlc-am-resegmentation.cc
+     test/nr-test-rlc-am-transmitter.cc
+     test/nr-test-rlc-header.cc
+     test/nr-test-rlc-tm.cc
+diff --git a/model/nr-amc.cc b/model/nr-amc.cc
+index 915912a..9b732af 100644
+--- a/model/nr-amc.cc
++++ b/model/nr-amc.cc
+@@ -98,6 +98,50 @@ NrAmc::GetMcsFromCqi(uint8_t cqi) const
+     return m_cachedCqiToMcsMap.at(cqi);
+ }
+ 
++std::optional<uint8_t>
++NrAmc::GetMcsForSisoGrant(const SpectrumValue& sinr, uint32_t rbSymbols) const
++{
++    if (rbSymbols == 0)
++    {
++        return std::nullopt;
++    }
++    if (m_amcModel == ShannonModel)
++    {
++        uint8_t mcs = 0;
++        CreateCqiFeedbackSiso(sinr, mcs);
++        return mcs;
++    }
++    std::vector<int> rbMap;
++    for (uint32_t rb = 0; rb < sinr.GetSpectrumModel()->GetNumBands(); ++rb)
++    {
++        if (sinr[rb] > 0)
++        {
++            rbMap.push_back(rb);
++        }
++    }
++    if (rbMap.empty())
++    {
++        return std::nullopt;
++    }
++    std::optional<uint8_t> selected;
++    for (uint32_t mcs = 0; mcs <= GetMaxMcs(); ++mcs)
++    {
++        const auto bytes = CalculateTbSize(mcs, 1, rbSymbols);
++        if (bytes == 0)
++        {
++            continue;
++        }
++        const auto output = m_errorModel->GetTbDecodificationStats(sinr, rbMap, bytes,
++                                                                  mcs, {});
++        if (output->m_tbler > 0.1)
++        {
++            break;
++        }
++        selected = mcs;
++    }
++    return selected;
++}
++
+ uint8_t
+ NrAmc::GetNumRefScPerRb() const
+ {
+diff --git a/model/nr-amc.h b/model/nr-amc.h
+index 573bfd0..cbcfec9 100644
+--- a/model/nr-amc.h
++++ b/model/nr-amc.h
+@@ -10,6 +10,8 @@
+ 
+ #include "ns3/nr-export.h"
+ 
++#include <optional>
++
+ namespace ns3
+ {
+ 
+@@ -125,6 +127,14 @@ class NR_EXPORT NrAmc : public Object
+      */
+     uint8_t CreateCqiFeedbackSiso(const SpectrumValue& sinr, uint8_t& mcsWb) const;
+ 
++    /**
++     * Select a SISO MCS for the full candidate grant, targeting TBLER <= 0.1.
++     * @param sinr Predicted SINR on active RBs, zero elsewhere
++     * @param rbSymbols Number of assigned RB-symbols in the transport block
++     * @return Supported MCS, or no value if the grant cannot meet the target
++     */
++    std::optional<uint8_t> GetMcsForSisoGrant(const SpectrumValue& sinr, uint32_t rbSymbols) const;
++
+     /**
+      * @brief Get CQI from a SpectralEfficiency value
+      * @param s spectral efficiency
 diff --git a/model/nr-control-messages.h b/model/nr-control-messages.h
 index fd201c8..2ea5aad 100644
 --- a/model/nr-control-messages.h
@@ -38,6 +144,146 @@ index fd201c8..2ea5aad 100644
 +    bool m_hasTimingReference{false}; //!< NTN grant has an explicit ground-clock origin.
      uint32_t m_arfcn{0};       //!< Source BWP arfcn.
  };
+ 
+diff --git a/model/nr-gnb-mac.cc b/model/nr-gnb-mac.cc
+index 9fdf7d2..5f691de 100644
+--- a/model/nr-gnb-mac.cc
++++ b/model/nr-gnb-mac.cc
+@@ -424,6 +424,10 @@ NrGnbMac::GetTypeId()
+                             "Information regarding received scheduling request.",
+                             MakeTraceSourceAccessor(&NrGnbMac::m_srCallback),
+                             "ns3::NrGnbMac::SrTracedCallback")
++            .AddTraceSource("ConnectedRaIdentity",
++                            "Decoded Msg3 temporary identity and established C-RNTI.",
++                            MakeTraceSourceAccessor(&NrGnbMac::m_connectedRaIdentity),
++                            "ns3::TracedCallback::Uint16Uint16")
+             .AddTraceSource("GnbMacRxedCtrlMsgsTrace",
+                             "Gnb MAC Rxed Control Messages Traces.",
+                             MakeTraceSourceAccessor(&NrGnbMac::m_macRxedCtrlMsgsTrace),
+@@ -923,6 +927,31 @@ NrGnbMac::DoReceivePhyPdu(Ptr<Packet> p)
+     NrMacHeaderFsUl header;
+     p->PeekHeader(header);
+ 
++    if (header.GetLcId() == NrMacHeaderFsUl::C_RNTI)
++    {
++        p->RemoveHeader(header);
++        if (p->GetSize() != 2)
++        {
++            NS_LOG_WARN("Discard malformed C-RNTI MAC CE");
++            return;
++        }
++        uint8_t identity[2];
++        p->CopyData(identity, 2);
++        const uint16_t connectedRnti = (uint16_t(identity[0]) << 8) | identity[1];
++        const auto connected = m_rlcAttached.find(connectedRnti);
++        if (connectedRnti == 0 || connected == m_rlcAttached.end() ||
++            connected->second.count(1) == 0)
++        {
++            NS_LOG_WARN("C-RNTI MAC CE refers to no connected bearer context");
++            return;
++        }
++        // A decoded Msg3 restores scheduling of the existing bearer. The
++        // temporary context remains subject to its normal setup timeout.
++        m_connectedRaIdentity(rnti, connectedRnti);
++        DoReportSrToScheduler(connectedRnti);
++        return;
++    }
++
+     // Based on LC ID, we know if it is a CE or simply data.
+     if (header.GetLcId() == NrMacHeaderFsUl::SHORT_BSR)
+     {
+@@ -1203,6 +1232,29 @@ NrGnbMac::HasMsg3Allocations(const SlotAllocInfo& slotInfo)
+     return false;
+ }
+ 
++void
++NrGnbMac::FillDlTxOpportunity(NrMacSapUser* rlc,
++                               NrMacSapUser::TxOpportunityParameters params,
++                               uint32_t& used,
++                               uint32_t tbSize)
++{
++    // The scheduler reserves one maximum-size MAC subheader per LC. Every
++    // additional RLC PDU needs its own subheader, paid from this same LC budget.
++    const uint32_t maximumHeader = 3;
++    const uint32_t limit = std::min<uint64_t>(tbSize, uint64_t{used} + params.bytes + maximumHeader);
++    while (used < limit && limit - used > maximumHeader)
++    {
++        params.bytes = limit - used - maximumHeader;
++        const uint32_t before = used;
++        rlc->NotifyTxOpportunity(params);
++        NS_ABORT_MSG_IF(used < before || used > limit, "RLC exceeded its DL MAC grant");
++        if (used == before)
++        {
++            break; // Empty, window-stalled, or too small: do not spin.
++        }
++    }
++}
++
+ void
+ NrGnbMac::DoSchedConfigIndication(NrMacSchedSapUser::SchedConfigIndParameters ind)
+ {
+@@ -1278,13 +1330,15 @@ NrGnbMac::DoSchedConfigIndication(NrMacSchedSapUser::SchedConfigIndParameters in
+                                 << (unsigned int)harqId << " LC ID " << std::to_string(+j.m_lcid)
+                                 << (unsigned int)j.m_size);
+ 
+-                    (*lcidIt).second->NotifyTxOpportunity(
+-                        NrMacSapUser::TxOpportunityParameters((j.m_size),
+-                                                              0,
+-                                                              harqId,
+-                                                              GetBwpId(),
+-                                                              rnti,
+-                                                              j.m_lcid));
++                    FillDlTxOpportunity((*lcidIt).second,
++                                        NrMacSapUser::TxOpportunityParameters(j.m_size,
++                                                                              0,
++                                                                              harqId,
++                                                                              GetBwpId(),
++                                                                              rnti,
++                                                                              j.m_lcid),
++                                        pduMapIt->second.m_used,
++                                        dciElem->m_tbSize);
+                     harqIt->second.at(harqId).m_lcidList.push_back(j.m_lcid);
+                 }
+ 
+diff --git a/model/nr-gnb-mac.h b/model/nr-gnb-mac.h
+index 5277802..4eb132e 100644
+--- a/model/nr-gnb-mac.h
++++ b/model/nr-gnb-mac.h
+@@ -53,6 +53,7 @@ class NR_EXPORT NrGnbMac : public Object
+     friend class NrMacMemberMacSchedSapUser;
+     friend class GnbMacMemberNrMacSapProvider<NrGnbMac>;
+     friend class MemberNrCcmMacSapProvider<NrGnbMac>;
++    friend class NrConnectedRaTestCase; ///< Verify decoded connected-mode Msg3 handling.
+ 
+   public:
+     /**
+@@ -278,6 +279,19 @@ class NR_EXPORT NrGnbMac : public Object
+     std::shared_ptr<DciInfoElementTdma> GetUlCtrlDci() const;
+ 
+   private:
++    /// Exercise grant filling without constructing a complete radio topology.
++    friend class NrGnbMacGrantFillTestCase;
++    /**
++     * Fill one LC's scheduled share with multiple bounded RLC PDUs.
++     * @param rlc Logical-channel SAP user
++     * @param params Initial RLC opportunity, excluding the reserved MAC header
++     * @param used Live total MAC bytes already appended to this transport block
++     * @param tbSize Transport block byte limit
++     */
++    void FillDlTxOpportunity(NrMacSapUser* rlc,
++                              NrMacSapUser::TxOpportunityParameters params,
++                              uint32_t& used,
++                              uint32_t tbSize);
+     void ReceiveRachPreamble(uint32_t raId);
+     void DoReceiveRachPreamble(uint32_t raId);
+     void ReceiveBsrMessage(MacCeElement bsr);
+@@ -416,6 +430,7 @@ class NR_EXPORT NrGnbMac : public Object
+     std::unordered_map<uint8_t, uint32_t> m_rapIdRntiMap; //!< RAPID RNTI map
+ 
+     TracedCallback<uint8_t, uint16_t> m_srCallback; //!< Callback invoked when a UE requested a SR
++    TracedCallback<uint16_t, uint16_t> m_connectedRaIdentity; //!< Decoded Msg3 temporary and existing identities.
+ 
+     uint16_t m_bandwidthInRbg{0}; //!< BW in RBG. Set by RRC through ConfigureMac
  
 diff --git a/model/nr-gnb-phy.cc b/model/nr-gnb-phy.cc
 index b54c921..db9b397 100644
@@ -174,8 +420,40 @@ index aa4998d..8ff0c72 100644
      GetUeManager(rnti)->RecvRrcConnectionSetupCompleted(msg);
  }
  
+diff --git a/model/nr-mac-scheduler-cqi-management.cc b/model/nr-mac-scheduler-cqi-management.cc
+index 2476070..d386f4e 100644
+--- a/model/nr-mac-scheduler-cqi-management.cc
++++ b/model/nr-mac-scheduler-cqi-management.cc
+@@ -46,7 +46,10 @@ NrMacSchedulerCQIManagement::UlSBCQIReported(
+         {
+             for (uint32_t k = 0; k < numRbPerRbg; ++k)
+             {
+-                rbAssignment[i * numRbPerRbg + k] = 1;
++                if (i * numRbPerRbg + k < rbAssignment.size())
++                {
++                    rbAssignment[i * numRbPerRbg + k] = 1;
++                }
+             }
+         }
+     }
+@@ -75,6 +78,15 @@ NrMacSchedulerCQIManagement::UlSBCQIReported(
+ 
+     NS_LOG_INFO("Values of SINR to pass to the AMC: " << out.str());
+ 
++    // Flat-channel fixed-total-power reference: the sum removes the per-RB
++    // allocation-width dependence. Do not count silent RBs outside the grant.
++    ueInfo->m_ulTotalPowerSinr = 0;
++    for (uint32_t rb = 0; rb < model->GetNumBands(); ++rb)
++    {
++        ueInfo->m_ulTotalPowerSinr += specVals[rb];
++    }
++    ueInfo->m_ulCqiSpectrumModel = model;
++
+     // MCS updated inside the function; crappy API... but we can't fix everything
+     ueInfo->m_ulCqi.m_wbCqi = GetAmcUl()->CreateCqiFeedbackSiso(specVals, ueInfo->m_ulMcs);
+     NS_LOG_DEBUG("Calculated MCS for RNTI " << ueInfo->m_rnti << " is " << ueInfo->m_ulMcs);
 diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
-index b50fbb9..0e2f175 100644
+index b50fbb9..4254ed2 100644
 --- a/model/nr-mac-scheduler-ns3.cc
 +++ b/model/nr-mac-scheduler-ns3.cc
 @@ -114,6 +114,11 @@ NrMacSchedulerNs3::GetTypeId()
@@ -190,7 +468,28 @@ index b50fbb9..0e2f175 100644
              .AddAttribute("CqiTimerThreshold",
                            "The time while a CQI is valid",
                            TimeValue(Seconds(1)),
-@@ -1212,7 +1217,9 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
+@@ -132,6 +137,12 @@ NrMacSchedulerNs3::GetTypeId()
+                           MakeBooleanAccessor(&NrMacSchedulerNs3::SetFixedUlMcs,
+                                               &NrMacSchedulerNs3::IsUlMcsFixed),
+                           MakeBooleanChecker())
++            .AddAttribute("UlGrantPowerAwareMcs",
++                          "Predict SISO UL grant SINR for a flat channel with fixed total UE "
++                          "power over used RBs. Disable for uplink power control or fixed PSD.",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_ulGrantPowerAwareMcs),
++                          MakeBooleanChecker())
+             .AddAttribute("StartingMcsDl",
+                           "Starting MCS for DL",
+                           UintegerValue(0),
+@@ -604,6 +615,7 @@ NrMacSchedulerNs3::DoCschedUeConfigReq(
+         UeInfoOf(*itUe)->m_dlMcs = m_startMcsDl;
+         UeInfoOf(*itUe)->m_startMcsDlUe = m_startMcsDl;
+         UeInfoOf(*itUe)->m_ulMcs = m_startMcsUl;
++        UeInfoOf(*itUe)->m_ulGrantPowerAwareMcs = m_ulGrantPowerAwareMcs && !m_fixedMcsUl;
+         UeInfoOf(*itUe)->m_dlAmc = m_dlAmc;
+         UeInfoOf(*itUe)->m_ulAmc = m_ulAmc;
+         UeInfoOf(*itUe)->m_mcsCsiSource = m_mcsCsiSource;
+@@ -1212,7 +1224,9 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
              continue;
          }
  
@@ -202,10 +501,18 @@ index b50fbb9..0e2f175 100644
              ++process.m_timer;
              NS_LOG_INFO("Updated process for UE " << rnti << " number "
 diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
-index e1ae87d..265df15 100644
+index e1ae87d..7dc5b8d 100644
 --- a/model/nr-mac-scheduler-ns3.h
 +++ b/model/nr-mac-scheduler-ns3.h
-@@ -1066,6 +1066,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+@@ -1002,6 +1002,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+ 
+     bool m_fixedMcsDl{false};  //!< Fixed MCS for *all* UE in DL
+     bool m_fixedMcsUl{false};  //!< Fixed MCS for *all* UE in UL
++    bool m_ulGrantPowerAwareMcs{false}; //!< Flat-channel fixed-total-power UL grant correction
+     uint8_t m_startMcsDl{0};   //!< Starting (or fixed) value for DL MCS
+     uint8_t m_startMcsUl{0};   //!< Starting (or fixed) value for UL MCS
+     int8_t m_maxDlMcs{0};      //!< Maximum index for DL MCS
+@@ -1066,6 +1067,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
  
      uint32_t m_srsSlotCounter{0}; //!< Counter for UL slots
  
@@ -213,6 +520,262 @@ index e1ae87d..265df15 100644
      bool m_enableHarqReTx{true}; //!< Flag to enable or disable HARQ ReTx (attribute)
  
      TracedCallback<uint16_t, uint16_t, const std::shared_ptr<NrMacSchedulerUeInfo>&>
+diff --git a/model/nr-mac-scheduler-ofdma.cc b/model/nr-mac-scheduler-ofdma.cc
+index df9c109..f97e8ce 100644
+--- a/model/nr-mac-scheduler-ofdma.cc
++++ b/model/nr-mac-scheduler-ofdma.cc
+@@ -215,7 +215,7 @@ NrMacSchedulerOfdma::ReapStarvedUeResources(std::vector<UePtrAndBufferReq>& ueVe
+                                             const bool isDl) const
+ {
+     // The minimum TBS to create a DCI, as enforced by CreateDlDci and CreateUlDci
+-    const uint32_t minTbs = isDl ? 10 : 12;
++    const uint32_t minTbs = isDl ? 10 : 15;
+     auto tbsOf = [isDl](const UePtrAndBufferReq& u) {
+         return isDl ? u.first->m_dlTbSize : u.first->m_ulTbSize;
+     };
+@@ -634,6 +634,7 @@ NrMacSchedulerOfdma::AssignULRBG(uint32_t symAvail, const ActiveUeMap& activeUl)
+         uint32_t beamSym = symPerBeam.at(GetBeamId(el));
+         std::vector<UePtrAndBufferReq> ueVector;
+         FTResources assigned(0, 0);
++        std::set<uint16_t> powerLimited;
+ 
+         std::vector<bool> availableRbgs = GetUlBitmask();
+         std::set<uint32_t> remainingRbgSet;
+@@ -674,7 +675,8 @@ NrMacSchedulerOfdma::AssignULRBG(uint32_t symAvail, const ActiveUeMap& activeUl)
+                 while (schedInfoIt != ueVector.end())
+                 {
+                     uint32_t bufQueueSize = schedInfoIt->second;
+-                    if (GetUe(*schedInfoIt)->m_ulTbSize >= std::max(bufQueueSize, 12U))
++                    if (GetUe(*schedInfoIt)->m_ulTbSize >= std::max(bufQueueSize, 15U) ||
++                        powerLimited.contains(GetUe(*schedInfoIt)->m_rnti))
+                     {
+                         std::advance(schedInfoIt, 1);
+                     }
+@@ -698,6 +700,18 @@ NrMacSchedulerOfdma::AssignULRBG(uint32_t symAvail, const ActiveUeMap& activeUl)
+                 auto existingRbgs = assignedRbgs.size();
+                 assignedRbgs.resize(assignedRbgs.size() + beamSym);
+                 std::fill(assignedRbgs.begin() + existingRbgs, assignedRbgs.end(), *assignedRbg);
++                // More frequency resources reduce power per RB. Preserve an
++                // existing usable grant if widening it would make it infeasible;
++                // another UE can still use this uncommitted resource. Grants
++                // too small to form a MAC PDU may keep growing until serviceable.
++                if (GetUe(*schedInfoIt)->m_ulGrantPowerAwareMcs &&
++                    GetUe(*schedInfoIt)->m_ulTbSize >= 15 &&
++                    GetUe(*schedInfoIt)->GetUlGrant().tbSize < 15)
++                {
++                    assignedRbgs.resize(existingRbgs);
++                    powerLimited.insert(GetUe(*schedInfoIt)->m_rnti);
++                    continue;
++                }
+                 assigned.m_rbg++;
+ 
+                 auto& assignedSymbols = GetUe(*schedInfoIt)->m_ulSym;
+@@ -817,18 +831,18 @@ NrMacSchedulerOfdma::CreateUlDci(PointInFTPlane* spoint,
+ {
+     NS_LOG_FUNCTION(this);
+ 
+-    uint32_t tbs = m_ulAmc->CalculateTbSize(ueInfo->m_ulMcs,
+-                                            ueInfo->m_ulRank,
+-                                            ueInfo->m_ulRBG.size() * GetNumRbPerRbg());
++    const auto grant = ueInfo->GetUlGrant();
++    const auto ulMcs = grant.mcs;
++    const auto tbs = grant.tbSize;
+ 
+-    // If is less than 12, i.e., 7 (3 mac header, 2 rlc header, 2 data) + 5 bytes for
+-    // the SHORT_BSR. then we can't transmit any new data, so don't create dci.
+-    if (tbs < 12)
++    // The UE reserves SHORT_BSR (5), a MAC subheader (3), and at least
++    // 7 bytes for RLC AM. Smaller grants cannot carry new data.
++    if (tbs < 15)
+     {
+         NS_LOG_DEBUG("While creating UL DCI for UE "
+                      << ueInfo->m_rnti << " assigned "
+                      << std::set<uint32_t>(ueInfo->m_ulRBG.begin(), ueInfo->m_ulRBG.end()).size()
+-                     << " UL RBG, but TBS < 12");
++                     << " UL RBG, but TBS < 15");
+         return nullptr;
+     }
+ 
+@@ -845,7 +859,7 @@ NrMacSchedulerOfdma::CreateUlDci(PointInFTPlane* spoint,
+                                              DciInfoElementTdma::UL,
+                                              spoint->m_sym - maxSym,
+                                              maxSym,
+-                                             ueInfo->m_ulMcs,
++                                             ulMcs,
+                                              ueInfo->m_ulRank,
+                                              ueInfo->m_ulPrecMats,
+                                              tbs,
+diff --git a/model/nr-mac-scheduler-ofdma.h b/model/nr-mac-scheduler-ofdma.h
+index 5537a22..df7e0ef 100644
+--- a/model/nr-mac-scheduler-ofdma.h
++++ b/model/nr-mac-scheduler-ofdma.h
+@@ -213,7 +213,7 @@ class NR_EXPORT NrMacSchedulerOfdma : public NrMacSchedulerTdma
+                                                 const bool isDl = true);
+     /**
+      * @brief Reap the resources of the UE with the smallest TBS, in case that TBS is
+-     * below the minimum required to create a DCI (10 bytes in DL, 12 bytes in UL, as
++     * below the minimum required to create a DCI (10 bytes in DL, 15 bytes in UL, as
+      * enforced by CreateDlDci and CreateUlDci), returning them to remainingRbgSet so
+      * that they can be redistributed to the other UEs of the same beam. Without this,
+      * when the active UEs outnumber the schedulable resources and all of them are at
+diff --git a/model/nr-mac-scheduler-tdma.cc b/model/nr-mac-scheduler-tdma.cc
+index d14fc70..76d4981 100644
+--- a/model/nr-mac-scheduler-tdma.cc
++++ b/model/nr-mac-scheduler-tdma.cc
+@@ -161,7 +161,8 @@ NrMacSchedulerTdma::AssignRBGTDMA(uint32_t symAvail,
+             uint32_t activeLCs = (type == "DL") ? GetUe(*schedInfoIt)->GetTotalNumActiveDlLc()
+                                                 : GetUe(*schedInfoIt)->GetTotalNumActiveUlLc();
+ 
+-            if (GetTBSFn(GetUe(*schedInfoIt)) >= std::max(bufQueueSize, 10U * activeLCs))
++            if (GetTBSFn(GetUe(*schedInfoIt)) >= std::max(bufQueueSize, type == "UL" ? 5U + 10U * std::max(activeLCs, 1U)
++                                                                : 10U * activeLCs))
+             {
+                 NS_LOG_INFO("UE " << GetUe(*schedInfoIt)->m_rnti << " TBS "
+                                   << GetTBSFn(GetUe(*schedInfoIt)) << " queue " << bufQueueSize
+@@ -224,7 +225,7 @@ NrMacSchedulerTdma::AssignRBGTDMA(uint32_t symAvail,
+     // them cross the minimum. Without this, when the active UEs outnumber the
+     // available symbols and all of them are at a low MCS, every allocation is
+     // discarded and the cell starves indefinitely.
+-    const uint32_t minTbs = type == "DL" ? 10 : 12;
++    const uint32_t minTbs = type == "DL" ? 10 : 15;
+     GetFirst GetUe;
+     auto isStarved = [&](const UePtrAndBufferReq& ue) {
+         return !GetRBGFn(GetUe(ue)).empty() && GetTBSFn(GetUe(ue)) < minTbs;
+@@ -481,17 +482,17 @@ NrMacSchedulerTdma::CreateUlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
+                                 uint32_t maxSym) const
+ {
+     NS_LOG_FUNCTION(this);
+-    uint32_t tbs = m_ulAmc->CalculateTbSize(ueInfo->m_ulMcs,
+-                                            ueInfo->m_ulRank,
+-                                            ueInfo->m_ulRBG.size() * GetNumRbPerRbg());
++    const auto grant = ueInfo->GetUlGrant();
++    const auto ulMcs = grant.mcs;
++    const auto tbs = grant.tbSize;
+ 
+-    // If is less than 12, 7 (3 mac header, 2 rlc header, 2 data) + SHORT_BSR (5),
+-    // then we can't transmit any new data, so don't create dci.
+-    if (tbs < 12)
++    // The UE reserves SHORT_BSR (5), MAC subheader (3), and an RLC AM
++    // transmission opportunity of at least 7 bytes. Smaller grants cannot send data.
++    if (tbs < 15)
+     {
+         NS_LOG_DEBUG("While creating UL DCI for UE " << ueInfo->m_rnti << " assigned "
+                                                      << ueInfo->m_ulRBG.size()
+-                                                     << " UL RBG, but TBS " << tbs << " < 12");
++                                                     << " UL RBG, but TBS " << tbs << " < 15");
+         return nullptr;
+     }
+ 
+@@ -512,7 +513,7 @@ NrMacSchedulerTdma::CreateUlDci(NrMacSchedulerNs3::PointInFTPlane* spoint,
+                          ueInfo,
+                          tbs,
+                          DciInfoElementTdma::UL,
+-                         ueInfo->m_ulMcs,
++                         ulMcs,
+                          ueInfo->m_ulRank,
+                          ueInfo->m_ulPrecMats,
+                          numSym);
+diff --git a/model/nr-mac-scheduler-ue-info.cc b/model/nr-mac-scheduler-ue-info.cc
+index ed6b387..12dd129 100644
+--- a/model/nr-mac-scheduler-ue-info.cc
++++ b/model/nr-mac-scheduler-ue-info.cc
+@@ -5,8 +5,10 @@
+ #include "nr-mac-scheduler-ue-info.h"
+ 
+ #include "ns3/log.h"
++#include "ns3/spectrum-value.h"
+ 
+ #include <numeric>
++#include <set>
+ 
+ namespace ns3
+ {
+@@ -208,10 +210,54 @@ NrMacSchedulerUeInfo::UpdateUlMetric()
+     }
+     else
+     {
+-        m_ulTbSize = m_ulAmc->CalculateTbSize(m_ulMcs, m_ulRank, m_ulRBG.size() * GetNumRbPerRbg());
++        m_ulTbSize = GetUlGrant().tbSize;
+     }
+ }
+ 
++uint8_t
++NrMacSchedulerUeInfo::GetUlMcsForGrant() const
++{
++    return GetUlGrant().mcs;
++}
++
++NrAmc::McsParams
++NrMacSchedulerUeInfo::GetUlGrant() const
++{
++    NrAmc::McsParams grant;
++    grant.mcs = m_ulMcs;
++    grant.tbSize = m_ulRBG.empty() ? 0 : m_ulAmc->CalculateTbSize(
++        m_ulMcs, m_ulRank, m_ulRBG.size() * GetNumRbPerRbg());
++    if (!m_ulGrantPowerAwareMcs || !m_ulCqiSpectrumModel || m_ulCqi.m_timer == 0 ||
++        m_ulRBG.empty() || m_ulRank != 1)
++    {
++        return grant;
++    }
++    const auto bands = m_ulCqiSpectrumModel->GetNumBands();
++    std::set<uint32_t> active;
++    for (auto rbg : m_ulRBG)
++    {
++        for (uint32_t rb = rbg * GetNumRbPerRbg();
++             rb < std::min<uint32_t>((rbg + 1) * GetNumRbPerRbg(), bands); ++rb)
++        {
++            active.insert(rb);
++        }
++    }
++    if (active.empty())
++    {
++        return grant;
++    }
++    SpectrumValue predicted(m_ulCqiSpectrumModel);
++    for (auto rb : active)
++    {
++        predicted[rb] = m_ulTotalPowerSinr / active.size();
++    }
++    const auto mcs = m_ulAmc->GetMcsForSisoGrant(predicted, m_ulRBG.size() * GetNumRbPerRbg());
++    grant.mcs = mcs.value_or(0);
++    grant.tbSize = mcs ? m_ulAmc->CalculateTbSize(*mcs, 1,
++                                                 m_ulRBG.size() * GetNumRbPerRbg()) : 0;
++    return grant;
++}
++
+ void
+ NrMacSchedulerUeInfo::ResetUlMetric()
+ {
+diff --git a/model/nr-mac-scheduler-ue-info.h b/model/nr-mac-scheduler-ue-info.h
+index b954019..88b7dca 100644
+--- a/model/nr-mac-scheduler-ue-info.h
++++ b/model/nr-mac-scheduler-ue-info.h
+@@ -222,6 +222,15 @@ class NR_EXPORT NrMacSchedulerUeInfo
+      */
+     virtual void UpdateUlMetric();
+ 
++    /**
++     * Predict the MCS for the current UL grant in a flat, fixed-total-power channel.
++     * @return Grant-aware MCS, or cached MCS if correction/CQI is unavailable
++     */
++    uint8_t GetUlMcsForGrant() const;
++
++    /** @return Consistent MCS and TB size; zero TB size denotes an infeasible grant */
++    NrAmc::McsParams GetUlGrant() const;
++
+     /**
+      * @brief ResetUlMetric
+      *
+@@ -364,6 +373,9 @@ class NR_EXPORT NrMacSchedulerUeInfo
+ 
+     CqiInfo m_dlCqi; //!< DL CQI information
+     CqiInfo m_ulCqi; //!< UL CQI information
++    bool m_ulGrantPowerAwareMcs{false}; //!< Enable flat-channel fixed-total-power grant prediction
++    double m_ulTotalPowerSinr{0}; //!< Observed per-RB SINR times observed active RB count
++    Ptr<const SpectrumModel> m_ulCqiSpectrumModel; //!< Spectrum of the latest PUSCH observation
+ 
+     NrMacHarqVector m_dlHarq; //!< HARQ process vector for DL
+     NrMacHarqVector m_ulHarq; //!< HARQ process vector for UL
 diff --git a/model/nr-pdcp.cc b/model/nr-pdcp.cc
 index e46a948..c3daa50 100644
 --- a/model/nr-pdcp.cc
@@ -261,25 +824,793 @@ index fc2ee3d..679ef99 100644
      TracedCallback<uint16_t, uint8_t, uint32_t> m_txPdu;
      /**
       * Used to inform of a PDU reception from the RLC SAP user.
+diff --git a/model/nr-rlc-am-header.cc b/model/nr-rlc-am-header.cc
+index 2a5e9c0..e158a74 100644
+--- a/model/nr-rlc-am-header.cc
++++ b/model/nr-rlc-am-header.cc
+@@ -8,6 +8,9 @@
+ 
+ #include "ns3/log.h"
+ 
++#include <iterator>
++#include <vector>
++
+ namespace ns3
+ {
+ 
+@@ -196,44 +199,54 @@ NrRlcAmHeader::SetAckSn(nr::SequenceNumber10 ackSn)
+ }
+ 
+ bool
+-NrRlcAmHeader::OneMoreNackWouldFitIn(uint16_t bytes)
++NrRlcAmHeader::OneMoreNackWouldFitIn(uint32_t bytes, bool segmented) const
+ {
+-    NS_LOG_FUNCTION(this << bytes);
+-    NS_ASSERT_MSG(m_dataControlBit == CONTROL_PDU && m_controlPduType == NrRlcAmHeader::STATUS_PDU,
+-                  "method allowed only for STATUS PDUs");
+-    // A NACK is 12 bits: appending to an even-sized list grows the serialized
+-    // header by 2 bytes, to an odd-sized list by 1 byte (see PushNack).
+-    const uint16_t nextNackCost = (m_nackSnList.size() % 2 == 0) ? 2 : 1;
+-    return (m_headerLength + nextNackCost <= bytes);
++    uint32_t bits = 15 + 12 * m_nackSnList.size();
++    for (const auto& nack : m_nackSnList)
++    {
++        bits += nack.segmented ? 30 : 0;
++    }
++    return (bits + 12 + (segmented ? 30 : 0) + 7) / 8 <= bytes;
+ }
+ 
+ void
+ NrRlcAmHeader::PushNack(int nack)
+ {
+-    NS_LOG_FUNCTION(this << nack);
+-    NS_ASSERT_MSG(m_dataControlBit == CONTROL_PDU && m_controlPduType == NrRlcAmHeader::STATUS_PDU,
+-                  "method allowed only for STATUS PDUs");
+-    m_nackSnList.push_back(nack);
+-
+-    if (m_nackSnList.size() % 2 == 0)
++    m_nackSnList.push_back({static_cast<uint16_t>(nack), false, 0, 0x7fff});
++    uint32_t bits = 15 + 12 * m_nackSnList.size();
++    for (const auto& entry : m_nackSnList)
+     {
+-        m_headerLength++;
++        bits += entry.segmented ? 30 : 0;
+     }
+-    else
++    m_headerLength = (bits + 7) / 8;
++}
++
++void
++NrRlcAmHeader::PushNack(uint16_t sn, uint16_t start, uint16_t end)
++{
++    NS_ASSERT(start <= end && end <= 0x7fff);
++    PushNack(sn);
++    m_nackSnList.back() = {sn, true, start, end};
++    uint32_t bits = 15 + 12 * m_nackSnList.size();
++    for (const auto& entry : m_nackSnList)
+     {
+-        m_headerLength += 2;
++        bits += entry.segmented ? 30 : 0;
+     }
++    m_headerLength = (bits + 7) / 8;
++}
++
++const std::list<NrRlcAmHeader::Nack>&
++NrRlcAmHeader::GetNacks() const
++{
++    return m_nackSnList;
+ }
+ 
+ bool
+ NrRlcAmHeader::IsNackPresent(nr::SequenceNumber10 nack)
+ {
+-    NS_LOG_FUNCTION(this);
+-    NS_ASSERT_MSG(m_dataControlBit == CONTROL_PDU && m_controlPduType == NrRlcAmHeader::STATUS_PDU,
+-                  "method allowed only for STATUS PDUs");
+-    for (auto nackIt = m_nackSnList.begin(); nackIt != m_nackSnList.end(); ++nackIt)
++    for (const auto& entry : m_nackSnList)
+     {
+-        if ((*nackIt) == nack.GetValue())
++        if (entry.sn == nack.GetValue())
+         {
+             return true;
+         }
+@@ -244,17 +257,12 @@ NrRlcAmHeader::IsNackPresent(nr::SequenceNumber10 nack)
+ int
+ NrRlcAmHeader::PopNack()
+ {
+-    NS_LOG_FUNCTION(this);
+-    NS_ASSERT_MSG(m_dataControlBit == CONTROL_PDU && m_controlPduType == NrRlcAmHeader::STATUS_PDU,
+-                  "method allowed only for STATUS PDUs");
+     if (m_nackSnList.empty())
+     {
+         return -1;
+     }
+-
+-    int nack = m_nackSnList.front();
++    int nack = m_nackSnList.front().sn;
+     m_nackSnList.pop_front();
+-
+     return nack;
+ }
+ 
+@@ -327,7 +335,11 @@ NrRlcAmHeader::Print(std::ostream& os) const
+ 
+         while (it3 != m_nackSnList.end())
+         {
+-            os << " NACK_SN=" << (int)(*it3);
++            os << " NACK_SN=" << it3->sn;
++            if (it3->segmented)
++            {
++                os << " SO=" << it3->start << ":" << it3->end;
++            }
+             it3++;
+         }
+     }
+@@ -346,8 +358,6 @@ NrRlcAmHeader::Serialize(Buffer::Iterator start) const
+ 
+     auto it1 = m_extensionBits.begin();
+     auto it2 = m_lengthIndicators.begin();
+-    auto it3 = m_nackSnList.begin();
+-
+     if (m_dataControlBit == DATA_PDU)
+     {
+         i.WriteU8(((DATA_PDU << 7) & 0x80) | ((m_resegmentationFlag << 6) & 0x40) |
+@@ -391,74 +401,34 @@ NrRlcAmHeader::Serialize(Buffer::Iterator start) const
+             }
+         }
+     }
+-    else // if ( m_dataControlBit == CONTROL_PDU )
++    else
+     {
+-        i.WriteU8(((CONTROL_PDU << 7) & 0x80) | ((m_controlPduType << 4) & 0x70) |
+-                  ((m_ackSn.GetValue() >> 6) & 0x0F));
+-        // note: second part of ackSn will be written later
+-
+-        // serialize the NACKs
+-        if (it3 == m_nackSnList.end())
+-        {
+-            NS_LOG_LOGIC(this << " no NACKs");
+-            // If there are no NACKs then this line adds the rest of the ACK
+-            // along with 0x00, indicating an E1 value of 0 or no NACKs follow.
+-            i.WriteU8((m_ackSn.GetValue() << 2) & 0xFC);
+-        }
+-        else
++        // TS 36.322: D/C, CPT, ACK_SN, E1, followed by NACK_SN/E1/E2 and
++        // optional 15-bit SOstart/SOend. Keep whole-PDU STATUS wire compatibility.
++        std::vector<uint8_t> bytes(GetSerializedSize(), 0);
++        uint32_t bit = 0;
++        auto put = [&](uint32_t value, uint32_t width) {
++            for (uint32_t j = width; j > 0; --j, ++bit)
++            {
++                bytes[bit / 8] |= ((value >> (j - 1)) & 1) << (7 - bit % 8);
++            }
++        };
++        put(CONTROL_PDU, 1);
++        put(m_controlPduType, 3);
++        put(m_ackSn.GetValue(), 10);
++        put(!m_nackSnList.empty(), 1);
++        for (auto nack = m_nackSnList.begin(); nack != m_nackSnList.end(); ++nack)
+         {
+-            int oddNack = *it3;
+-            int evenNack = -1;
+-            // Else write out a series of E1 = 1 and NACK values. Note since we
+-            // are not supporting SO start/end the value of E2 will always be 0.
+-
+-            // First write out the ACK along with the very first NACK
+-            // And the remaining NACK with 0x02 or 10 in binary to set
+-            // E1 to 1, then Or in the first bit of the NACK
+-            i.WriteU8(((m_ackSn.GetValue() << 2) & 0xFC) | (0x02) | ((*it3 >> 9) & 0x01));
+-
+-            while (it3 != m_nackSnList.end())
++            put(nack->sn, 10);
++            put(std::next(nack) != m_nackSnList.end(), 1);
++            put(nack->segmented, 1);
++            if (nack->segmented)
+             {
+-                // The variable oddNack has the current NACK value to write, also
+-                // either the setup to enter this loop or the previous loop would
+-                // have written the highest order bit to the previous octet.
+-                // Write the next set of bits (2 - 9) into the next octet
+-                i.WriteU8((oddNack >> 1) & 0xFF);
+-
+-                // Next check to see if there is going to be another NACK after
+-                // this
+-                it3++;
+-                if (it3 != m_nackSnList.end())
+-                {
+-                    // Yes there will be another NACK after this, so E1 will be 1
+-                    evenNack = *it3;
+-                    i.WriteU8(((oddNack << 7) & 0x80) | (0x40) // E1 = 1 E2 = 0, more NACKs
+-                              | ((evenNack >> 5) & 0x1F));
+-
+-                    // The final octet of this loop will have the rest of the
+-                    // NACK and another E1, E2. Check to see if there will be
+-                    // one more NACK after this.
+-                    it3++;
+-                    if (it3 != m_nackSnList.end())
+-                    {
+-                        // Yes there is at least one more NACK. Finish writing
+-                        // this octet and the next iteration will do the rest.
+-                        oddNack = *it3;
+-                        i.WriteU8(((evenNack << 3) & 0xF8) | (0x04) | ((oddNack >> 9) & 0x01));
+-                    }
+-                    else
+-                    {
+-                        // No, there are no more NACKs
+-                        i.WriteU8((evenNack << 3) & 0xF8);
+-                    }
+-                }
+-                else
+-                {
+-                    // No, this is the last NACK so E1 will be 0
+-                    i.WriteU8((oddNack << 7) & 0x80);
+-                }
++                put(nack->start, 15);
++                put(nack->end, 15);
+             }
+         }
++        i.Write(bytes.data(), bytes.size());
+     }
+ }
+ 
+@@ -472,12 +442,24 @@ NrRlcAmHeader::Deserialize(Buffer::Iterator start)
+     uint8_t byte_4;
+     uint8_t extensionBit;
+ 
++    m_extensionBits.clear();
++    m_lengthIndicators.clear();
++    m_nackSnList.clear();
++    m_lastOffset = 0xffff;
++    if (i.GetRemainingSize() < 1)
++    {
++        return 0;
++    }
+     byte_1 = i.ReadU8();
+     m_headerLength = 1;
+     m_dataControlBit = (byte_1 & 0x80) >> 7;
+ 
+     if (m_dataControlBit == DATA_PDU)
+     {
++        if (i.GetRemainingSize() < 3)
++        {
++            return 0;
++        }
+         byte_2 = i.ReadU8();
+         byte_3 = i.ReadU8();
+         byte_4 = i.ReadU8();
+@@ -496,6 +478,7 @@ NrRlcAmHeader::Deserialize(Buffer::Iterator start)
+ 
+         if (extensionBit == DATA_FIELD_FOLLOWS)
+         {
++            m_lastOffset = m_segmentOffset + start.GetSize() - m_headerLength;
+             return GetSerializedSize();
+         }
+ 
+@@ -507,6 +490,10 @@ NrRlcAmHeader::Deserialize(Buffer::Iterator start)
+ 
+         while (moreLiFields)
+         {
++            if (i.GetRemainingSize() < 2)
++            {
++                return 0;
++            }
+             byte_1 = i.ReadU8();
+             byte_2 = i.ReadU8();
+ 
+@@ -520,6 +507,10 @@ NrRlcAmHeader::Deserialize(Buffer::Iterator start)
+ 
+             if (moreLiFields)
+             {
++                if (i.GetRemainingSize() < 1)
++                {
++                    return 0;
++                }
+                 byte_3 = i.ReadU8();
+ 
+                 evenE = (byte_2 & 0x08) >> 3;
+@@ -538,61 +529,46 @@ NrRlcAmHeader::Deserialize(Buffer::Iterator start)
+             m_lastOffset = m_segmentOffset + start.GetSize() - m_headerLength;
+         }
+     }
+-    else // if ( m_dataControlBit == CONTROL_PDU )
++    else
+     {
+-        byte_2 = i.ReadU8();
+-
+-        m_controlPduType = (byte_1 & 0x70) >> 4;
+-        m_ackSn = ((byte_1 & 0x0F) << 6) | ((byte_2 & 0xFC) >> 2);
+-
+-        int moreNacks = (byte_2 & 0x02) >> 1;
+-        // Get the first NACK outside the loop as it is not preceded by an E2
+-        // field but all following NACKs will.
+-        if (moreNacks == 1)
+-        {
+-            byte_3 = i.ReadU8();
+-            byte_4 = i.ReadU8();
+-            m_headerLength = 4;
+-
+-            m_nackSnList.push_back(((byte_2 & 0x01) << 9) | (byte_3 << 1) | ((byte_4 & 0x80) >> 7));
+-
+-            // Loop until all NACKs are found
+-            moreNacks = ((byte_4 & 0x40) >> 6);
+-            uint8_t byte = byte_4;
+-            uint8_t nextByte;
+-            uint8_t finalByte;
+-            while (moreNacks == 1)
++        const uint32_t available = start.GetRemainingSize();
++        std::vector<uint8_t> bytes(available);
++        start.Read(bytes.data(), available);
++        uint32_t bit = 0;
++        bool valid = true;
++        auto get = [&](uint32_t width) {
++            uint32_t value = 0;
++            if (bit + width > available * 8)
+             {
+-                // Ignore E2, read next NACK
+-                nextByte = i.ReadU8();
+-                m_nackSnList.push_back(((byte & 0x1F) << 5) | ((nextByte & 0xF8) >> 3));
+-
+-                // Check for another NACK, after this any following NACKs will
+-                // be aligned properly for the next iteration of this loop.
+-                moreNacks = (nextByte & 0x04) >> 2;
+-                byte = nextByte;
+-                if (moreNacks == 1)
+-                {
+-                    nextByte = i.ReadU8();
+-                    finalByte = i.ReadU8();
+-
+-                    m_nackSnList.push_back(((byte & 0x01) << 9) | (nextByte << 1) |
+-                                           ((finalByte & 0x80) >> 7));
+-
+-                    moreNacks = ((finalByte & 0x40) >> 6);
+-                    byte = finalByte;
+-                    m_headerLength += 3;
+-                }
+-                else
+-                {
+-                    m_headerLength++;
+-                }
++                valid = false;
++                return value;
+             }
++            for (uint32_t j = 0; j < width; ++j, ++bit)
++            {
++                value = (value << 1) | ((bytes[bit / 8] >> (7 - bit % 8)) & 1);
++            }
++            return value;
++        };
++        get(1);
++        m_controlPduType = get(3);
++        m_ackSn = get(10);
++        bool more = get(1);
++        while (valid && more)
++        {
++            Nack nack{};
++            nack.sn = get(10);
++            more = get(1);
++            nack.segmented = get(1);
++            nack.start = nack.segmented ? get(15) : 0;
++            nack.end = nack.segmented ? get(15) : 0x7fff;
++            valid = valid && nack.start <= nack.end;
++            m_nackSnList.push_back(nack);
+         }
+-        else
++        if (!valid || m_controlPduType != STATUS_PDU)
+         {
+-            m_headerLength++;
++            return 0;
+         }
++        m_headerLength = (bit + 7) / 8;
+     }
+ 
+     return GetSerializedSize();
+diff --git a/model/nr-rlc-am-header.h b/model/nr-rlc-am-header.h
+index ff00e5f..fde61c0 100644
+--- a/model/nr-rlc-am-header.h
++++ b/model/nr-rlc-am-header.h
+@@ -251,7 +251,27 @@ class NR_EXPORT NrRlcAmHeader : public Header
+      *
+      * @return true if one more NACK would fit in the CONTROL PDU; false otherwise
+      */
+-    bool OneMoreNackWouldFitIn(uint16_t bytes);
++    bool OneMoreNackWouldFitIn(uint32_t bytes, bool segmented = false) const;
++
++    /** A whole-PDU NACK or an inclusive byte range within its original data field. */
++    struct Nack
++    {
++        uint16_t sn;       ///< Original PDU sequence number
++        bool segmented;    ///< Whether segment offsets are present
++        uint16_t start;    ///< First missing byte
++        uint16_t end;      ///< Last missing byte; 0x7fff means through the end
++    };
++
++    /**
++     * Add a segment NACK.
++     * @param sn Original sequence number
++     * @param start First missing byte
++     * @param end Last missing byte, or 0x7fff for an unknown end
++     */
++    void PushNack(uint16_t sn, uint16_t start, uint16_t end);
++
++    /** @return All NACKs, including repeated SNs with different byte ranges. */
++    const std::list<Nack>& GetNacks() const;
+ 
+     /**
+      * Add one more NACK to the CONTROL PDU
+@@ -298,7 +318,7 @@ class NR_EXPORT NrRlcAmHeader : public Header
+ 
+     // Status PDU fields
+     nr::SequenceNumber10 m_ackSn; ///< ack sn
+-    std::list<int> m_nackSnList;  ///< nack sn list
++    std::list<Nack> m_nackSnList; ///< Whole-PDU and byte-range NACKs
+ 
+     std::list<uint8_t> m_extensionBits1; ///< Includes E1 after ACK_SN
+     std::list<uint8_t> m_extensionBits2; ///< extension bits 2
 diff --git a/model/nr-rlc-am.cc b/model/nr-rlc-am.cc
-index 35eee58..c45160a 100644
+index 35eee58..54ab942 100644
 --- a/model/nr-rlc-am.cc
 +++ b/model/nr-rlc-am.cc
-@@ -113,6 +113,13 @@ NrRlcAm::GetTypeId()
+@@ -15,6 +15,9 @@
+ #include "ns3/log.h"
+ #include "ns3/simulator.h"
+ 
++#include <algorithm>
++#include <limits>
++
+ namespace ns3
+ {
+ 
+@@ -102,9 +105,8 @@ NrRlcAm::GetTypeId()
+                 MakeTimeAccessor(&NrRlcAm::m_bsrTimerValue),
+                 MakeTimeChecker())
+             .AddAttribute("TxOpportunityForRetxAlwaysBigEnough",
+-                          "If true, always pretend that the size of a TxOpportunity is big enough "
+-                          "for retransmission. If false (default and realistic behavior), no retx "
+-                          "is performed unless the corresponding TxOpportunity is big enough.",
++                          "Deprecated compatibility setting. Retransmissions always segment to fit "
++                          "the actual opportunity; this flag no longer permits oversized PDUs.",
+                           BooleanValue(false),
+                           MakeBooleanAccessor(&NrRlcAm::m_txOpportunityForRetxAlwaysBigEnough),
+                           MakeBooleanChecker())
+@@ -113,6 +115,12 @@ NrRlcAm::GetTypeId()
                            "configured, the buffer is unlimited.",
                            UintegerValue(10 * 1024),
                            MakeUintegerAccessor(&NrRlcAm::m_maxTxBufferSize),
 +                          MakeUintegerChecker<uint32_t>())
 +            .AddAttribute("MaxDataFieldBytes",
 +                          "Maximum payload bytes in a new AMD PDU. Zero disables the cap; a "
-+                          "cap helps when grants shrink and retransmission resegmentation "
-+                          "is unavailable.",
++                          "cap bounds initial segmentation; retransmissions always fit their grant.",
 +                          UintegerValue(0),
 +                          MakeUintegerAccessor(&NrRlcAm::m_maxDataFieldBytes),
                            MakeUintegerChecker<uint32_t>());
      return tid;
  }
-@@ -263,7 +270,8 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+@@ -182,12 +190,278 @@ NrRlcAm::DoTransmitPdcpPdu(Ptr<Packet> p)
+  * MAC SAP
+  */
+ 
++Ptr<Packet>
++NrRlcAm::MakeFragment(Ptr<const Packet> original, uint32_t begin, uint32_t end, bool poll) const
++{
++    auto payload = original->Copy();
++    NrRlcAmHeader source;
++    payload->RemoveHeader(source);
++    NS_ASSERT(begin < end && end <= payload->GetSize() && begin <= 0x7fff);
++    std::set<uint32_t> boundaries;
++    if (!(source.GetFramingInfo() & NrRlcAmHeader::NO_FIRST_BYTE))
++    {
++        boundaries.insert(0);
++    }
++    uint32_t offset = 0;
++    while (source.PopExtensionBit() == NrRlcAmHeader::E_LI_FIELDS_FOLLOWS)
++    {
++        offset += source.PopLengthIndicator();
++        boundaries.insert(offset);
++    }
++    if (!(source.GetFramingInfo() & NrRlcAmHeader::NO_LAST_BYTE))
++    {
++        boundaries.insert(payload->GetSize());
++    }
++    NrRlcAmHeader header;
++    header.SetDataPdu();
++    header.SetSequenceNumber(source.GetSequenceNumber());
++    header.SetResegmentationFlag(begin == 0 && end == payload->GetSize()
++                                    ? NrRlcAmHeader::PDU : NrRlcAmHeader::SEGMENT);
++    header.SetSegmentOffset(begin);
++    header.SetLastSegmentFlag(end == payload->GetSize());
++    header.SetPollingBit(poll);
++    header.SetFramingInfo((boundaries.contains(begin) ? 0 : NrRlcAmHeader::NO_FIRST_BYTE) |
++                         (boundaries.contains(end) ? 0 : NrRlcAmHeader::NO_LAST_BYTE));
++    uint32_t previous = begin;
++    for (auto boundary : boundaries)
++    {
++        if (begin < boundary && boundary < end)
++        {
++            header.PushExtensionBit(NrRlcAmHeader::E_LI_FIELDS_FOLLOWS);
++            header.PushLengthIndicator(boundary - previous);
++            previous = boundary;
++        }
++    }
++    header.PushExtensionBit(NrRlcAmHeader::DATA_FIELD_FOLLOWS);
++    auto result = payload->CreateFragment(begin, end - begin);
++    result->AddHeader(header);
++    NrRlcTag tag(Simulator::Now());
++    tag.SetTxEntityId(m_rlcEntityId);
++    result->AddByteTag(tag, 1, header.GetSerializedSize());
++    return result;
++}
++
++void
++NrRlcAm::QueueRetransmission(uint16_t sn, const std::vector<ByteRange>& ranges)
++{
++    auto& pending = m_retxBuffer.at(sn);
++    auto& awaiting = m_txedBuffer.at(sn);
++    auto original = pending.m_pdu ? pending.m_pdu : awaiting.m_pdu;
++    if (!original)
++    {
++        return; // A late NACK cannot resurrect an acknowledged sequence number.
++    }
++    auto payload = original->Copy();
++    NrRlcAmHeader header;
++    payload->RemoveHeader(header);
++    std::vector<ByteRange> requested;
++    for (auto [begin, end] : ranges)
++    {
++        end = std::min(end, payload->GetSize());
++        if (begin < end)
++        {
++            requested.emplace_back(begin, end);
++        }
++    }
++    if (requested.empty())
++    {
++        return;
++    }
++    if (!pending.m_pdu)
++    {
++        pending = awaiting;
++        awaiting = {};
++        m_txedBufferSize -= original->GetSize();
++        m_retxBufferSize += original->GetSize();
++        if (pending.m_retransmitted)
++        {
++            ++pending.m_retxCount;
++        }
++        pending.m_retransmitted = true;
++        if (pending.m_retxCount >= m_maxRetxThreshold && !m_maxRetxReachedNotified &&
++            !m_maxRetxReachedCallback.IsNull())
++        {
++            m_maxRetxReachedNotified = true;
++            auto callback = m_maxRetxReachedCallback;
++            Simulator::ScheduleNow([callback]() { callback(); });
++        }
++    }
++    requested.insert(requested.end(), pending.m_pending.begin(), pending.m_pending.end());
++    std::sort(requested.begin(), requested.end());
++    pending.m_pending.clear();
++    for (const auto& range : requested)
++    {
++        if (!pending.m_pending.empty() && range.first <= pending.m_pending.back().second)
++        {
++            pending.m_pending.back().second = std::max(pending.m_pending.back().second, range.second);
++        }
++        else
++        {
++            pending.m_pending.push_back(range);
++        }
++    }
++}
++
++std::vector<NrRlcAm::ByteRange>
++NrRlcAm::GetMissingRanges(uint16_t sn) const
++{
++    auto found = m_rxonBuffer.find(sn);
++    if (found == m_rxonBuffer.end())
++    {
++        return {{0, 32768}};
++    }
++    const auto& received = found->second;
++    if (received.m_pduComplete)
++    {
++        return {};
++    }
++    std::vector<ByteRange> result;
++    uint32_t next = 0;
++    for (const auto& [offset, payload] : received.m_fragments)
++    {
++        if (next < offset)
++        {
++            result.emplace_back(next, offset);
++        }
++        next = offset + payload->GetSize();
++    }
++    const uint32_t end = received.m_end.value_or(32768);
++    if (next < end)
++    {
++        result.emplace_back(next, end);
++    }
++    return result;
++}
++
++bool
++NrRlcAm::ReceiveSegment(Ptr<Packet> packet, const NrRlcAmHeader& header)
++{
++    auto payload = packet->Copy();
++    NrRlcAmHeader parsed;
++    payload->RemoveHeader(parsed);
++    const bool segmented = header.GetResegmentationFlag() == NrRlcAmHeader::SEGMENT;
++    const uint32_t begin = segmented ? header.GetSegmentOffset() : 0;
++    const uint32_t end = begin + payload->GetSize();
++    const bool last = !segmented || header.GetLastSegmentFlag();
++    if (payload->GetSize() == 0 || end > 32768)
++    {
++        return false;
++    }
++    std::set<uint32_t> boundaries;
++    uint32_t offset = begin;
++    while (parsed.PopExtensionBit() == NrRlcAmHeader::E_LI_FIELDS_FOLLOWS)
++    {
++        const uint32_t length = parsed.PopLengthIndicator();
++        offset += length;
++        if (length == 0 || offset >= end)
++        {
++            return false;
++        }
++        boundaries.insert(offset);
++    }
++    if (!(header.GetFramingInfo() & NrRlcAmHeader::NO_FIRST_BYTE))
++    {
++        boundaries.insert(begin);
++    }
++    if (!(header.GetFramingInfo() & NrRlcAmHeader::NO_LAST_BYTE))
++    {
++        boundaries.insert(end);
++    }
++    auto& received = m_rxonBuffer[header.GetSequenceNumber().GetValue()];
++    if (received.m_pduComplete || (received.m_end &&
++        (end > *received.m_end || (last && end != *received.m_end))))
++    {
++        return false;
++    }
++    if (last && !received.m_fragments.empty())
++    {
++        auto tail = received.m_fragments.rbegin();
++        if (tail->first + tail->second->GetSize() > end)
++        {
++            return false;
++        }
++    }
++    received.m_seqNumber = header.GetSequenceNumber();
++    if (last)
++    {
++        received.m_end = end;
++    }
++    if (begin == 0)
++    {
++        received.m_firstByte = !(header.GetFramingInfo() & NrRlcAmHeader::NO_FIRST_BYTE);
++    }
++    received.m_boundaries.insert(boundaries.begin(), boundaries.end());
++    std::vector<ByteRange> newRanges;
++    uint32_t cursor = begin;
++    for (const auto& [start, part] : received.m_fragments)
++    {
++        if (start >= end)
++        {
++            break;
++        }
++        if (start > cursor)
++        {
++            newRanges.emplace_back(cursor, start);
++        }
++        cursor = std::max(cursor, start + part->GetSize());
++    }
++    if (cursor < end)
++    {
++        newRanges.emplace_back(cursor, end);
++    }
++    for (const auto& [start, stop] : newRanges)
++    {
++        received.m_fragments.emplace(start, payload->CreateFragment(start - begin, stop - start));
++    }
++    if (!received.m_end || !GetMissingRanges(header.GetSequenceNumber().GetValue()).empty())
++    {
++        return !newRanges.empty();
++    }
++    auto complete = Create<Packet>();
++    for (const auto& [start, part] : received.m_fragments)
++    {
++        complete->AddAtEnd(part);
++    }
++    NrRlcAmHeader assembled;
++    assembled.SetDataPdu();
++    assembled.SetSequenceNumber(header.GetSequenceNumber());
++    assembled.SetResegmentationFlag(NrRlcAmHeader::PDU);
++    assembled.SetSegmentOffset(0);
++    assembled.SetLastSegmentFlag(NrRlcAmHeader::LAST_PDU_SEGMENT);
++    assembled.SetPollingBit(header.GetPollingBit());
++    assembled.SetFramingInfo((received.m_firstByte ? 0 : NrRlcAmHeader::NO_FIRST_BYTE) |
++                            (received.m_boundaries.contains(*received.m_end)
++                                 ? 0 : NrRlcAmHeader::NO_LAST_BYTE));
++    uint32_t previous = 0;
++    for (auto boundary : received.m_boundaries)
++    {
++        if (boundary > 0 && boundary < *received.m_end)
++        {
++            assembled.PushExtensionBit(NrRlcAmHeader::E_LI_FIELDS_FOLLOWS);
++            assembled.PushLengthIndicator(boundary - previous);
++            previous = boundary;
++        }
++    }
++    assembled.PushExtensionBit(NrRlcAmHeader::DATA_FIELD_FOLLOWS);
++    complete->AddHeader(assembled);
++    // The reconstructed header must retain the receive-side entity/timing tag.
++    // Payload slices no longer contain the individual segment header tags.
++    NrRlcTag tag;
++    const bool tagged = packet->FindFirstMatchingByteTag(tag);
++    NS_ASSERT_MSG(tagged, "Received AM segment has no RLC tag");
++    complete->AddByteTag(tag, 1, assembled.GetSerializedSize());
++    received.m_byteSegments = {complete};
++    received.m_pduComplete = true;
++    received.m_fragments.clear();
++    return true;
++}
++
+ void
+ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+ {
+     NS_LOG_FUNCTION(this << m_rnti << (uint32_t)m_lcid << txOpParams.bytes);
+ 
+-    if (txOpParams.bytes < 4)
++    if (txOpParams.bytes < 2)
+     {
+         // Stingy MAC: In general, we need more bytes.
+         // There are a more restrictive test for each particular case
+@@ -226,18 +500,36 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+         sn.SetModulusBase(m_vrR);
+         for (sn = m_vrR; sn < m_vrMs; sn++)
+         {
+-            NS_LOG_LOGIC("SN = " << sn);
+-            if (!rlcAmHeader.OneMoreNackWouldFitIn(txOpParams.bytes))
++            auto missing = GetMissingRanges(sn.GetValue());
++            if (missing.empty())
++            {
++                continue;
++            }
++            auto candidate = rlcAmHeader;
++            bool fits = m_rxonBuffer.contains(sn.GetValue());
++            for (const auto& [begin, end] : missing)
++            {
++                if (!fits || !candidate.OneMoreNackWouldFitIn(txOpParams.bytes, true))
++                {
++                    fits = false;
++                    break;
++                }
++                candidate.PushNack(sn.GetValue(), begin, end == 32768 ? 0x7fff : end - 1);
++            }
++            if (fits)
+             {
+-                NS_LOG_LOGIC("Can't fit more NACKs in STATUS PDU");
+-                break;
++                rlcAmHeader = candidate;
+             }
+-            auto pduIt = m_rxonBuffer.find(sn.GetValue());
+-            if (pduIt == m_rxonBuffer.end() || (!(pduIt->second.m_pduComplete)))
++            else if (rlcAmHeader.OneMoreNackWouldFitIn(txOpParams.bytes))
+             {
+-                NS_LOG_LOGIC("adding NACK_SN " << sn.GetValue());
++                // Report a whole SN if its complete set of holes cannot fit.
++                // Sending only some holes would falsely acknowledge the rest.
+                 rlcAmHeader.PushNack(sn.GetValue());
+             }
++            else
++            {
++                break; // ACK_SN must not advance past an unreported missing SN.
++            }
+         }
+         NS_LOG_LOGIC("SN at end of NACK loop = " << sn);
+         // 3GPP TS 36.322 section 6.2.2.1.4 ACK SN
+@@ -263,7 +555,8 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
          NrRlcTag rlcTag(Simulator::Now());
          rlcTag.SetTxEntityId(m_rlcEntityId);
          packet->AddByteTag(rlcTag, 1, rlcAmHeader.GetSerializedSize());
@@ -289,24 +1620,230 @@ index 35eee58..c45160a 100644
  
          // Send RLC PDU to MAC layer
          NrMacSapProvider::TransmitPduParameters params;
-@@ -360,7 +368,8 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
- 
-                     NS_LOG_LOGIC("new AM RLC header: " << rlcAmHeader);
- 
+@@ -285,148 +578,82 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+     }
+     else if (m_retxBufferSize > 0)
+     {
+-        NS_LOG_LOGIC("retxBufferSize = " << m_retxBufferSize);
+-        NS_LOG_LOGIC("Sending data from Retransmission Buffer");
+-        NS_ASSERT(m_vtA < m_vtS);
+-        bool anyRetxPduFound = false;
+-        nr::SequenceNumber10 sn;
++        nr::SequenceNumber10 sn = m_vtA;
+         sn.SetModulusBase(m_vtA);
+-        for (sn = m_vtA; sn < m_vtS; sn++)
++        for (; sn < m_vtS; sn++)
+         {
+-            uint16_t seqNumberValue = sn.GetValue();
+-            NS_LOG_LOGIC("SN = " << seqNumberValue << " m_pdu "
+-                                 << m_retxBuffer.at(seqNumberValue).m_pdu);
+-
+-            if (m_retxBuffer.at(seqNumberValue).m_pdu)
++            auto& entry = m_retxBuffer.at(sn.GetValue());
++            if (!entry.m_pdu || entry.m_pending.empty())
+             {
+-                anyRetxPduFound = true;
+-                Ptr<Packet> packet = m_retxBuffer.at(seqNumberValue).m_pdu->Copy();
+-
+-                if ((packet->GetSize() <= txOpParams.bytes) ||
+-                    m_txOpportunityForRetxAlwaysBigEnough)
++                continue;
++            }
++            auto [begin, end] = entry.m_pending.front();
++            // Header length depends on crossed SDU boundaries. Binary search
++            // the payload endpoint using the actual serialized fragment size.
++            uint32_t low = begin + 1;
++            uint32_t high = std::min(end, begin + txOpParams.bytes);
++            Ptr<Packet> packet;
++            uint32_t sentEnd = begin;
++            while (low <= high)
++            {
++                uint32_t candidate = low + (high - low) / 2;
++                auto fragment = MakeFragment(entry.m_pdu, begin, candidate, false);
++                if (fragment->GetSize() <= txOpParams.bytes)
+                 {
+-                    // According to 5.2.1, the data field is left as is, but we rebuild the header
+-                    NrRlcAmHeader rlcAmHeader;
+-                    packet->RemoveHeader(rlcAmHeader);
+-                    NS_LOG_LOGIC("old AM RLC header: " << rlcAmHeader);
+-
+-                    // Calculate the Polling Bit (5.2.2.1)
+-                    rlcAmHeader.SetPollingBit(NrRlcAmHeader::STATUS_REPORT_NOT_REQUESTED);
+-
+-                    NS_LOG_LOGIC("polling conditions: m_txonBuffer.empty="
+-                                 << m_txonBuffer.empty() << " retxBufferSize=" << m_retxBufferSize
+-                                 << " packet->GetSize ()=" << packet->GetSize());
+-                    if (((m_txonBuffer.empty()) &&
+-                         (m_retxBufferSize ==
+-                          packet->GetSize() + rlcAmHeader.GetSerializedSize())) ||
+-                        (m_vtS >= m_vtMs) || m_pollRetransmitTimerJustExpired)
+-                    {
+-                        m_pollRetransmitTimerJustExpired = false;
+-                        rlcAmHeader.SetPollingBit(NrRlcAmHeader::STATUS_REPORT_IS_REQUESTED);
+-                        m_pduWithoutPoll = 0;
+-                        m_byteWithoutPoll = 0;
+-
+-                        m_pollSn = m_vtS - 1;
+-                        NS_LOG_LOGIC("New POLL_SN = " << m_pollSn);
+-
+-                        if (!m_pollRetransmitTimer.IsPending())
+-                        {
+-                            NS_LOG_LOGIC("Start PollRetransmit timer");
+-
+-                            m_pollRetransmitTimer =
+-                                Simulator::Schedule(m_pollRetransmitTimerValue,
+-                                                    &NrRlcAm::ExpirePollRetransmitTimer,
+-                                                    this);
+-                        }
+-                        else
+-                        {
+-                            NS_LOG_LOGIC("Restart PollRetransmit timer");
+-
+-                            m_pollRetransmitTimer.Cancel();
+-                            m_pollRetransmitTimer =
+-                                Simulator::Schedule(m_pollRetransmitTimerValue,
+-                                                    &NrRlcAm::ExpirePollRetransmitTimer,
+-                                                    this);
+-                        }
+-                    }
+-
+-                    packet->AddHeader(rlcAmHeader);
+-
+-                    NrRlcTag rlcTag;
+-                    rlcTag.SetSenderTimestamp(Simulator::Now());
+-                    rlcTag.SetTxEntityId(m_rlcEntityId);
+-
+-                    packet->AddByteTag(rlcTag, 1, rlcAmHeader.GetSerializedSize());
+-
+-                    NS_LOG_LOGIC("new AM RLC header: " << rlcAmHeader);
+-
 -                    m_txPdu(m_rnti, m_lcid, packet->GetSize());
-+                    m_txPduPacket(m_rnti, m_lcid, packet);
-+    m_txPdu(m_rnti, m_lcid, packet->GetSize());
- 
-                     // Send RLC PDU to MAC layer
-                     NrMacSapProvider::TransmitPduParameters params;
-@@ -466,7 +475,14 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+-
+-                    // Send RLC PDU to MAC layer
+-                    NrMacSapProvider::TransmitPduParameters params;
+-                    params.pdu = packet;
+-                    params.rnti = m_rnti;
+-                    params.lcid = m_lcid;
+-                    params.layer = txOpParams.layer;
+-                    params.harqProcessId = txOpParams.harqId;
+-                    params.componentCarrierId = txOpParams.componentCarrierId;
+-
+-                    m_macSapProvider->TransmitPdu(params);
+-
+-                    m_retxBuffer.at(seqNumberValue).m_retxCount++;
+-                    m_retxBuffer.at(seqNumberValue).m_waitingSince = Simulator::Now();
+-                    NS_LOG_INFO("Incr RETX_COUNT for SN = " << seqNumberValue);
+-                    if (m_retxBuffer.at(seqNumberValue).m_retxCount >= m_maxRetxThreshold)
+-                    {
+-                        NS_LOG_INFO("Max RETX_COUNT for SN = " << seqNumberValue);
+-                        // TS 38.331 5.3.10.3: reaching maxRetxThreshold on an AM RLC
+-                        // entity is a radio-link-failure trigger. Raise the indication
+-                        // once (the RRC decides whether to act on it). Without this the
+-                        // PDU is simply requeued and retransmitted indefinitely, so an
+-                        // undeliverable uplink (e.g. a lost RrcConnectionReconfiguration
+-                        // Complete on a degraded link) never fails and the peer can stay
+-                        // stuck awaiting it.
+-                        if (!m_maxRetxReachedNotified && !m_maxRetxReachedCallback.IsNull())
+-                        {
+-                            m_maxRetxReachedNotified = true;
+-                            m_maxRetxReachedCallback();
+-                        }
+-                    }
+-
+-                    NS_LOG_INFO("Move SN = " << seqNumberValue << " back to txedBuffer");
+-                    m_txedBuffer.at(seqNumberValue).m_pdu =
+-                        m_retxBuffer.at(seqNumberValue).m_pdu->Copy();
+-                    m_txedBuffer.at(seqNumberValue).m_retxCount =
+-                        m_retxBuffer.at(seqNumberValue).m_retxCount;
+-                    m_txedBuffer.at(seqNumberValue).m_waitingSince =
+-                        m_retxBuffer.at(seqNumberValue).m_waitingSince;
+-                    m_txedBufferSize += m_txedBuffer.at(seqNumberValue).m_pdu->GetSize();
+-
+-                    m_retxBufferSize -= m_retxBuffer.at(seqNumberValue).m_pdu->GetSize();
+-                    m_retxBuffer.at(seqNumberValue).m_pdu = nullptr;
+-                    m_retxBuffer.at(seqNumberValue).m_retxCount = 0;
+-                    m_retxBuffer.at(seqNumberValue).m_waitingSince = MilliSeconds(0);
+-
+-                    NS_LOG_LOGIC("retxBufferSize = " << m_retxBufferSize);
+-
+-                    return;
++                    packet = fragment;
++                    sentEnd = candidate;
++                    low = candidate + 1;
+                 }
+                 else
+                 {
+-                    // This PDU does not fit; a later NACKed SN might (AM PDUs are
+-                    // not re-segmented, so PDU sizes vary). Do not let one oversized
+-                    // PDU head-of-line block every other pending retransmission.
+-                    NS_LOG_LOGIC("TxOpportunity (size = "
+-                                 << txOpParams.bytes
+-                                 << ") too small for retransmission of the packet (size = "
+-                                 << packet->GetSize() << "); trying the next NACKed SN");
++                    high = candidate - 1;
+                 }
+             }
++            if (!packet)
++            {
++                continue; // The grant cannot carry even one byte plus its header.
++            }
++            entry.m_pending.front().first = sentEnd;
++            if (sentEnd == end)
++            {
++                entry.m_pending.erase(entry.m_pending.begin());
++            }
++            const bool poll = m_pollRetransmitTimerJustExpired ||
++                              (m_txonBuffer.empty() && entry.m_pending.empty() &&
++                               m_retxBufferSize == entry.m_pdu->GetSize()) ||
++                              m_vtS >= m_vtMs;
++            if (poll)
++            {
++                packet = MakeFragment(entry.m_pdu, begin, sentEnd, true);
++                m_pollRetransmitTimerJustExpired = false;
++                m_pollSn = m_vtS - 1;
++                m_pduWithoutPoll = 0;
++                m_byteWithoutPoll = 0;
++                m_pollRetransmitTimer.Cancel();
++                m_pollRetransmitTimer = Simulator::Schedule(m_pollRetransmitTimerValue,
++                                                           &NrRlcAm::ExpirePollRetransmitTimer, this);
++            }
++            if (entry.m_pending.empty())
++            {
++                entry.m_waitingSince = Simulator::Now();
++                m_txedBuffer.at(sn.GetValue()) = entry;
++                m_txedBufferSize += entry.m_pdu->GetSize();
++                m_retxBufferSize -= entry.m_pdu->GetSize();
++                entry = {};
++            }
++            m_txPduPacket(m_rnti, m_lcid, packet);
++            m_txPdu(m_rnti, m_lcid, packet->GetSize());
++            NrMacSapProvider::TransmitPduParameters params;
++            params.pdu = packet;
++            params.rnti = m_rnti;
++            params.lcid = m_lcid;
++            params.layer = txOpParams.layer;
++            params.harqProcessId = txOpParams.harqId;
++            params.componentCarrierId = txOpParams.componentCarrierId;
++            m_macSapProvider->TransmitPdu(params);
++            DoTransmitBufferStatusReport();
++            return;
+         }
+-        NS_ABORT_MSG_UNLESS(anyRetxPduFound,
+-                            "m_retxBufferSize > 0, but no PDU considered for retx found");
+-        NS_LOG_LOGIC("No pending retransmission fits in this TxOpportunity ("
+-                     << txOpParams.bytes << " bytes); waiting for a bigger one");
+         return;
+     }
+     else if (m_txonBufferSize > 0)
+@@ -466,7 +693,14 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
      rlcAmHeader.SetDataPdu();
  
      // Build Data field
+-    uint32_t nextSegmentSize = txOpParams.bytes - 4;
 +    // A PDU built for a large grant cannot be retransmitted once the uplink
 +    // MCS falls and later grants are smaller. One such SN then blocks delivery
 +    // for the rest of the connection. Stay within a size later grants can carry.
-     uint32_t nextSegmentSize = txOpParams.bytes - 4;
++    uint32_t nextSegmentSize = std::min(txOpParams.bytes - 4, uint32_t{32768});
 +    if (m_maxDataFieldBytes > 0 && nextSegmentSize > m_maxDataFieldBytes)
 +    {
 +        nextSegmentSize = m_maxDataFieldBytes;
@@ -314,7 +1851,12 @@ index 35eee58..c45160a 100644
      uint32_t nextSegmentId = 1;
      uint32_t dataFieldAddedSize = 0;
      std::vector<Ptr<Packet>> dataField;
-@@ -768,6 +784,7 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+@@ -764,10 +998,12 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+     // Store new PDU into the Transmitted PDU Buffer
+     NS_LOG_LOGIC("Put transmitted PDU in the txedBuffer");
+     m_txedBufferSize += packet->GetSize();
++    m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()) = {};
+     m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()).m_pdu = packet->Copy();
      m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()).m_retxCount = 0;
      m_txedBuffer.at(rlcAmHeader.GetSequenceNumber().GetValue()).m_waitingSince = Simulator::Now();
  
@@ -322,7 +1864,20 @@ index 35eee58..c45160a 100644
      m_txPdu(m_rnti, m_lcid, packet->GetSize());
  
      // Send RLC PDU to MAC layer
-@@ -815,6 +832,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -795,7 +1031,11 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+ 
+     // Get RLC header parameters
+     NrRlcAmHeader rlcAmHeader;
+-    rxPduParams.p->PeekHeader(rlcAmHeader);
++    if (rxPduParams.p->PeekHeader(rlcAmHeader) == 0)
++    {
++        NS_LOG_WARN("Discarding malformed AM RLC header");
++        return;
++    }
+     NS_LOG_LOGIC("RLC header: " << rlcAmHeader);
+ 
+     // Receiver timestamp
+@@ -815,6 +1055,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
  
      delay = Simulator::Now() - rlcTag.GetSenderTimestamp();
  
@@ -330,11 +1885,245 @@ index 35eee58..c45160a 100644
      m_rxPdu(m_rnti, m_lcid, rxPduParams.p->GetSize(), delay.GetNanoSeconds());
  
      if (rlcAmHeader.IsDataPdu())
+@@ -932,24 +1173,9 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+         }
+         else
+         {
+-            // - if some byte segments of the AMD PDU contained in the RLC data PDU have been
+-            // received before:
+-            //         - discard the duplicate byte segments.
+-            // note: re-segmentation of AMD PDU is currently not supported,
+-            // so we just check that the segment was not received before
+-            auto it = m_rxonBuffer.find(seqNumber.GetValue());
+-            if (it != m_rxonBuffer.end())
++            if (!ReceiveSegment(rxPduParams.p, rlcAmHeader))
+             {
+-                NS_ASSERT(!it->second.m_byteSegments.empty());
+-                NS_ASSERT_MSG(it->second.m_byteSegments.size() == 1,
+-                              "re-segmentation not supported");
+-                NS_LOG_LOGIC("PDU segment already received, discarded");
+-            }
+-            else
+-            {
+-                NS_LOG_LOGIC("Place PDU in the reception buffer ( SN = " << seqNumber << " )");
+-                m_rxonBuffer[seqNumber.GetValue()].m_byteSegments.push_back(rxPduParams.p);
+-                m_rxonBuffer[seqNumber.GetValue()].m_pduComplete = true;
++                return;
+             }
+         }
+ 
+@@ -1130,24 +1356,19 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+ 
+                 incrementVtA = false;
+ 
+-                if (m_txedBuffer.at(seqNumberValue).m_pdu)
++                std::vector<ByteRange> ranges;
++                for (const auto& nack : rlcAmHeader.GetNacks())
+                 {
+-                    NS_LOG_INFO("Move SN = " << seqNumberValue << " to retxBuffer");
+-                    m_retxBuffer.at(seqNumberValue).m_pdu =
+-                        m_txedBuffer.at(seqNumberValue).m_pdu->Copy();
+-                    m_retxBuffer.at(seqNumberValue).m_retxCount =
+-                        m_txedBuffer.at(seqNumberValue).m_retxCount;
+-                    m_retxBuffer.at(seqNumberValue).m_waitingSince =
+-                        m_txedBuffer.at(seqNumberValue).m_waitingSince;
+-                    m_retxBufferSize += m_retxBuffer.at(seqNumberValue).m_pdu->GetSize();
+-
+-                    m_txedBufferSize -= m_txedBuffer.at(seqNumberValue).m_pdu->GetSize();
+-                    m_txedBuffer.at(seqNumberValue).m_pdu = nullptr;
+-                    m_txedBuffer.at(seqNumberValue).m_retxCount = 0;
+-                    m_txedBuffer.at(seqNumberValue).m_waitingSince = MilliSeconds(0);
++                    if (nack.sn == seqNumberValue)
++                    {
++                        ranges.emplace_back(nack.segmented ? nack.start : 0,
++                                            !nack.segmented || nack.end == 0x7fff
++                                                ? 32768 : uint32_t{nack.end} + 1);
++                    }
+                 }
+-
+-                NS_ASSERT(m_retxBuffer.at(seqNumberValue).m_pdu);
++                QueueRetransmission(seqNumberValue, ranges);
++                NS_ASSERT(m_retxBuffer.at(seqNumberValue).m_pdu ||
++                          m_txedBuffer.at(seqNumberValue).m_pdu);
+             }
+             else
+             {
+@@ -1191,6 +1412,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+ 
+         } // loop over SN : VT(A) <= SN < ACK SN
+ 
++        DoTransmitBufferStatusReport();
+         return;
+     }
+     else
+@@ -1370,7 +1592,19 @@ NrRlcAm::DoTransmitBufferStatusReport()
+     r.lcid = m_lcid;
+     r.txQueueSize = m_txonBufferSize;
+     r.txQueueHolDelay = txonQueueHolDelay.GetMilliSeconds();
+-    r.retxQueueSize = m_retxBufferSize + m_txedBufferSize;
++    // Retained originals awaiting feedback are not bytes ready to transmit.
++    // Advertise pending ranges and their actual headers, not retained copies.
++    for (auto sn = m_vtA; sn < m_vtS; sn++)
++    {
++        const auto& entry = m_retxBuffer.at(sn.GetValue());
++        if (entry.m_pdu)
++        {
++            for (const auto& [begin, end] : entry.m_pending)
++            {
++                r.retxQueueSize += MakeFragment(entry.m_pdu, begin, end, false)->GetSize();
++            }
++        }
++    }
+     r.retxQueueHolDelay = retxQueueHolDelay.GetMilliSeconds();
+ 
+     if (m_statusPduRequested && !m_statusProhibitTimer.IsPending())
+@@ -1382,17 +1616,8 @@ NrRlcAm::DoTransmitBufferStatusReport()
+         r.statusPduSize = 0;
+     }
+ 
+-    if (r.txQueueSize != 0 || r.retxQueueSize != 0 || r.statusPduSize != 0)
+-    {
+-        NS_LOG_INFO("Send BufferStatusReport: " << r.txQueueSize << ", " << r.txQueueHolDelay
+-                                                << ", " << r.retxQueueSize << ", "
+-                                                << r.retxQueueHolDelay << ", " << r.statusPduSize);
+-        m_macSapProvider->BufferStatusReport(r);
+-    }
+-    else
+-    {
+-        NS_LOG_INFO("BufferStatusReport don't needed");
+-    }
++    // Zero reports clear stale scheduler demand after ACK or queue drain.
++    m_macSapProvider->BufferStatusReport(r);
+ }
+ 
+ void
+@@ -1467,21 +1692,9 @@ NrRlcAm::ExpirePollRetransmitTimer()
+                                                                           << " to retxBuffer");
+         for (nr::SequenceNumber10 sn = m_vtA; sn < m_vtS; sn++)
+         {
+-            bool pduAvailable = (bool)m_txedBuffer.at(sn.GetValue()).m_pdu;
+-
+-            if (pduAvailable)
++            if (m_txedBuffer.at(sn.GetValue()).m_pdu)
+             {
+-                uint16_t snValue = sn.GetValue();
+-                NS_LOG_INFO("Move PDU " << sn << " from txedBuffer to retxBuffer");
+-                m_retxBuffer.at(snValue).m_pdu = m_txedBuffer.at(snValue).m_pdu->Copy();
+-                m_retxBuffer.at(snValue).m_retxCount = m_txedBuffer.at(snValue).m_retxCount;
+-                m_retxBuffer.at(snValue).m_waitingSince = m_txedBuffer.at(snValue).m_waitingSince;
+-                m_retxBufferSize += m_retxBuffer.at(snValue).m_pdu->GetSize();
+-
+-                m_txedBufferSize -= m_txedBuffer.at(snValue).m_pdu->GetSize();
+-                m_txedBuffer.at(snValue).m_pdu = nullptr;
+-                m_txedBuffer.at(snValue).m_retxCount = 0;
+-                m_txedBuffer.at(snValue).m_waitingSince = MilliSeconds(0);
++                QueueRetransmission(sn.GetValue(), {{0, 32768}});
+             }
+         }
+     }
+@@ -1493,6 +1706,10 @@ void
+ NrRlcAm::ExpireStatusProhibitTimer()
+ {
+     NS_LOG_FUNCTION(this);
++    if (m_statusPduRequested)
++    {
++        DoTransmitBufferStatusReport();
++    }
+ }
+ 
+ void
 diff --git a/model/nr-rlc-am.h b/model/nr-rlc-am.h
-index 1c78e82..4570661 100644
+index 1c78e82..f8655bf 100644
 --- a/model/nr-rlc-am.h
 +++ b/model/nr-rlc-am.h
-@@ -207,6 +207,7 @@ class NR_EXPORT NrRlcAm : public NrRlc
+@@ -8,12 +8,15 @@
+ #define NR_RLC_AM_H
+ 
+ #include "nr-rlc-sequence-number.h"
++#include "nr-rlc-am-header.h"
+ #include "nr-rlc.h"
+ 
+ #include "ns3/event-id.h"
+ #include "ns3/nr-export.h"
+ 
+ #include <map>
++#include <set>
++#include <optional>
+ #include <vector>
+ 
+ namespace ns3
+@@ -97,11 +100,45 @@ class NR_EXPORT NrRlcAm : public NrRlc
+      */
+     void DoTransmitBufferStatusReport();
+ 
++    /// Half-open byte range within the original AMD data field.
++    using ByteRange = std::pair<uint32_t, uint32_t>;
++    /**
++     * Construct a data-field fragment, preserving original SDU boundaries.
++     * @param original Canonical AMD PDU
++     * @param begin First payload byte
++     * @param end One past the last payload byte
++     * @param poll Whether to request STATUS
++     * @return An AMD PDU segment with absolute offsets
++     */
++    Ptr<Packet> MakeFragment(Ptr<const Packet> original, uint32_t begin, uint32_t end,
++                             bool poll) const;
++    /**
++     * Merge pending retransmission intervals and account for one recovery round.
++     * @param sn Original PDU sequence number
++     * @param ranges Missing payload intervals
++     */
++    void QueueRetransmission(uint16_t sn, const std::vector<ByteRange>& ranges);
++    /**
++     * Insert a received segment and reconstruct a complete AMD PDU if possible.
++     * @param packet Received AMD PDU or segment
++     * @param header Parsed header
++     * @return Whether new payload bytes were accepted
++     */
++    bool ReceiveSegment(Ptr<Packet> packet, const NrRlcAmHeader& header);
++    /**
++     * Find missing intervals, with 32768 representing an unknown tail.
++     * @param sn Original sequence number
++     * @return Missing intervals in ascending order
++     */
++    std::vector<ByteRange> GetMissingRanges(uint16_t sn) const;
++
+   private:
+     /// Grant the STATUS PDU robustness test access to private transmit window state
+     friend class NrRlcAmStaleStatusTestCase;
+     /// Grant the reassembly resynchronisation regression test access to private reassembly state
+     friend class NrRlcAmReassemblyResyncTestCase;
++    /// Grant the byte-range ARQ regression access to window and accounting invariants.
++    friend class NrRlcAmResegmentationTestCase;
+ 
+     /**
+      * @brief Store an incoming (from layer above us) PDU, waiting to transmit it
+@@ -131,8 +168,10 @@ class NR_EXPORT NrRlcAm : public NrRlc
+     struct NR_EXPORT RetxPdu
+     {
+         Ptr<Packet> m_pdu;    ///< PDU
+-        uint16_t m_retxCount; ///< retransmit count
++        uint16_t m_retxCount{0}; ///< Retransmission rounds, never individual fragments
+         Time m_waitingSince;  ///< Layer arrival time
++        std::vector<ByteRange> m_pending; ///< Unsent intervals in this recovery round
++        bool m_retransmitted{false}; ///< Whether a recovery round has started
+     };
+ 
+     std::vector<RetxPdu> m_txedBuffer; ///< Buffer for transmitted and retransmitted PDUs
+@@ -154,7 +193,11 @@ class NR_EXPORT NrRlcAm : public NrRlc
+         nr::SequenceNumber10 m_seqNumber;      ///< sequence number
+         std::list<Ptr<Packet>> m_byteSegments; ///< byte segments
+ 
+-        bool m_pduComplete; ///< PDU complete?
++        bool m_pduComplete{false}; ///< PDU complete?
++        std::map<uint32_t, Ptr<Packet>> m_fragments; ///< Nonoverlapping payload slices
++        std::set<uint32_t> m_boundaries; ///< Absolute SDU boundaries in the data field
++        std::optional<uint32_t> m_end; ///< Known end of the original data field
++        bool m_firstByte{false}; ///< Original data begins at an SDU boundary
+     };
+ 
+     std::map<uint16_t, PduBuffer> m_rxonBuffer; ///< Reception buffer
+@@ -207,6 +250,7 @@ class NR_EXPORT NrRlcAm : public NrRlc
      uint16_t m_maxRetxThreshold; ///< \todo How these parameters are configured???
      uint16_t m_pollPdu;          ///< poll PDU
      uint16_t m_pollByte;         ///< poll byte
@@ -375,7 +2164,7 @@ index 8ca8c2b..51bae27 100644
      /**
       * Used to inform of a PDU reception from the MAC SAP user
 diff --git a/model/nr-spectrum-phy.cc b/model/nr-spectrum-phy.cc
-index 132cb70..e53b930 100644
+index 132cb70..b63a8b6 100644
 --- a/model/nr-spectrum-phy.cc
 +++ b/model/nr-spectrum-phy.cc
 @@ -138,6 +138,11 @@ NrSpectrumPhy::GetTypeId()
@@ -409,7 +2198,47 @@ index 132cb70..e53b930 100644
              .AddTraceSource("TxDataTrace",
                              "Indicates when the channel is being occupied by a data transmission",
                              MakeTraceSourceAccessor(&NrSpectrumPhy::m_txDataTrace),
-@@ -858,6 +875,7 @@ NrSpectrumPhy::StartTxDataFrames(const Ptr<PacketBurst>& pb,
+@@ -610,30 +627,16 @@ NrSpectrumPhy::CreateSpectrumChannelMatrix(const Ptr<SpectrumSignalParameters> p
+                   "The conversion only fits to a single antenna port in Tx and Rx");
+ 
+     Ptr<const SpectrumValue> rxPsd = params->psd;
+-    Ptr<const SpectrumValue> txPsd =
+-        DynamicCast<NrSpectrumPhy>(params->txPhy)->GetTxPowerSpectralDensity();
+     uint32_t nRb = rxPsd->GetValuesN();
+-    Ptr<MatrixBasedChannelModel::Complex3DVector> channelSpct =
+-        Create<MatrixBasedChannelModel::Complex3DVector>(rxAntennaPorts, txAntennaPorts, nRb);
+-    auto rxRb = rxPsd->ConstValuesBegin();
+-    auto txRb = txPsd->ConstValuesBegin();
+-    size_t iRb = 0;
+-    while (rxRb != rxPsd->ConstValuesEnd() && txRb != txPsd->ConstValuesEnd())
+-    {
+-        if (*rxRb != 0.0 && *txRb != 0.0)
+-        {
+-            auto sqrtvit = sqrt(*rxRb / *txRb);
+-            for (size_t u = 0; u < rxAntennaPorts; u++)
+-            {
+-                for (size_t s = 0; s < txAntennaPorts; s++)
+-                {
+-                    channelSpct->Elem(u, s, iRb) = sqrtvit;
+-                }
+-            }
+-        }
+-        rxRb++;
+-        txRb++;
+-        iRb++;
++    auto channelSpct = Create<MatrixBasedChannelModel::Complex3DVector>(
++        rxAntennaPorts, txAntennaPorts, nRb);
++    for (uint32_t rb = 0; rb < nRb; ++rb)
++    {
++        // NrInterference normalizes this matrix directly by receiver noise.
++        // Its squared norm must therefore be received PSD, not path gain.
++        // In particular, never read the transmitter's live PSD: after a channel
++        // delay its power and occupied RBs can belong to a different burst.
++        channelSpct->Elem(0, 0, rb) = std::sqrt(std::max(0.0, (*rxPsd)[rb]));
+     }
+     return channelSpct;
+ }
+@@ -858,6 +861,7 @@ NrSpectrumPhy::StartTxDataFrames(const Ptr<PacketBurst>& pb,
          txParams->cellId = GetCellId();
          txParams->ctrlMsgList = ctrlMsgList;
          txParams->rnti = dci->m_rnti;
@@ -417,7 +2246,7 @@ index 132cb70..e53b930 100644
          txParams->precodingMatrix = dci->m_precMats;
  
          /* This section is used for trace */
-@@ -1224,13 +1242,19 @@ NrSpectrumPhy::AddSrsSnrReportCallback(SrsSnrReportCallback callback)
+@@ -1224,13 +1228,19 @@ NrSpectrumPhy::AddSrsSnrReportCallback(SrsSnrReportCallback callback)
  // private
  
  void
@@ -439,7 +2268,7 @@ index 132cb70..e53b930 100644
                    m_phy->GetBwpId(),
                    m_phy->GetCellId());
  
-@@ -1266,8 +1290,13 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+@@ -1266,8 +1276,13 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
      case RX_UL_CTRL:
          /* no break */
      case RX_UL_SRS:
@@ -455,7 +2284,7 @@ index 132cb70..e53b930 100644
      case CCA_BUSY:
          NS_LOG_INFO("Start receiving DATA while in CCA_BUSY state.");
          /* no break */
-@@ -1294,14 +1323,22 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+@@ -1294,14 +1309,22 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
          // reaches this point while a reception is still open. Decline to decode it rather than
          // corrupting the interference window; its power is still accounted for, because
          // AddSignalMimo() has already registered it as interference in StartRx().
@@ -481,7 +2310,7 @@ index 132cb70..e53b930 100644
              return;
          }
  
-@@ -1312,11 +1349,11 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+@@ -1312,11 +1335,11 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
              NS_ASSERT(m_state == IDLE || m_state == CCA_BUSY);
              // first transmission, i.e., we're IDLE and we start RX
              m_firstRxStart = Simulator::Now();
@@ -496,7 +2325,7 @@ index 132cb70..e53b930 100644
          }
          else
          {
-@@ -1325,11 +1362,12 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+@@ -1325,11 +1348,12 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
              // should occur at the same time and have the same
              // duration, otherwise the interference calculation
              // won't be correct
@@ -512,7 +2341,7 @@ index 132cb70..e53b930 100644
  
          if (params->packetBurst && !params->packetBurst->GetPackets().empty())
          {
-@@ -1349,8 +1387,14 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
+@@ -1349,8 +1373,14 @@ NrSpectrumPhy::StartRxData(const Ptr<NrSpectrumSignalParametersDataFrame>& param
  }
  
  void
@@ -528,7 +2357,7 @@ index 132cb70..e53b930 100644
      // The current code of this function assumes:
      // that this function is called only when cellId = m_cellId, which means
      // that UE can start to receive DL CTRL only from its own cellId,
-@@ -1380,11 +1424,11 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
+@@ -1380,11 +1410,11 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
      case IDLE: {
          NS_ASSERT(m_rxControlMessageList.empty());
          NS_LOG_LOGIC(this << "receiving DL CTRL from cellId:" << params->cellId
@@ -543,7 +2372,7 @@ index 132cb70..e53b930 100644
          break;
      }
      default: {
-@@ -1395,8 +1439,14 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
+@@ -1395,8 +1425,14 @@ NrSpectrumPhy::StartRxDlCtrl(const Ptr<NrSpectrumSignalParametersDlCtrlFrame>& p
  }
  
  void
@@ -559,7 +2388,7 @@ index 132cb70..e53b930 100644
      // The current code of this function assumes:
      // 1) that this function is called only when cellId = m_cellId
      // 2) this function should be only called for gNB, only gNB should enter into reception of
-@@ -1410,10 +1460,11 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+@@ -1410,10 +1446,11 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
          NS_FATAL_ERROR("Cannot RX UL CTRL while TX.");
          break;
      case RX_DATA:
@@ -573,7 +2402,7 @@ index 132cb70..e53b930 100644
          break;
      case RX_DL_CTRL:
          NS_FATAL_ERROR("gNB should not be in RX_DL_CTRL state.");
-@@ -1430,17 +1481,18 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+@@ -1430,17 +1467,18 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
              // first transmission, i.e., we're IDLE and we start RX
              NS_ASSERT(m_rxControlMessageList.empty());
              m_firstRxStart = Simulator::Now();
@@ -598,7 +2427,7 @@ index 132cb70..e53b930 100644
              m_rxControlMessageList.insert(m_rxControlMessageList.end(),
                                            params->ctrlMsgList.begin(),
                                            params->ctrlMsgList.end());
-@@ -1455,8 +1507,14 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
+@@ -1455,8 +1493,14 @@ NrSpectrumPhy::StartRxUlCtrl(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& p
  }
  
  void
@@ -614,7 +2443,7 @@ index 132cb70..e53b930 100644
      NS_LOG_FUNCTION(this);
      // The current code of this function assumes:
      // 1) that this function is called only when cellId = m_cellId
-@@ -1494,13 +1552,13 @@ NrSpectrumPhy::StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& para
+@@ -1494,13 +1538,13 @@ NrSpectrumPhy::StartRxSrs(const Ptr<NrSpectrumSignalParametersUlCtrlFrame>& para
          // empty
          NS_ASSERT(m_rxControlMessageList.empty());
          m_firstRxStart = Simulator::Now();
@@ -632,7 +2461,7 @@ index 132cb70..e53b930 100644
      }
      break;
      default: {
-@@ -1535,11 +1593,64 @@ NrSpectrumPhy::SetIsGnb(bool isGnb)
+@@ -1535,11 +1579,64 @@ NrSpectrumPhy::SetIsGnb(bool isGnb)
      m_isGnb = isGnb;
  }
  
@@ -697,7 +2526,7 @@ index 132cb70..e53b930 100644
  
      if (newState == RX_DATA || newState == RX_DL_CTRL || newState == RX_UL_CTRL || newState == TX ||
          newState == CCA_BUSY)
-@@ -1741,6 +1852,7 @@ NrSpectrumPhy::SendUlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
+@@ -1741,6 +1838,7 @@ NrSpectrumPhy::SendUlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
      }
  
      // Send the feedback
@@ -705,7 +2534,7 @@ index 132cb70..e53b930 100644
      m_phyUlHarqFeedbackCallback(harqUlInfo);
  
      // Arrange the history
-@@ -1775,6 +1887,7 @@ NrSpectrumPhy::SendDlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
+@@ -1775,6 +1873,7 @@ NrSpectrumPhy::SendDlHarqFeedback(uint16_t rnti, TransportBlockInfo& tbInfo)
      }
  
      // Send the feedback
@@ -713,7 +2542,7 @@ index 132cb70..e53b930 100644
      m_phyDlHarqFeedbackCallback(harqDlInfo);
  
      // Arrange the history
-@@ -1826,6 +1939,7 @@ NrSpectrumPhy::ProcessReceivedPacketBurst()
+@@ -1826,6 +1925,7 @@ NrSpectrumPhy::ProcessReceivedPacketBurst()
              }
              auto& tbInfo = itTb->second;
  
@@ -721,7 +2550,7 @@ index 132cb70..e53b930 100644
              if (!tbInfo.m_isCorrupted)
              {
                  m_phyRxDataEndOkCallback(packet);
-@@ -2175,6 +2289,14 @@ NrSpectrumPhy::ScheduleCsiIm(Ptr<SpectrumSignalParameters> csiRsParams) const
+@@ -2175,6 +2275,14 @@ NrSpectrumPhy::ScheduleCsiIm(Ptr<SpectrumSignalParameters> csiRsParams) const
      Simulator::Schedule(fakeCsiImSignal->duration, &NrInterference::EndRx, m_interferenceCsiIm);
  }
  
@@ -737,7 +2566,7 @@ index 132cb70..e53b930 100644
  NrSpectrumPhy::IsUeScheduled() const
  {
 diff --git a/model/nr-spectrum-phy.h b/model/nr-spectrum-phy.h
-index 0cfa850..3e18923 100644
+index 0cfa850..d4540fa 100644
 --- a/model/nr-spectrum-phy.h
 +++ b/model/nr-spectrum-phy.h
 @@ -80,6 +80,15 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
@@ -756,7 +2585,15 @@ index 0cfa850..3e18923 100644
  
      /**
       * @brief NrSpectrumPhy constructor
-@@ -662,19 +671,25 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+@@ -656,25 +665,33 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+     void NotifyTxDataTrace(Time duration) const;
+ 
+   private:
++    /// Verify scalar-PSD fallback power and independence from later transmitter state.
++    friend class NrSpectrumPhyPowerMatrixTestCase;
+     std::vector<MimoSinrChunk>
+         m_mimoSinrPerceived; //!< received SINR values during data reception for TB decoding, to
+                              //!< replace m_sinrPerceived for all (MIMO and SISO) receivers
  
      /**
       * @brief Function is called when what is being received is holding data
@@ -786,7 +2623,7 @@ index 0cfa850..3e18923 100644
      /**
       * @brief Function that is called when is being received CSI-RS signal
       * @param csiRsParams holds CSI-RS signal parameters
-@@ -682,10 +697,12 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+@@ -682,10 +699,12 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
      void StartRxCsiRs(const Ptr<NrSpectrumSignalParametersCsiRs>& csiRsParams);
      /**
       * @brief Function that is called when is being received SRS
@@ -801,7 +2638,18 @@ index 0cfa850..3e18923 100644
      /**
       * @brief Checks if CSI-IM measurement is needed, if not, then it checks if needed to
       * call directly the generation of CSI feedback
-@@ -838,6 +855,26 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+@@ -750,8 +769,8 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+ 
+     /**
+      * @brief Function that is called when the rx signal does not contain an expected channel
+-     * matrix. Currently, this function is only used for compatibility with the current API,
+-     * as the spectrum channel is not actually used in the case of a single stream.
++     * matrix. The single-port fallback includes the received power spectral density,
++     * matching the power-weighted matrices consumed by NrInterference.
+      * @param params the signal parameters which contains the spectrum channel matrix
+      * @returns the channel matrix
+      */
+@@ -838,6 +857,26 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
      std::list<Ptr<NrControlMessage>>
          m_rxControlMessageList; //!< the list of received control messages
  
@@ -828,7 +2676,7 @@ index 0cfa850..3e18923 100644
      Time m_firstRxStart{
          Seconds(0)}; //!< this is needed to save the time at which we lock down onto signal
      Time m_firstRxDuration{Seconds(0)}; //!< the duration of the current reception
-@@ -875,6 +912,14 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
+@@ -875,6 +914,14 @@ class NR_EXPORT NrSpectrumPhy : public SpectrumPhy
      TracedCallback<Time>
          m_channelOccupied; //!< trace callback that is notifying of total time that this spectrum
                             //!< phy sees the channel occupied, by others and by itself
@@ -844,10 +2692,38 @@ index 0cfa850..3e18923 100644
                                          //!< starts to occupy the channel with data transmission
      TracedCallback<Time> m_txCtrlTrace; //!< trace callback that is notifying when this spectrum phy
 diff --git a/model/nr-ue-mac.cc b/model/nr-ue-mac.cc
-index cf81e7d..a63d10e 100644
+index cf81e7d..3da141e 100644
 --- a/model/nr-ue-mac.cc
 +++ b/model/nr-ue-mac.cc
-@@ -338,6 +338,12 @@ NrUeMac::GetRnti() const
+@@ -216,6 +216,10 @@ NrUeMac::GetTypeId()
+         TypeId("ns3::NrUeMac")
+             .SetParent<Object>()
+             .AddConstructor<NrUeMac>()
++            .AddTraceSource("ConnectedRaMsg3",
++                            "Connected-mode Msg3 IMSI, temporary identity and established C-RNTI.",
++                            MakeTraceSourceAccessor(&NrUeMac::m_connectedRaMsg3),
++                            "ns3::TracedCallback::Uint64Uint16Uint16")
+             .AddAttribute(
+                 "NumHarqProcess",
+                 "Number of concurrent stop-and-wait Hybrid ARQ processes per user",
+@@ -275,6 +279,8 @@ NrUeMac::~NrUeMac()
+ void
+ NrUeMac::DoDispose()
+ {
++    m_connectedRaTimeout.Cancel();
++    m_noRaResponseReceivedEvent.Cancel();
+     m_miUlHarqProcessesPacket.clear();
+     m_miUlHarqProcessesPacketTimer.clear();
+     m_ulBsrReceived.clear();
+@@ -296,6 +302,7 @@ void
+ NrUeMac::DoNotifyConnectionSuccessful()
+ {
+     NS_LOG_FUNCTION(this);
++    m_connectionSuccessful = true;
+     m_phySapProvider->NotifyConnectionSuccessful();
+ }
+ 
+@@ -338,6 +345,12 @@ NrUeMac::GetRnti() const
      return m_rnti;
  }
  
@@ -860,7 +2736,7 @@ index cf81e7d..a63d10e 100644
  uint64_t
  NrUeMac::GetImsi() const
  {
-@@ -409,6 +415,7 @@ NrUeMac::DoTransmitPdu(NrMacSapProvider::TransmitPduParameters params)
+@@ -409,6 +422,7 @@ NrUeMac::DoTransmitPdu(NrMacSapProvider::TransmitPduParameters params)
      NrMacHeaderVs header;
      header.SetLcId(params.lcid);
      header.SetSize(params.pdu->GetSize());
@@ -868,7 +2744,7 @@ index cf81e7d..a63d10e 100644
  
      params.pdu->AddHeader(header);
  
-@@ -435,6 +442,7 @@ NrUeMac::DoTransmitBufferStatusReport(NrMacSapProvider::BufferStatusReportParame
+@@ -435,6 +449,7 @@ NrUeMac::DoTransmitBufferStatusReport(NrMacSapProvider::BufferStatusReportParame
  {
      NS_LOG_FUNCTION(this << static_cast<uint32_t>(params.lcid));
  
@@ -876,7 +2752,25 @@ index cf81e7d..a63d10e 100644
      auto it = m_ulBsrReceived.find(params.lcid);
  
      NS_LOG_INFO("Received BSR for LC Id" << static_cast<uint32_t>(params.lcid));
-@@ -777,7 +785,7 @@ NrUeMac::DoReceivePhyPdu(Ptr<Packet> p)
+@@ -656,7 +671,7 @@ NrUeMac::DoSlotIndication(const SfnSf& sfn)
+     // sr-ProhibitTimer is not running (3GPP TS 38.321, clause 5.4.4). While the timer runs the
+     // request stays pending, so a backlogged UE asks again as soon as it is allowed to, without
+     // repeating the request on every slot.
+-    if (m_srState == TO_SEND &&
++    if (!m_connectedRaPending && m_srState == TO_SEND &&
+         (m_lastSrSent == Time::Min() || Simulator::Now() - m_lastSrSent >= m_srProhibitTimer))
+     {
+         if (m_srCounter < m_srTransMax)
+@@ -701,6 +716,8 @@ NrUeMac::DoSlotIndication(const SfnSf& sfn)
+ 
+             if (m_rachConfigured)
+             {
++                m_connectedRaPending = m_connectionSuccessful;
++                m_preambleTransmissionCounter = 0;
+                 RandomlySelectAndSendRaPreamble();
+             }
+             else
+@@ -777,18 +794,51 @@ NrUeMac::DoReceivePhyPdu(Ptr<Packet> p)
  }
  
  void
@@ -885,7 +2779,43 @@ index cf81e7d..a63d10e 100644
  {
      NS_LOG_FUNCTION(this);
      m_waitingForRaResponse = false;
-@@ -788,7 +796,7 @@ NrUeMac::RecvRaResponse(NrBuildRarListElement_s raResponse)
+     m_noRaResponseReceivedEvent.Cancel();
++    if (m_connectionSuccessful)
++    {
++        m_connectedRaMsg3(m_imsi, raResponse.ulMsg3Dci->m_rnti, m_rnti);
++        // TS 38.321 5.1.5: connected-mode Msg3 identifies the existing C-RNTI.
++        // The RAR's temporary identity is only for this Msg3 transport block;
++        // replacing the established identity strands its RLC/PDCP bearers.
++        const uint8_t identity[2] = {static_cast<uint8_t>(m_rnti >> 8),
++                                     static_cast<uint8_t>(m_rnti & 0xff)};
++        auto packet = Create<Packet>(identity, 2);
++        NrMacHeaderFsUl header;
++        header.SetLcId(NrMacHeaderFsUl::C_RNTI);
++        packet->AddHeader(header);
++        packet->AddPacketTag(NrRadioBearerTag(raResponse.ulMsg3Dci->m_rnti,
++                                             NrMacHeaderFsUl::C_RNTI, 0));
++        NS_ABORT_MSG_IF(packet->GetSize() > raResponse.ulMsg3Dci->m_tbSize,
++                        "RAR grant cannot carry C-RNTI MAC CE");
++        auto msg3Slot = referenceSlot;
++        msg3Slot.Add(raResponse.k2Delay);
++        m_phySapProvider->SendMacPdu(packet, msg3Slot,
++                                    raResponse.ulMsg3Dci->m_symStart,
++                                    raResponse.ulMsg3Dci->m_rnti);
++        m_connectedRaPending = true;
++        m_connectedRaTimeout.Cancel();
++        // Start after Msg3, adding the NTN round trip to the 64 ms interval.
++        // A corrupt Msg3 never manufactures a successful recovery.
++        const auto untilMsg3 = m_phySapProvider->GetSlotPeriod() *
++            std::max<int64_t>(0, static_cast<int64_t>(msg3Slot.Normalize()) -
++                                static_cast<int64_t>(m_currentSlot.Normalize()));
++        m_connectedRaTimeout = Simulator::Schedule(
++            untilMsg3 + MilliSeconds(64) + m_phySapProvider->GetSlotPeriod() * (2 * m_ntnKOffset),
++            &NrUeMac::ConnectedRaTimeout, this);
++        return;
++    }
+     NS_LOG_INFO(" IMSI " << m_imsi << " RNTI " << m_rnti << " received RAR for RA preamble ID "
+                          << +m_raPreambleId
+                          << ", setting T-C-RNTI = " << raResponse.ulMsg3Dci->m_rnti
                           << " at: " << Simulator::Now().As(Time::MS));
      // Save data for MSG3
      m_rnti = raResponse.ulMsg3Dci->m_rnti;
@@ -894,16 +2824,29 @@ index cf81e7d..a63d10e 100644
      m_ulDciSfnsf.Add(raResponse.k2Delay);
      m_ulDciTotalUsed = 0;
      m_ulDci = raResponse.ulMsg3Dci;
-@@ -834,7 +842,7 @@ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
+@@ -833,8 +883,20 @@ void
+ NrUeMac::ProcessUlDci(const Ptr<NrUlDciMessage>& dciMsg)
  {
      NS_LOG_FUNCTION(this);
++    if (m_connectedRaPending && dciMsg->GetDciInfoElement()->m_rnti == m_rnti &&
++        dciMsg->GetDciInfoElement()->m_ndi == 1)
++    {
++        // Only a new-data grant addressed to the established C-RNTI resolves
++        // contention. Receipt of a RAR does not prove that Msg3 was received.
++        m_connectedRaPending = false;
++        m_connectedRaTimeout.Cancel();
++        m_noRaResponseReceivedEvent.Cancel();
++        m_srCounter = 0;
++        m_lastSrSent = Time::Min();
++        m_cmacSapUser->NotifyRandomAccessSuccessful();
++    }
  
 -    SfnSf dataSfn = m_currentSlot;
 +    SfnSf dataSfn = dciMsg->GetTimingReferenceOr(m_currentSlot);
      dataSfn.Add(dciMsg->GetKDelay());
  
      // Saving the data we need in DoTransmitPdu
-@@ -969,13 +977,19 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
+@@ -969,13 +1031,19 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
          return;
      }
  
@@ -924,7 +2867,7 @@ index cf81e7d..a63d10e 100644
          {
              NrMacSapUser::TxOpportunityParameters txParams;
              txParams.lcid = bsr.lcid;
-@@ -990,15 +1004,16 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
+@@ -990,15 +1058,16 @@ NrUeMac::SendRetxData(uint32_t usefulTbs, uint32_t activeLcsRetx)
                                                      "of "
                                                   << bytesPerLcId << " B for a RETX PDU");
  
@@ -949,7 +2892,7 @@ index cf81e7d..a63d10e 100644
          }
          else
          {
-@@ -1026,10 +1041,12 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+@@ -1026,10 +1095,12 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
      constexpr uint32_t minTxOpBytes = 7;
      constexpr uint32_t rlcAmWorstCaseHeaderBytes = 4;
  
@@ -964,7 +2907,7 @@ index cf81e7d..a63d10e 100644
          if (availableBytes < minTxOpBytes)
          {
              NS_LOG_WARN("Not enough bytes available to send a TxPDU, skipping");
-@@ -1101,15 +1118,21 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+@@ -1101,15 +1172,21 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
                                               << " of a TxOpp "
                                                  "of "
                                               << bytesPerLcId << " B for a TX PDU");
@@ -994,7 +2937,7 @@ index cf81e7d..a63d10e 100644
      }
  }
  
-@@ -1294,7 +1317,7 @@ NrUeMac::DoReceiveControlMessage(Ptr<NrControlMessage> msg)
+@@ -1294,7 +1371,7 @@ NrUeMac::DoReceiveControlMessage(Ptr<NrControlMessage> msg)
              {
                  if (it->rarPayload.raPreambleId == m_raPreambleId)
                  {
@@ -1003,7 +2946,32 @@ index cf81e7d..a63d10e 100644
                  }
              }
          }
-@@ -1408,6 +1431,7 @@ NrUeMac::SendRaPreamble(bool contention)
+@@ -1333,6 +1410,7 @@ NrUeMac::RaResponseTimeout(bool contention)
+     if (m_preambleTransmissionCounter == m_rachConfig.preambleTransMax + 1)
+     {
+         NS_LOG_INFO("RAR timeout, preambleTransMax reached => giving up");
++        m_connectedRaPending = false;
+         m_cmacSapUser->NotifyRandomAccessFailed();
+     }
+     else
+@@ -1358,6 +1436,16 @@ NrUeMac::DoConfigureRach(NrUeCmacSapProvider::RachConfig rc)
+     m_rachConfigured = true;
+ }
+ 
++void
++NrUeMac::ConnectedRaTimeout()
++{
++    NS_LOG_WARN("Connected-mode contention resolution timed out for C-RNTI " << m_rnti);
++    m_connectedRaPending = false;
++    m_srCounter = 0;
++    m_lastSrSent = Time::Min();
++    m_srState = GetTotalBufSize() > 0 ? TO_SEND : INACTIVE;
++}
++
+ NrUeCmacSapProvider::RachConfig
+ NrUeMac::GetRachConfig() const
+ {
+@@ -1408,6 +1496,7 @@ NrUeMac::SendRaPreamble(bool contention)
                                       << " at: " << Simulator::Now().As(Time::MS));
      Time raWindowBegin = m_phySapProvider->GetSlotPeriod();
      Time raWindowEnd = m_phySapProvider->GetSlotPeriod() * (6 + m_rachConfig.raResponseWindowSize);
@@ -1011,19 +2979,40 @@ index cf81e7d..a63d10e 100644
      Simulator::Schedule(raWindowBegin, &NrUeMac::StartWaitingForRaResponse, this);
      m_noRaResponseReceivedEvent =
          Simulator::Schedule(raWindowEnd, &NrUeMac::RaResponseTimeout, this, contention);
+@@ -1431,6 +1520,9 @@ NrUeMac::DoStartNonContentionBasedRandomAccessProcedure(uint16_t rnti,
+                                                         uint8_t prachMask)
+ {
+     NS_LOG_FUNCTION(this << rnti << (uint16_t)preambleId << (uint16_t)prachMask);
++    m_connectionSuccessful = false;
++    m_connectedRaPending = false;
++    m_connectedRaTimeout.Cancel();
+     NS_ASSERT_MSG(prachMask == 0,
+                   "requested PRACH MASK = " << (uint32_t)prachMask
+                                             << ", but only PRACH MASK = 0 is supported");
+@@ -1493,6 +1585,9 @@ void
+ NrUeMac::DoReset()
+ {
+     NS_LOG_FUNCTION(this);
++    m_connectionSuccessful = false;
++    m_connectedRaPending = false;
++    m_connectedRaTimeout.Cancel();
+     auto it = m_lcInfoMap.begin();
+     while (it != m_lcInfoMap.end())
+     {
 diff --git a/model/nr-ue-mac.h b/model/nr-ue-mac.h
-index a199212..04c9469 100644
+index a199212..1d102e6 100644
 --- a/model/nr-ue-mac.h
 +++ b/model/nr-ue-mac.h
-@@ -107,6 +107,7 @@ class NR_EXPORT NrUeMac : public Object
+@@ -107,6 +107,8 @@ class NR_EXPORT NrUeMac : public Object
      friend class UeMemberNrUeCmacSapProvider;
      friend class UeMemberNrMacSapProvider;
      friend class MacUeMemberPhySapUser;
 +    friend class NrUeMacAccountingRegression; ///< Exercise grant accounting with a mock RLC peer.
++    friend class NrConnectedRaTestCase; ///< Verify identity preservation and finite recovery.
  
    public:
      /**
-@@ -266,6 +267,9 @@ class NR_EXPORT NrUeMac : public Object
+@@ -266,6 +268,9 @@ class NR_EXPORT NrUeMac : public Object
       */
      uint16_t GetRnti() const;
  
@@ -1033,7 +3022,7 @@ index a199212..04c9469 100644
      /**
       * @brief Get the IMSI
       * @return the IMSI
-@@ -308,9 +312,10 @@ class NR_EXPORT NrUeMac : public Object
+@@ -308,9 +313,10 @@ class NR_EXPORT NrUeMac : public Object
    private:
      /**
       * @brief Received a RA response
@@ -1045,7 +3034,16 @@ index a199212..04c9469 100644
      /**
       * @brief Set the RNTI
       */
-@@ -470,6 +475,8 @@ class NR_EXPORT NrUeMac : public Object
+@@ -362,6 +368,8 @@ class NR_EXPORT NrUeMac : public Object
+     void DoReceiveControlMessage(Ptr<NrControlMessage> msg);
+     // void DoNotifyHarqDeliveryFailure (uint8_t harqId);
+     void RaResponseTimeout(bool contention);
++    /** Retry access if no new-data grant resolves connected-mode random access. */
++    void ConnectedRaTimeout();
+ 
+     // forwarded from UE CMAC SAP
+     void DoConfigureRach(NrUeCmacSapProvider::RachConfig rc);
+@@ -470,6 +478,8 @@ class NR_EXPORT NrUeMac : public Object
      std::shared_ptr<DciInfoElementTdma>
          m_ulDci;                  //!< Received a DCI. While we process it, store it here.
      SfnSf m_ulDciSfnsf;           //!< Received a DCI for transmitting data in this slot.
@@ -1054,7 +3052,18 @@ index a199212..04c9469 100644
      uint32_t m_ulDciTotalUsed{0}; //!< Received a DCI, put the total count of bytes we sent.
  
      std::unordered_map<uint8_t, NrMacSapProvider::BufferStatusReportParameters>
-@@ -557,6 +564,7 @@ class NR_EXPORT NrUeMac : public Object
+@@ -481,6 +491,10 @@ class NR_EXPORT NrUeMac : public Object
+     Time m_lastSrSent{Time::Min()};           //!< When the last scheduling request was transmitted
+     uint32_t m_srTransMax{64}; //!< sr-TransMax (TS 38.331): transmissions before giving up
+     uint32_t m_srCounter{0};   //!< SR_COUNTER: transmissions of the currently pending request
++    bool m_connectionSuccessful{false}; //!< A configured connected bearer exists.
++    bool m_connectedRaPending{false}; //!< SR recovery preserves the established C-RNTI.
++    EventId m_connectedRaTimeout; //!< Finite contention-resolution deadline for SR recovery.
++    TracedCallback<uint64_t, uint16_t, uint16_t> m_connectedRaMsg3; //!< IMSI, temporary and established identities.
+ 
+     Ptr<UniformRandomVariable> m_raPreambleUniformVariable;
+     uint8_t m_raPreambleId{255}; //!< The RA Preamble ID (255 = none sent; valid IDs 0..63)
+@@ -557,6 +571,7 @@ class NR_EXPORT NrUeMac : public Object
      NrUeCmacSapProvider::RachConfig m_rachConfig{}; ///< RACH configuration
      uint8_t m_preambleTransmissionCounter{0};       ///< preamble transmission counter
      EventId m_noRaResponseReceivedEvent;            ///< no RA response received event ID
@@ -1081,10 +3090,33 @@ index 390bdcb..a328397 100644
      }
  }
 diff --git a/model/nr-ue-phy.cc b/model/nr-ue-phy.cc
-index d1a8e89..5fb4c79 100644
+index d1a8e89..a2a934a 100644
 --- a/model/nr-ue-phy.cc
 +++ b/model/nr-ue-phy.cc
-@@ -627,7 +627,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+@@ -131,7 +131,8 @@ NrUePhy::GetTypeId()
+             .AddAttribute("EnableUplinkPowerControl",
+                           "If true, Uplink Power Control will be enabled.",
+                           BooleanValue(false),
+-                          MakeBooleanAccessor(&NrUePhy::SetEnableUplinkPowerControl),
++                          MakeBooleanAccessor(&NrUePhy::SetEnableUplinkPowerControl,
++                                              &NrUePhy::GetEnableUplinkPowerControl),
+                           MakeBooleanChecker())
+             .AddAttribute("WbPmiUpdateInterval",
+                           "Wideband PMI update interval",
+@@ -288,6 +289,12 @@ NrUePhy::SetEnableUplinkPowerControl(bool enable)
+     m_enableUplinkPowerControl = enable;
+ }
+ 
++bool
++NrUePhy::GetEnableUplinkPowerControl() const
++{
++    return m_enableUplinkPowerControl;
++}
++
+ void
+ NrUePhy::SetAlphaCovMat(double alpha)
+ {
+@@ -627,7 +634,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
              return; // DCI not for me
          }
  
@@ -1093,7 +3125,7 @@ index d1a8e89..5fb4c79 100644
          uint32_t k0Delay = dciMsg->GetKDelay();
          dciSfn.Add(k0Delay);
  
-@@ -655,6 +655,14 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+@@ -655,6 +662,14 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
                                dciMsg->GetK1Delay());
  
          InsertAllocation(dciInfoElem);
@@ -1108,7 +3140,7 @@ index d1a8e89..5fb4c79 100644
  
          m_phySapUser->ReceiveControlMessage(msg);
  
-@@ -676,7 +684,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
+@@ -676,7 +691,7 @@ NrUePhy::PhyCtrlMessagesReceived(const Ptr<NrControlMessage>& msg)
              return; // DCI not for me
          }
  
@@ -1117,7 +3149,7 @@ index d1a8e89..5fb4c79 100644
          uint32_t k2Delay = dciMsg->GetKDelay();
          ulSfnSf.Add(k2Delay);
  
-@@ -737,7 +745,7 @@ NrUePhy::ProcessRar(const Ptr<NrRarMessage>& rarMsg)
+@@ -737,7 +752,7 @@ NrUePhy::ProcessRar(const Ptr<NrRarMessage>& rarMsg)
                                                                  << " current RA preamble ID is :"
                                                                  << m_raPreambleId);
                  // insert allocation
@@ -1126,7 +3158,7 @@ index d1a8e89..5fb4c79 100644
                  uint32_t k2Delay = it->rarPayload.k2Delay;
                  ulSfnSf.Add(k2Delay);
                  NS_LOG_DEBUG("Insert RAR UL DCI allocation for " << ulSfnSf);
-@@ -1118,6 +1126,15 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
+@@ -1118,6 +1133,15 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
      NS_LOG_FUNCTION(this);
  
      Time varTtiDuration = GetSymbolPeriod() * dci->m_numSym;
@@ -1142,7 +3174,7 @@ index d1a8e89..5fb4c79 100644
  
      if (m_ctrlMsgs.empty())
      {
-@@ -1177,6 +1194,33 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
+@@ -1177,6 +1201,33 @@ NrUePhy::UlCtrl(const std::shared_ptr<DciInfoElementTdma>& dci)
      return varTtiDuration;
  }
  
@@ -1176,7 +3208,7 @@ index d1a8e89..5fb4c79 100644
  Time
  NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
  {
-@@ -1196,21 +1240,10 @@ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
+@@ -1196,21 +1247,10 @@ NrUePhy::DlData(const std::shared_ptr<DciInfoElementTdma>& dci)
          return varTtiDuration;
      }
  
@@ -1202,7 +3234,7 @@ index d1a8e89..5fb4c79 100644
      NS_LOG_INFO("UE" << m_rnti << " RXing DL DATA frame for symbols " << +dci->m_symStart << "-"
                       << +(dci->m_symStart + dci->m_numSym - 1) << " num of rbg assigned: "
                       << FromRBGBitmaskToRBAssignment(dci->m_rbgBitmask).size()
-@@ -1282,6 +1315,23 @@ void
+@@ -1282,6 +1322,23 @@ void
  NrUePhy::StartVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
  {
      NS_LOG_FUNCTION(this);
@@ -1226,7 +3258,7 @@ index d1a8e89..5fb4c79 100644
      Time varTtiDuration;
  
      m_currTbs = dci->m_tbSize;
-@@ -1338,7 +1388,23 @@ NrUePhy::EndVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
+@@ -1338,7 +1395,23 @@ NrUePhy::EndVarTti(const std::shared_ptr<DciInfoElementTdma>& dci)
          // stale boundary to the current instant so the slot machine keeps
          // running on the target BWP instead of asserting; StartSlot() detects
          // the numerology change and cleanly re-stamps the loop from there.
@@ -1251,7 +3283,7 @@ index d1a8e89..5fb4c79 100644
          if (delay.IsNegative())
          {
              NS_LOG_WARN("Clamping next-slot start "
-@@ -1437,8 +1503,10 @@ void
+@@ -1437,8 +1510,10 @@ void
  NrUePhy::GenerateDlCqiReport(const SpectrumValue& sinr)
  {
      NS_LOG_FUNCTION(this);
@@ -1264,7 +3296,7 @@ index d1a8e89..5fb4c79 100644
      {
          m_dlDataSinrTrace(GetCellId(), m_rnti, ComputeAvgSinr(sinr), GetBwpId());
  
-@@ -1556,17 +1624,56 @@ NrUePhy::GetBeamId([[maybe_unused]] uint16_t rnti) const
+@@ -1556,17 +1631,56 @@ NrUePhy::GetBeamId([[maybe_unused]] uint16_t rnti) const
      NS_FATAL_ERROR("ERROR");
  }
  
@@ -1329,10 +3361,20 @@ index d1a8e89..5fb4c79 100644
  
  void
 diff --git a/model/nr-ue-phy.h b/model/nr-ue-phy.h
-index 0086172..0a758d9 100644
+index 0086172..d7a408b 100644
 --- a/model/nr-ue-phy.h
 +++ b/model/nr-ue-phy.h
-@@ -419,6 +419,14 @@ class NR_EXPORT NrUePhy : public NrPhy
+@@ -104,6 +104,9 @@ class NR_EXPORT NrUePhy : public NrPhy
+      * @param enable parameter that enables or disables power control
+      */
+     void SetEnableUplinkPowerControl(bool enable);
++
++    /** @return Whether uplink power control is enabled */
++    bool GetEnableUplinkPowerControl() const;
+     /**
+      * @brief Set alpha parameter for the calculation of the CSI interference covariance matrix
+      * moving average
+@@ -419,6 +422,14 @@ class NR_EXPORT NrUePhy : public NrPhy
       */
      void SetCam(const Ptr<NrChAccessManager>& cam);
  
@@ -1347,7 +3389,7 @@ index 0086172..0a758d9 100644
      const SfnSf& GetCurrentSfnSf() const override;
  
      // From nr phy. Not used in the UE
-@@ -439,6 +447,10 @@ class NR_EXPORT NrUePhy : public NrPhy
+@@ -439,6 +450,10 @@ class NR_EXPORT NrUePhy : public NrPhy
                                  uint8_t subframe,
                                  uint16_t slot) override;
  
@@ -1358,7 +3400,7 @@ index 0086172..0a758d9 100644
      /**
       * @brief Called when rsReceivedPower is fired
       * @param power the power received
-@@ -745,6 +757,14 @@ class NR_EXPORT NrUePhy : public NrPhy
+@@ -745,6 +760,14 @@ class NR_EXPORT NrUePhy : public NrPhy
       */
      Time DlData(const std::shared_ptr<DciInfoElementTdma>& dci) __attribute__((warn_unused_result));
  
@@ -1373,7 +3415,7 @@ index 0086172..0a758d9 100644
      /**
       * @brief Transmit UL data and return the duration of the transmission
       * @param dci the current DCI
-@@ -1130,6 +1150,15 @@ class NR_EXPORT NrUePhy : public NrPhy
+@@ -1130,6 +1153,15 @@ class NR_EXPORT NrUePhy : public NrPhy
      TracedCallback<uint16_t, uint16_t, double, double, bool, uint8_t> m_reportUeMeasurements;
  
      bool m_isConnected; //!< Flag indicating PHY is connected
@@ -1389,3 +3431,1181 @@ index 0086172..0a758d9 100644
  
      // Inherited
      void NotifyConnectionSuccessful() override;
+diff --git a/test/nr-connected-ra-test.cc b/test/nr-connected-ra-test.cc
+new file mode 100644
+index 0000000..abc9b0d
+--- /dev/null
++++ b/test/nr-connected-ra-test.cc
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "ns3/nr-gnb-mac.h"
++#include "ns3/nr-ue-mac.h"
++#include "ns3/nr-control-messages.h"
++#include "ns3/nr-mac-header-fs-ul.h"
++#include "ns3/nr-radio-bearer-tag.h"
++#include "ns3/beam-id.h"
++#include "ns3/simulator.h"
++#include "ns3/test.h"
++
++namespace ns3
++{
++/** PHY peer retaining the actual Msg3 bytes and transmission identity. */
++class ConnectedRaPhy : public NrPhySapProvider
++{
++  public:
++    void SendMacPdu(const Ptr<Packet>& p, const SfnSf&, uint8_t, uint16_t rnti) override
++    { packet=p->Copy(); identity=rnti; }
++    void SendControlMessage(Ptr<NrControlMessage>) override {}
++    void SendRachPreamble(uint8_t, uint8_t) override {}
++    void SetSlotAllocInfo(const SlotAllocInfo&) override {}
++    void NotifyConnectionSuccessful() override {}
++    BeamId GetBeamId(uint8_t) const override { return BeamId(0,0); }
++    Ptr<const SpectrumModel> GetSpectrumModel() override { return nullptr; }
++    uint16_t GetBwpId() const override { return 0; }
++    uint16_t GetCellId() const override { return 1; }
++    uint32_t GetSymbolsPerSlot() const override { return 14; }
++    Time GetSlotPeriod() const override { return MilliSeconds(1); }
++    uint32_t GetRbNum() const override { return 53; }
++    void RegisterToGnb(uint16_t) override {}
++    uint32_t GetArfcn() const override { return 0; }
++    Ptr<Packet> packet; ///< Captured physical Msg3 PDU.
++    uint16_t identity{0}; ///< Physical transmission uses the temporary identity.
++};
++
++/** RRC peer counting actual successful access notifications. */
++class ConnectedRaRrc : public NrUeCmacSapUser
++{
++  public:
++    void SetTemporaryCellRnti(uint16_t) override { ++replacements; }
++    void NotifyRandomAccessSuccessful() override { ++successes; }
++    void NotifyRandomAccessFailed() override { ++failures; }
++    unsigned replacements{0}, successes{0}, failures{0}; ///< Callback counts.
++};
++
++/** Connected access preserves bearers and resolves only after an addressed new-data grant. */
++class NrConnectedRaTestCase : public TestCase
++{
++  public:
++    NrConnectedRaTestCase() : TestCase("Connected Msg3 retains C-RNTI and retries on loss") {}
++  private:
++    /** Exercise real MAC handlers with decoded and deliberately missing Msg3 delivery. */
++    void DoRun() override
++    {
++        ConnectedRaPhy phy;
++        ConnectedRaRrc rrc;
++        auto ue=CreateObject<NrUeMac>();
++        ue->SetPhySapProvider(&phy);
++        ue->SetUeCmacSapUser(&rrc);
++        ue->m_rnti=7;
++        ue->m_connectionSuccessful=true;
++        ue->m_connectedRaPending=true;
++        auto dci=std::make_shared<DciInfoElementTdma>(9,DciInfoElementTdma::UL,
++            1,2,0,1,nullptr,20,1,0,DciInfoElementTdma::MSG3,0,0);
++        NrBuildRarListElement_s rar{};
++        rar.ulMsg3Dci=dci; rar.k2Delay=2;
++        ue->RecvRaResponse(rar,SfnSf(0,0,0,0));
++        NS_TEST_ASSERT_MSG_EQ(ue->m_rnti,7,"existing bearer identity retained");
++        NS_TEST_ASSERT_MSG_EQ(rrc.replacements,0,"RAR must not replace connected C-RNTI");
++        NS_TEST_ASSERT_MSG_EQ(rrc.successes,0,"RAR is not contention resolution");
++        NS_TEST_ASSERT_MSG_EQ(phy.identity,9,"Msg3 uses temporary physical identity");
++        NS_TEST_ASSERT_MSG_EQ(phy.packet->GetSize(),3,"C-RNTI CE is one-byte LCID plus two-byte identity");
++
++        auto gnb=CreateObject<NrGnbMac>();
++        gnb->SetPhySapProvider(&phy);
++        gnb->m_rlcAttached[9];
++        gnb->m_rlcAttached[7][1]=nullptr;
++        gnb->DoReceivePhyPdu(phy.packet->Copy());
++        NS_TEST_ASSERT_MSG_EQ(gnb->m_srRntiList.size(),1,"decoded Msg3 requests a real grant");
++        NS_TEST_ASSERT_MSG_EQ(gnb->m_srRntiList.front(),7,"scheduler receives established C-RNTI");
++        gnb->m_srRntiList.clear();
++        auto invalid=Create<Packet>(1);
++        NrMacHeaderFsUl header; header.SetLcId(NrMacHeaderFsUl::C_RNTI);
++        invalid->AddHeader(header); invalid->AddPacketTag(NrRadioBearerTag(9,58,0));
++        gnb->DoReceivePhyPdu(invalid);
++        NS_TEST_ASSERT_MSG_EQ(gnb->m_srRntiList.size(),0,"malformed CE cannot restore scheduling");
++
++        // Suppress the actual Msg3 delivery/grant. The pending procedure must
++        // time out, retain the old identity and never report false success.
++        Simulator::Stop(MilliSeconds(200)); Simulator::Run();
++        NS_TEST_ASSERT_MSG_EQ(ue->m_connectedRaPending,false,"finite resolution timeout");
++        NS_TEST_ASSERT_MSG_EQ(rrc.successes,0,"no grant means no recovery success");
++        NS_TEST_ASSERT_MSG_EQ(ue->m_rnti,7,"timeout does not destroy bearer identity");
++
++        ue->m_connectedRaPending=true;
++        auto grant=std::make_shared<DciInfoElementTdma>(7,DciInfoElementTdma::UL,
++            1,2,0,1,nullptr,20,1,0,DciInfoElementTdma::DATA,0,0);
++        ue->ProcessUlDci(Create<NrUlDciMessage>(grant));
++        NS_TEST_ASSERT_MSG_EQ(rrc.successes,1,"addressed new-data grant resolves access");
++        NS_TEST_ASSERT_MSG_EQ(ue->m_connectedRaPending,false,"resolution cancels timer");
++        ue->Dispose();gnb->Dispose();Simulator::Destroy();
++    }
++};
++
++/** Isolated connected-mode random access regression suite. */
++class NrConnectedRaTestSuite : public TestSuite
++{
++  public:
++    NrConnectedRaTestSuite() : TestSuite("nr-connected-ra",Type::UNIT)
++    { AddTestCase(new NrConnectedRaTestCase(),Duration::QUICK); }
++};
++static NrConnectedRaTestSuite g_connectedRaTestSuite;
++}
+diff --git a/test/nr-gnb-mac-grant-fill-test.cc b/test/nr-gnb-mac-grant-fill-test.cc
+new file mode 100644
+index 0000000..c87905a
+--- /dev/null
++++ b/test/nr-gnb-mac-grant-fill-test.cc
+@@ -0,0 +1,89 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "ns3/nr-gnb-mac.h"
++#include "ns3/test.h"
++
++#include <functional>
++
++namespace ns3
++{
++namespace
++{
++/** RLC SAP double permitting exact control of per-call progress and overhead. */
++class GrantFillRlc : public NrMacSapUser
++{
++  public:
++    void NotifyTxOpportunity(TxOpportunityParameters params) override { m_send(params); }
++    void NotifyHarqDeliveryFailure() override {}
++    void ReceivePdu(ReceivePduParameters params) override {}
++    std::function<void(TxOpportunityParameters)> m_send; ///< Emission callback
++};
++} // namespace
++
++/** Enumerate budgets, short/long subheaders, empty queues, and multiple LCs. */
++class NrGnbMacGrantFillTestCase : public TestCase
++{
++  public:
++    NrGnbMacGrantFillTestCase() : TestCase("DL grant filling respects LC/TB budgets and stops without progress") {}
++
++  private:
++    void DoRun() override
++    {
++        auto mac = CreateObject<NrGnbMac>();
++        for (uint32_t budget = 0; budget <= 512; ++budget)
++        {
++            for (uint32_t cap : {0u, 4u, 5u, 124u, 127u, 128u, 240u, 1024u})
++            {
++                const uint32_t initial = budget % 31;
++                uint32_t used = initial;
++                uint32_t calls = 0;
++                GrantFillRlc rlc;
++                rlc.m_send = [&](NrMacSapUser::TxOpportunityParameters params) {
++                    ++calls;
++                    NS_TEST_ASSERT_MSG_EQ(params.lcid, 3, "LC identity retained");
++                    NS_TEST_ASSERT_MSG_EQ(params.harqId, 2, "HARQ identity retained");
++                    const uint32_t bytes = std::min(cap, params.bytes);
++                    if (bytes > 0) used += bytes + (bytes > 127 ? 3 : 2);
++                };
++                auto params = NrMacSapUser::TxOpportunityParameters(budget, 0, 2, 0, 1, 3);
++                mac->FillDlTxOpportunity(&rlc, params, used, initial + budget + 3);
++                NS_TEST_ASSERT_MSG_LT_OR_EQ(used, initial + budget + 3, "LC budget bounds all headers");
++                NS_TEST_ASSERT_MSG_LT_OR_EQ(calls, budget + 1, "bounded calls");
++                if (cap == 0 && budget > 0)
++                    NS_TEST_ASSERT_MSG_EQ(calls, 1, "zero progress exits immediately");
++                if (cap > 0 && budget > 0)
++                    NS_TEST_ASSERT_MSG_LT_OR_EQ(initial + budget + 3 - used, 3,
++                                               "available capacity filled up to header slack");
++            }
++        }
++        // First LC has a larger nominal offer than the remaining TB; the next LC
++        // must not spend capacity already used by the first.
++        uint32_t used = 0;
++        GrantFillRlc rlc;
++        rlc.m_send = [&](NrMacSapUser::TxOpportunityParameters params) {
++            const uint32_t bytes = std::min(124u, params.bytes);
++            used += bytes + (bytes > 127 ? 3 : 2);
++        };
++        auto params = NrMacSapUser::TxOpportunityParameters(5000, 0, 2, 0, 1, 3);
++        mac->FillDlTxOpportunity(&rlc, params, used, 2515);
++        const uint32_t before = used;
++        mac->FillDlTxOpportunity(&rlc, params, used, 2515);
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(used, 2515, "transport block cannot overflow");
++        NS_TEST_ASSERT_MSG_EQ(used, before, "remaining header slack cannot form another PDU");
++        NS_TEST_ASSERT_MSG_GT(used, 2400, "120-byte RLC payload cap no longer leaves TB empty");
++        mac->Dispose();
++    }
++};
++
++/** DL multiplexing regression suite. */
++class NrGnbMacGrantFillTestSuite : public TestSuite
++{
++  public:
++    NrGnbMacGrantFillTestSuite() : TestSuite("nr-gnb-mac-grant-fill", Type::UNIT)
++    {
++        AddTestCase(new NrGnbMacGrantFillTestCase(), Duration::QUICK);
++    }
++};
++static NrGnbMacGrantFillTestSuite g_nrGnbMacGrantFillTestSuite;
++} // namespace ns3
+diff --git a/test/nr-spectrum-phy-power-matrix-test.cc b/test/nr-spectrum-phy-power-matrix-test.cc
+new file mode 100644
+index 0000000..54add49
+--- /dev/null
++++ b/test/nr-spectrum-phy-power-matrix-test.cc
+@@ -0,0 +1,88 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "ns3/nr-spectrum-phy.h"
++#include "ns3/spectrum-model.h"
++#include "ns3/spectrum-signal-parameters.h"
++#include "ns3/spectrum-value.h"
++#include "ns3/test.h"
++#include "ns3/uniform-planar-array.h"
++
++namespace ns3
++{
++/** Scalar-channel fallback must preserve burst power and occupied RBs. */
++class NrSpectrumPhyPowerMatrixTestCase : public TestCase
++{
++  public:
++    NrSpectrumPhyPowerMatrixTestCase()
++        : TestCase("Fallback matrix norm equals received PSD despite later TX allocations")
++    {
++    }
++
++  private:
++    void DoRun() override
++    {
++        auto tx = CreateObject<NrSpectrumPhy>();
++        auto rx = CreateObject<NrSpectrumPhy>();
++        tx->SetAntenna(CreateObject<UniformPlanarArray>());
++        rx->SetAntenna(CreateObject<UniformPlanarArray>());
++        Bands bands;
++        for (uint32_t rb = 0; rb < 4; ++rb)
++        {
++            const double fc = 2e9 + rb * 180000;
++            bands.push_back({fc - 90000, fc, fc + 90000});
++        }
++        auto model = Create<SpectrumModel>(bands);
++        auto params = Create<SpectrumSignalParameters>();
++        params->txPhy = tx;
++        params->psd = Create<SpectrumValue>(model);
++        (*params->psd)[0] = 2e-20;
++        (*params->psd)[1] = 0;
++        (*params->psd)[2] = 8e-20;
++        (*params->psd)[3] = 1e-21;
++        // There need not even be a live TX PSD when a delayed burst arrives.
++        auto first = rx->CreateSpectrumChannelMatrix(params);
++        for (uint32_t iteration = 0; iteration < 16; ++iteration)
++        {
++            auto later = Create<SpectrumValue>(model);
++            for (uint32_t rb = 0; rb < 4; ++rb)
++            {
++                (*later)[rb] = iteration & (1u << rb) ? 1e-8 : 0;
++            }
++            tx->SetTxPowerSpectralDensity(later);
++            auto matrix = rx->CreateSpectrumChannelMatrix(params);
++            for (uint32_t rb = 0; rb < 4; ++rb)
++            {
++                const double power = std::norm(matrix->Elem(0, 0, rb));
++                NS_TEST_ASSERT_MSG_EQ_TOL(power, (*params->psd)[rb], 1e-32,
++                                          "matrix includes received PSD and preserves silent RBs");
++                NS_TEST_ASSERT_MSG_EQ(matrix->Elem(0, 0, rb), first->Elem(0, 0, rb),
++                                      "a later allocation cannot alter the received burst");
++            }
++        }
++        auto stronger = params->Copy();
++        stronger->psd = Copy<SpectrumValue>(params->psd);
++        *stronger->psd *= 4;
++        auto matrix = rx->CreateSpectrumChannelMatrix(stronger);
++        for (uint32_t rb = 0; rb < 4; ++rb)
++        {
++            NS_TEST_ASSERT_MSG_EQ_TOL(std::norm(matrix->Elem(0, 0, rb)),
++                                      4 * (*params->psd)[rb], 1e-31,
++                                      "received power changes reach the decoder");
++        }
++        tx->Dispose(); rx->Dispose();
++    }
++};
++
++/** Fallback single-port channel matrix regressions. */
++class NrSpectrumPhyPowerMatrixTestSuite : public TestSuite
++{
++  public:
++    NrSpectrumPhyPowerMatrixTestSuite()
++        : TestSuite("nr-spectrum-phy-power-matrix", Type::UNIT)
++    {
++        AddTestCase(new NrSpectrumPhyPowerMatrixTestCase(), Duration::QUICK);
++    }
++};
++static NrSpectrumPhyPowerMatrixTestSuite g_nrSpectrumPhyPowerMatrixTestSuite;
++} // namespace ns3
+diff --git a/test/nr-test-rlc-am-resegmentation.cc b/test/nr-test-rlc-am-resegmentation.cc
+new file mode 100644
+index 0000000..a0a4aa2
+--- /dev/null
++++ b/test/nr-test-rlc-am-resegmentation.cc
+@@ -0,0 +1,521 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "nr-rlc-test-utils.h"
++
++#include "ns3/boolean.h"
++#include "ns3/nr-rlc-am.h"
++#include "ns3/nr-rlc-am-header.h"
++#include "ns3/nr-rlc-tag.h"
++#include "ns3/simulator.h"
++#include "ns3/test.h"
++#include "ns3/uinteger.h"
++
++#include <algorithm>
++#include <array>
++#include <random>
++#include <sstream>
++
++namespace ns3
++{
++namespace
++{
++/** Recording scheduler demand as well as emitted PDUs. */
++class RangeCaptureMac : public NrRlcTestCaptureMac
++{
++  public:
++    void BufferStatusReport(BufferStatusReportParameters params) override
++    {
++        m_status = params;
++    }
++    BufferStatusReportParameters m_status{}; ///< Last scheduler demand
++};
++
++/** Construct identifiable, nonuniform payload bytes. */
++Ptr<Packet>
++RangePayload(uint32_t size, uint32_t identity)
++{
++    std::vector<uint8_t> bytes(size);
++    for (uint32_t i = 0; i < size; ++i)
++    {
++        bytes[i] = (identity * 131 + i * 17 + i / 251) & 255;
++    }
++    return Create<Packet>(bytes.data(), bytes.size());
++}
++
++/** Compare every delivered byte, not just packet lengths. */
++bool
++EqualPayload(Ptr<const Packet> left, Ptr<const Packet> right)
++{
++    if (left->GetSize() != right->GetSize())
++    {
++        return false;
++    }
++    std::vector<uint8_t> a(left->GetSize()), b(right->GetSize());
++    left->CopyData(a.data(), a.size());
++    right->CopyData(b.data(), b.size());
++    return a == b;
++}
++
++/** Deliver an explicitly constructed STATUS, preserving entity tags. */
++void
++RangeStatus(Ptr<NrRlcAm> tx, const NrRlcAmHeader& header)
++{
++    auto packet = Create<Packet>();
++    packet->AddHeader(header);
++    NrRlcTag tag(Simulator::Now());
++    packet->AddByteTag(tag, 1, header.GetSerializedSize());
++    DeliverPduToRlc(tx, packet);
++}
++} // namespace
++
++/** Header wire vectors, all short partition boundaries, and seeded lossy ARQ. */
++class NrRlcAmResegmentationTestCase : public TestCase
++{
++  public:
++    /** @param seed Zero selects structural tests; positive values select lossy ARQ seeds. */
++    explicit NrRlcAmResegmentationTestCase(uint32_t seed)
++        : TestCase(seed == 0 ? "AM byte-range headers, partitions, overlap, STATUS and timers"
++                             : "AM byte-exact lossy variable-grant ARQ seed " + std::to_string(seed)),
++          m_seed(seed),
++          m_rng(seed)
++    {
++    }
++
++  private:
++    void DoRun() override;
++    /// Check wire compatibility, range fields, and truncation rejection.
++    void HeaderTests();
++    /// Enumerate short payload partitions and duplicate/overlapping reception.
++    void PartitionTests();
++    /// Check missing-range feedback, grant bounds, counters, and storage.
++    void StatusTests();
++    /// Exercise maximum offsets and partial-state reestablishment.
++    void BoundaryTests();
++    void Tick();
++    void Grant(Ptr<NrRlcAm> rlc, RangeCaptureMac& mac, uint32_t size);
++    void SendCaptured(RangeCaptureMac& capture, size_t& cursor, Ptr<NrRlcAm> peer, bool status);
++    uint32_t m_seed; ///< Reproducible scenario seed
++    std::mt19937 m_rng; ///< Local independent test randomness
++    Ptr<NrRlcAm> m_tx; ///< Sender
++    Ptr<NrRlcAm> m_rx; ///< Receiver
++    RangeCaptureMac m_txMac; ///< Sender MAC capture
++    RangeCaptureMac m_rxMac; ///< Receiver MAC capture
++    NrRlcTestSduSink m_sink; ///< Received SDUs
++    std::vector<Ptr<Packet>> m_expected; ///< Original application payloads
++    size_t m_txCursor{0}; ///< Next emitted data PDU to process
++    size_t m_rxCursor{0}; ///< Next STATUS PDU to process
++    uint32_t m_ticks{0}; ///< Simulation duration bound
++    uint32_t m_dataDrops{0}; ///< Data losses injected
++    uint32_t m_statusDrops{0}; ///< Feedback losses injected
++    uint32_t m_segments{0}; ///< Retransmission segments observed
++    uint32_t m_failures{0}; ///< Maximum-retransmission indications
++    void RecordFailure() { ++m_failures; }
++    bool m_done{false}; ///< Delivered and positively acknowledged all data
++};
++
++void
++NrRlcAmResegmentationTestCase::HeaderTests()
++{
++    // Legacy whole-PDU wire vector (ACK_SN=1023, NACK_SN=1023).
++    NrRlcAmHeader legacy;
++    legacy.SetControlPdu(NrRlcAmHeader::STATUS_PDU);
++    legacy.SetAckSn(nr::SequenceNumber10(1023));
++    legacy.PushNack(1023);
++    auto packet = Create<Packet>();
++    packet->AddHeader(legacy);
++    std::array<uint8_t, 4> actual{};
++    packet->CopyData(actual.data(), actual.size());
++    const std::array<uint8_t, 4> golden{0x0f, 0xff, 0xff, 0x80};
++    NS_TEST_ASSERT_MSG_EQ(actual == golden, true, "whole-PDU wire compatibility");
++
++    for (uint32_t count = 0; count <= 64; ++count)
++    {
++        NrRlcAmHeader source;
++        source.SetControlPdu(NrRlcAmHeader::STATUS_PDU);
++        source.SetAckSn(nr::SequenceNumber10(1023));
++        for (uint32_t i = 0; i < count; ++i)
++        {
++            const bool segmented = i % 3 != 0;
++            const uint32_t before = source.GetSerializedSize();
++            if (segmented)
++            {
++                source.PushNack(i % 2 ? 1023 : 0, i, i % 2 ? 0x7fff : i + 5);
++            }
++            else
++            {
++                source.PushNack(i % 1024);
++            }
++            NrRlcAmHeader prefix;
++            prefix.SetControlPdu(NrRlcAmHeader::STATUS_PDU);
++            prefix.SetAckSn(nr::SequenceNumber10(1023));
++            auto previous = source.GetNacks();
++            previous.pop_back();
++            for (const auto& nack : previous)
++            {
++                if (nack.segmented) prefix.PushNack(nack.sn, nack.start, nack.end);
++                else prefix.PushNack(nack.sn);
++            }
++            NS_TEST_ASSERT_MSG_EQ(prefix.GetSerializedSize(), before, "prefix size");
++            NS_TEST_ASSERT_MSG_EQ(prefix.OneMoreNackWouldFitIn(source.GetSerializedSize(), segmented),
++                                  true, "exact-fit STATUS accounting");
++            NS_TEST_ASSERT_MSG_EQ(prefix.OneMoreNackWouldFitIn(source.GetSerializedSize() - 1, segmented),
++                                  false, "one-byte-short STATUS accounting");
++        }
++        auto wire = Create<Packet>();
++        wire->AddHeader(source);
++        NrRlcAmHeader decoded;
++        NS_TEST_ASSERT_MSG_EQ(wire->PeekHeader(decoded), source.GetSerializedSize(), "header size");
++        NS_TEST_ASSERT_MSG_EQ(decoded.GetNacks().size(), count, "all NACK entries round trip");
++        auto expected = source.GetNacks().begin();
++        for (const auto& nack : decoded.GetNacks())
++        {
++            NS_TEST_ASSERT_MSG_EQ(nack.sn, expected->sn, "NACK SN");
++            NS_TEST_ASSERT_MSG_EQ(nack.segmented, expected->segmented, "E2");
++            NS_TEST_ASSERT_MSG_EQ(nack.start, expected->start, "SOstart");
++            NS_TEST_ASSERT_MSG_EQ(nack.end, expected->end, "SOend");
++            ++expected;
++        }
++        wire->PeekHeader(decoded);
++        NS_TEST_ASSERT_MSG_EQ(decoded.GetNacks().size(), count, "reusing a header clears old entries");
++        for (uint32_t length = 0; length < source.GetSerializedSize(); ++length)
++        {
++            auto truncated = wire->CreateFragment(0, length);
++            NrRlcAmHeader invalid;
++            NS_TEST_ASSERT_MSG_EQ(truncated->PeekHeader(invalid), 0, "truncated STATUS rejected");
++        }
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::PartitionTests()
++{
++    // Enumerate every two-way split and overlap of short payloads. End fragments
++    // arrive first, with duplicates; no delivery is allowed before complete coverage.
++    for (uint32_t size = 2; size <= 24; ++size)
++    {
++        for (uint32_t split = 1; split < size; ++split)
++        {
++            for (uint32_t overlap = 0; overlap <= std::min(split, size - split); ++overlap)
++            {
++                auto tx = CreateObject<NrRlcAm>();
++                auto rx = CreateObject<NrRlcAm>();
++                RangeCaptureMac txMac, rxMac;
++                NrRlcTestSduSink sink;
++                tx->SetNrMacSapProvider(&txMac);
++                rx->SetNrMacSapProvider(&rxMac);
++                rx->SetNrRlcSapUser(sink.GetSapUser());
++                auto expected = RangePayload(size, split);
++                tx->DoTransmitPdcpPdu(expected->Copy());
++                GrantTxOpportunities(tx, std::max(7u, size + 4), 1);
++                NS_TEST_ASSERT_MSG_EQ(txMac.m_pdus.size(), 1, "one canonical PDU");
++                auto tail = tx->MakeFragment(txMac.m_pdus[0], split, size, false);
++                DeliverPduToRlc(rx, tail);
++                DeliverPduToRlc(rx, tail);
++                NS_TEST_ASSERT_MSG_EQ(sink.m_sdus.size(), 0, "tail is incomplete");
++                auto head = tx->MakeFragment(txMac.m_pdus[0], 0, split + overlap, false);
++                DeliverPduToRlc(rx, head);
++                DeliverPduToRlc(rx, head);
++                NS_TEST_ASSERT_MSG_EQ(sink.m_sdus.size(), 1, "complete SDU delivered exactly once");
++                NS_TEST_ASSERT_MSG_EQ(EqualPayload(sink.m_sdus[0], expected), true,
++                                      "byte-exact overlapping reassembly");
++                NS_TEST_ASSERT_MSG_EQ(rx->m_rxonBuffer.empty(), true, "completed storage released");
++                tx->Dispose(); rx->Dispose();
++                Simulator::Destroy();
++            }
++        }
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::StatusTests()
++{
++    auto tx = CreateObject<NrRlcAm>();
++    auto rx = CreateObject<NrRlcAm>();
++    RangeCaptureMac txMac, rxMac;
++    NrRlcTestSduSink sink;
++    tx->SetNrMacSapProvider(&txMac);
++    rx->SetNrMacSapProvider(&rxMac);
++    rx->SetNrRlcSapUser(sink.GetSapUser());
++    // Three SDUs cross retransmission cuts and LI extension-byte boundaries.
++    for (uint32_t n : {37u, 91u, 172u}) tx->DoTransmitPdcpPdu(RangePayload(n, n));
++    GrantTxOpportunities(tx, 400, 1);
++    auto original = txMac.m_pdus.front();
++    auto payload = original->Copy(); NrRlcAmHeader h; payload->RemoveHeader(h);
++    NS_TEST_ASSERT_MSG_EQ(payload->GetSize(), 300, "canonical concatenation");
++    DeliverPduToRlc(rx, tx->MakeFragment(original, 0, 40, false));
++    DeliverPduToRlc(rx, tx->MakeFragment(original, 60, 130, false));
++    DeliverPduToRlc(rx, tx->MakeFragment(original, 200, 300, false));
++    rx->m_vrMs = 1;
++    rx->m_statusPduRequested = true;
++    rx->m_statusPduBufferSize = 4;
++    GrantTxOpportunities(rx, 32, 1);
++    NrRlcAmHeader status; rxMac.m_pdus.back()->PeekHeader(status);
++    NS_TEST_ASSERT_MSG_EQ(status.GetNacks().size(), 2, "two explicit holes");
++    auto hole = status.GetNacks().begin();
++    NS_TEST_ASSERT_MSG_EQ(hole->start, 40, "first hole start");
++    NS_TEST_ASSERT_MSG_EQ(hole->end, 59, "first hole inclusive end");
++    ++hole;
++    NS_TEST_ASSERT_MSG_EQ(hole->start, 130, "second hole start");
++    NS_TEST_ASSERT_MSG_EQ(hole->end, 199, "second hole inclusive end");
++    RangeStatus(tx, status);
++    NS_TEST_ASSERT_MSG_EQ(tx->m_retxBuffer[0].m_pending.size(), 2, "only missing ranges queued");
++    NS_TEST_ASSERT_MSG_EQ(tx->m_retxBuffer[0].m_retxCount, 0, "first recovery round");
++    RangeStatus(tx, status);
++    NS_TEST_ASSERT_MSG_EQ(tx->m_retxBuffer[0].m_retxCount, 0, "duplicate NACK is not a retry round");
++    NS_TEST_ASSERT_MSG_EQ(tx->m_retxBuffer[0].m_pending.size(), 2, "duplicate ranges merged");
++    uint32_t attempts = 0;
++    while (tx->m_retxBufferSize && attempts++ < 100)
++    {
++        const size_t before = txMac.m_pdus.size();
++        GrantTxOpportunities(tx, 9, 1);
++        NS_TEST_ASSERT_MSG_EQ(txMac.m_pdus.size(), before + 1, "small grants make progress");
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(txMac.m_pdus.back()->GetSize(), 9, "grant respected");
++        DeliverPduToRlc(rx, txMac.m_pdus.back());
++        NS_TEST_ASSERT_MSG_EQ(tx->m_txedBufferSize + tx->m_retxBufferSize, original->GetSize(),
++                              "one retained canonical original, despite many fragments");
++    }
++    NS_TEST_ASSERT_MSG_EQ(tx->m_txedBuffer[0].m_retxCount, 0, "fragments do not exhaust retry count");
++    NS_TEST_ASSERT_MSG_EQ(sink.m_sdus.size(), 3, "all concatenated SDUs recovered");
++    for (uint32_t i = 0; i < 3; ++i)
++    {
++        const uint32_t sizes[] = {37, 91, 172};
++        NS_TEST_ASSERT_MSG_EQ(EqualPayload(sink.m_sdus[i], RangePayload(sizes[i], sizes[i])), true,
++                              "SDU boundaries preserved across fragment cuts");
++    }
++    tx->SetMaxRetxReachedCallback(MakeCallback(&NrRlcAmResegmentationTestCase::RecordFailure, this));
++    NrRlcAmHeader retry; retry.SetControlPdu(NrRlcAmHeader::STATUS_PDU);
++    retry.SetAckSn(nr::SequenceNumber10(1)); retry.PushNack(0);
++    for (uint32_t round = 1; round <= 7; ++round)
++    {
++        RangeStatus(tx, retry);
++        uint32_t pieces = 0;
++        while (tx->m_retxBufferSize && pieces++ < 400)
++        {
++            const size_t before = txMac.m_pdus.size();
++            GrantTxOpportunities(tx, 5, 1);
++            NS_TEST_ASSERT_MSG_EQ(txMac.m_pdus.size(), before + 1, "one-byte grants progress");
++            NS_TEST_ASSERT_MSG_LT_OR_EQ(txMac.m_pdus.back()->GetSize(), 5, "one-byte payload fits");
++        }
++        NS_TEST_ASSERT_MSG_EQ(tx->m_txedBuffer[0].m_retxCount, round, "retry counts recovery rounds");
++    }
++    Simulator::Stop(NanoSeconds(1)); Simulator::Run();
++    NS_TEST_ASSERT_MSG_EQ(m_failures, 1, "max-retry indication fires once, not per fragment");
++    NrRlcAmHeader ack; ack.SetControlPdu(NrRlcAmHeader::STATUS_PDU);
++    ack.SetAckSn(nr::SequenceNumber10(1)); RangeStatus(tx, ack);
++    NS_TEST_ASSERT_MSG_EQ(tx->m_txedBufferSize + tx->m_retxBufferSize, 0, "ACK releases originals");
++    NS_TEST_ASSERT_MSG_EQ(txMac.m_status.retxQueueSize, 0, "ACK clears scheduler demand");
++    tx->Dispose(); rx->Dispose(); Simulator::Destroy();
++
++    // A tiny STATUS must fall back to whole-SN NACKs, not acknowledge omitted holes.
++    for (uint32_t grant : {4u, 5u, 6u, 7u, 8u, 9u, 10u, 16u})
++    {
++        auto a = CreateObject<NrRlcAm>(); auto b = CreateObject<NrRlcAm>();
++        RangeCaptureMac am, bm; NrRlcTestSduSink output;
++        a->SetNrMacSapProvider(&am); b->SetNrMacSapProvider(&bm);
++        b->SetNrRlcSapUser(output.GetSapUser());
++        a->DoTransmitPdcpPdu(RangePayload(100, 99)); GrantTxOpportunities(a, 104, 1);
++        DeliverPduToRlc(b, a->MakeFragment(am.m_pdus[0], 20, 40, false));
++        DeliverPduToRlc(b, a->MakeFragment(am.m_pdus[0], 60, 80, false));
++        b->m_vrMs = 1; b->m_statusPduRequested = true; b->m_statusPduBufferSize = 4;
++        GrantTxOpportunities(b, grant, 1);
++        NrRlcAmHeader small; bm.m_pdus.back()->PeekHeader(small);
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(bm.m_pdus.back()->GetSize(), grant, "STATUS fits grant");
++        NS_TEST_ASSERT_MSG_EQ(small.IsNackPresent(nr::SequenceNumber10(0)), true,
++                              "all incomplete data remains NACKed");
++        if (small.GetNacks().size() == 1)
++        {
++            NS_TEST_ASSERT_MSG_EQ(small.GetNacks().front().segmented, false,
++                                  "partial hole list uses whole-PDU fallback");
++        }
++        a->Dispose(); b->Dispose(); Simulator::Destroy();
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::BoundaryTests()
++{
++    auto tx = CreateObject<NrRlcAm>(); auto rx = CreateObject<NrRlcAm>();
++    RangeCaptureMac txMac, rxMac; NrRlcTestSduSink sink;
++    tx->SetNrMacSapProvider(&txMac); rx->SetNrMacSapProvider(&rxMac);
++    rx->SetNrRlcSapUser(sink.GetSapUser());
++    tx->SetAttribute("MaxTxBufferSize", UintegerValue(0));
++    auto expected = RangePayload(32768, 77);
++    tx->DoTransmitPdcpPdu(expected->Copy()); GrantTxOpportunities(tx, 32772, 1);
++    auto original = txMac.m_pdus.front();
++    auto tail = tx->MakeFragment(original, 32767, 32768, false);
++    NrRlcAmHeader h; tail->PeekHeader(h);
++    NS_TEST_ASSERT_MSG_EQ(h.GetSegmentOffset(), 32767, "maximum representable offset");
++    NS_TEST_ASSERT_MSG_EQ(h.GetLastOffset(), 32768, "exclusive end does not wrap");
++    DeliverPduToRlc(rx, tail);
++    NS_TEST_ASSERT_MSG_EQ(sink.m_sdus.size(), 0, "last segment does not imply complete coverage");
++    DeliverPduToRlc(rx, tx->MakeFragment(original, 0, 32767, false));
++    NS_TEST_ASSERT_MSG_EQ(sink.m_sdus.size(), 1, "full 15-bit offset space reassembled");
++    NS_TEST_ASSERT_MSG_EQ(EqualPayload(sink.m_sdus[0], expected), true, "maximum-offset data integrity");
++    tx->Dispose(); rx->Dispose(); Simulator::Destroy();
++
++    // A peer entity replacement must discard partial byte ranges from the old
++    // epoch, and a delayed old fragment must not attach to the new SN zero.
++    auto oldTx = CreateObject<NrRlcAm>(); auto newTx = CreateObject<NrRlcAm>();
++    auto receiver = CreateObject<NrRlcAm>();
++    RangeCaptureMac oldMac, newMac, receiverMac; NrRlcTestSduSink output;
++    oldTx->SetNrMacSapProvider(&oldMac); newTx->SetNrMacSapProvider(&newMac);
++    receiver->SetNrMacSapProvider(&receiverMac); receiver->SetNrRlcSapUser(output.GetSapUser());
++    oldTx->DoTransmitPdcpPdu(RangePayload(100, 1)); GrantTxOpportunities(oldTx, 104, 1);
++    DeliverPduToRlc(receiver, oldTx->MakeFragment(oldMac.m_pdus[0], 0, 50, false));
++    NS_TEST_ASSERT_MSG_EQ(receiver->m_rxonBuffer.size(), 1, "old partial state retained before reset");
++    auto fresh = RangePayload(50, 2);
++    newTx->DoTransmitPdcpPdu(fresh->Copy()); GrantTxOpportunities(newTx, 54, 1);
++    DeliverPduToRlc(receiver, newMac.m_pdus[0]);
++    DeliverPduToRlc(receiver, oldTx->MakeFragment(oldMac.m_pdus[0], 50, 100, false));
++    NS_TEST_ASSERT_MSG_EQ(output.m_sdus.size(), 1, "late old-epoch fragment cannot create a delivery");
++    NS_TEST_ASSERT_MSG_EQ(EqualPayload(output.m_sdus[0], fresh), true, "new epoch is not contaminated");
++    NS_TEST_ASSERT_MSG_EQ(receiver->m_rxonBuffer.empty(), true, "partial state cleared on reestablishment");
++    oldTx->Dispose(); newTx->Dispose(); receiver->Dispose(); Simulator::Destroy();
++}
++
++void
++NrRlcAmResegmentationTestCase::Grant(Ptr<NrRlcAm> rlc, RangeCaptureMac& mac, uint32_t size)
++{
++    const size_t before = mac.m_pdus.size();
++    GrantTxOpportunities(rlc, size, 1);
++    for (size_t i = before; i < mac.m_pdus.size(); ++i)
++    {
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(mac.m_pdus[i]->GetSize(), size, "every PDU fits actual grant");
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::SendCaptured(RangeCaptureMac& capture, size_t& cursor,
++                                          Ptr<NrRlcAm> peer, bool status)
++{
++    while (cursor < capture.m_pdus.size())
++    {
++        auto packet = capture.m_pdus[cursor++];
++        NrRlcAmHeader header; packet->PeekHeader(header);
++        if (header.IsDataPdu() && header.GetResegmentationFlag() == NrRlcAmHeader::SEGMENT)
++        {
++            ++m_segments;
++        }
++        bool drop = m_rng() % 100 < (status ? 25u : 22u);
++        // Force feedback outage, so poll expiry and resegmentation are exercised.
++        drop = drop || (status && Simulator::Now() < MilliSeconds(350));
++        if (drop)
++        {
++            if (status) ++m_statusDrops; else ++m_dataDrops;
++            continue;
++        }
++        const auto delay = MilliSeconds(15 + m_rng() % 36);
++        Simulator::Schedule(delay, [peer, packet]() { DeliverPduToRlc(peer, packet); });
++        if (m_rng() % 5 == 0)
++        {
++            Simulator::Schedule(delay + MilliSeconds(1 + m_rng() % 20),
++                                [peer, packet]() { DeliverPduToRlc(peer, packet); });
++        }
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::Tick()
++{
++    ++m_ticks;
++    const uint32_t grant = m_ticks == 1 ? 4096
++                           : m_ticks % 13 < 3 ? m_ticks % 5 : 5 + m_rng() % 190;
++    Grant(m_tx, m_txMac, grant);
++    SendCaptured(m_txMac, m_txCursor, m_rx, false);
++    if (m_rxMac.m_status.statusPduSize)
++    {
++        Grant(m_rx, m_rxMac, 4 + m_rng() % 32);
++    }
++    SendCaptured(m_rxMac, m_rxCursor, m_tx, true);
++    if (m_sink.m_sdus.size() == m_expected.size() && m_tx->m_vtA == m_tx->m_vtS &&
++        m_tx->m_txonBufferSize + m_tx->m_retxBufferSize + m_tx->m_txedBufferSize == 0)
++    {
++        m_done = true;
++        Simulator::Stop();
++    }
++    else if (m_ticks < 12000)
++    {
++        Simulator::Schedule(MilliSeconds(1), &NrRlcAmResegmentationTestCase::Tick, this);
++    }
++    else
++    {
++        Simulator::Stop();
++    }
++}
++
++void
++NrRlcAmResegmentationTestCase::DoRun()
++{
++    if (m_seed == 0)
++    {
++        HeaderTests(); PartitionTests(); StatusTests(); BoundaryTests();
++        return;
++    }
++    m_tx = CreateObject<NrRlcAm>(); m_rx = CreateObject<NrRlcAm>();
++    m_tx->SetNrMacSapProvider(&m_txMac); m_rx->SetNrMacSapProvider(&m_rxMac);
++    m_rx->SetNrRlcSapUser(m_sink.GetSapUser());
++    m_tx->SetAttribute("MaxTxBufferSize", UintegerValue(0));
++    m_tx->SetAttribute("TxOpportunityForRetxAlwaysBigEnough", BooleanValue(m_seed % 128 == 0));
++    m_tx->SetAttribute("MaxDataFieldBytes", UintegerValue(m_seed % 2 ? 0 : 120));
++    m_tx->SetAttribute("PollRetransmitTimer", TimeValue(MilliSeconds(200)));
++    m_rx->SetAttribute("ReorderingTimer", TimeValue(MilliSeconds(80)));
++    m_rx->SetAttribute("StatusProhibitTimer", TimeValue(MilliSeconds(5)));
++    // Begin near wraparound; more than one SN epoch is exercised by small grants.
++    const uint16_t start = m_seed % 3 == 0 ? 1018 : 0;
++    m_tx->m_vtA = start; m_tx->m_vtS = start; m_tx->m_vtMs = m_tx->m_vtA + 512;
++    m_rx->m_vrR = start; m_rx->m_vrMs = start; m_rx->m_vrH = start; m_rx->m_vrX = start;
++    m_rx->m_vrMr = m_rx->m_vrR + 512; m_rx->m_expectedSeqNumber = start;
++    m_tx->m_vtA.SetModulusBase(m_tx->m_vtA);
++    m_tx->m_vtS.SetModulusBase(m_tx->m_vtA);
++    m_tx->m_vtMs.SetModulusBase(m_tx->m_vtA);
++    m_rx->m_vrR.SetModulusBase(m_rx->m_vrR);
++    m_rx->m_vrMs.SetModulusBase(m_rx->m_vrR);
++    m_rx->m_vrH.SetModulusBase(m_rx->m_vrR);
++    m_rx->m_vrX.SetModulusBase(m_rx->m_vrR);
++    m_rx->m_vrMr.SetModulusBase(m_rx->m_vrR);
++    const uint32_t sdus = m_seed % 64 == 0 ? 1800 : 32;
++    for (uint32_t i = 0; i < sdus; ++i)
++    {
++        auto packet = RangePayload(20 + m_rng() % (sdus > 32 ? 60 : 700), i);
++        m_expected.push_back(packet->Copy());
++        m_tx->DoTransmitPdcpPdu(packet);
++    }
++    Simulator::ScheduleNow(&NrRlcAmResegmentationTestCase::Tick, this);
++    Simulator::Run();
++    NS_TEST_ASSERT_MSG_EQ(m_done, true, "lossy ARQ must drain within bounded time; seed " << m_seed);
++    NS_TEST_ASSERT_MSG_EQ(m_sink.m_sdus.size(), m_expected.size(), "all SDUs delivered once");
++    for (size_t i = 0; i < std::min(m_sink.m_sdus.size(), m_expected.size()); ++i)
++    {
++        NS_TEST_ASSERT_MSG_EQ(EqualPayload(m_sink.m_sdus[i], m_expected[i]), true,
++                              "byte-exact in-order SDU " << i << " seed " << m_seed);
++    }
++    NS_TEST_ASSERT_MSG_GT(m_dataDrops, 0, "loss injection active");
++    NS_TEST_ASSERT_MSG_GT(m_statusDrops, 0, "feedback loss injection active");
++    NS_TEST_ASSERT_MSG_GT(m_segments, 0, "resegmentation exercised");
++    NS_TEST_ASSERT_MSG_EQ(m_tx->m_txedBufferSize + m_tx->m_retxBufferSize, 0, "retained state drains");
++    m_tx->Dispose(); m_rx->Dispose(); Simulator::Destroy();
++    // TestCase instances live until the whole suite exits. Release packet graphs
++    // after each seed so extensive sanitizer runs have bounded live storage.
++    m_txMac.m_pdus.clear(); m_rxMac.m_pdus.clear();
++    m_expected.clear(); m_sink.m_sdus.clear();
++    m_tx = nullptr; m_rx = nullptr;
++}
++
++/** AM retransmission resegmentation and data-integrity regressions. */
++class NrRlcAmResegmentationTestSuite : public TestSuite
++{
++  public:
++    NrRlcAmResegmentationTestSuite()
++        : TestSuite("nr-test-rlc-am-resegmentation", Type::SYSTEM)
++    {
++        AddTestCase(new NrRlcAmResegmentationTestCase(0), Duration::QUICK);
++        for (uint32_t seed = 1; seed <= 1024; ++seed)
++        {
++            AddTestCase(new NrRlcAmResegmentationTestCase(seed),
++                        seed <= 64 ? Duration::QUICK : Duration::EXTENSIVE);
++        }
++    }
++};
++static NrRlcAmResegmentationTestSuite g_nrRlcAmResegmentationTestSuite;
++} // namespace ns3
+diff --git a/test/nr-ul-grant-power-test.cc b/test/nr-ul-grant-power-test.cc
+new file mode 100644
+index 0000000..9fd71ea
+--- /dev/null
++++ b/test/nr-ul-grant-power-test.cc
+@@ -0,0 +1,337 @@
++// Copyright (c) 2026
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "ns3/nr-amc.h"
++#include "ns3/nr-lte-mi-error-model.h"
++#include "ns3/nr-mac-scheduler-cqi-management.h"
++#include "ns3/nr-mac-scheduler-ue-info-rr.h"
++#include "ns3/nr-mac-scheduler-ofdma-rr.h"
++#include "ns3/simulator.h"
++#include "ns3/spectrum-model.h"
++#include "ns3/spectrum-value.h"
++#include "ns3/test.h"
++
++#include <cmath>
++
++namespace ns3
++{
++class GrantCschedSapUser : public NrMacCschedSapUser
++{
++  public:
++    GrantCschedSapUser()
++        : NrMacCschedSapUser()
++    {
++    }
++
++    void CschedCellConfigCnf(
++        [[maybe_unused]] const struct CschedCellConfigCnfParameters& params) override
++    {
++    }
++
++    void CschedUeConfigCnf(
++        [[maybe_unused]] const struct CschedUeConfigCnfParameters& params) override
++    {
++    }
++
++    void CschedLcConfigCnf(
++        [[maybe_unused]] const struct CschedLcConfigCnfParameters& params) override
++    {
++    }
++
++    void CschedLcReleaseCnf(
++        [[maybe_unused]] const struct CschedLcReleaseCnfParameters& params) override
++    {
++    }
++
++    void CschedUeReleaseCnf(
++        [[maybe_unused]] const struct CschedUeReleaseCnfParameters& params) override
++    {
++    }
++
++    void CschedUeConfigUpdateInd(
++        [[maybe_unused]] const struct CschedUeConfigUpdateIndParameters& params) override
++    {
++    }
++
++    void CschedCellConfigUpdateInd(
++        [[maybe_unused]] const struct CschedCellConfigUpdateIndParameters& params) override
++    {
++    }
++};
++
++class GrantSchedSapUser : public NrMacSchedSapUser
++{
++  public:
++    GrantSchedSapUser()
++        : NrMacSchedSapUser()
++    {
++    }
++
++    void SchedConfigInd(const struct SchedConfigIndParameters& params) override
++    {
++    }
++
++    // For the rest, setup some hard-coded values; for the moment, there is
++    // no need to have real values here.
++    Ptr<const SpectrumModel> GetSpectrumModel() const override
++    {
++        return nullptr;
++    }
++
++    uint32_t GetNumRbPerRbg() const override
++    {
++        return 1;
++    }
++
++    uint8_t GetNumHarqProcess() const override
++    {
++        return 20;
++    }
++
++    uint16_t GetBwpId() const override
++    {
++        return 0;
++    }
++
++    uint16_t GetCellId() const override
++    {
++        return 0;
++    }
++
++    uint32_t GetSymbolsPerSlot() const override
++    {
++        return 14;
++    }
++
++    Time GetSlotPeriod() const override
++    {
++        return MilliSeconds(1);
++    }
++
++    void BuildRarList(SlotAllocInfo& allocInfo) override
++    {
++    }
++};
++
++/** Expose allocation and grant construction for power-budget tests. */
++class GrantBudgetScheduler : public NrMacSchedulerOfdmaRR
++{
++  public:
++    using NrMacSchedulerOfdma::AssignULRBG;
++    using NrMacSchedulerOfdma::CreateUlDci;
++};
++
++/** Grant-width changes must not reuse narrow-grant power in a wide grant. */
++class NrUlGrantPowerTestCase : public TestCase
++{
++  public:
++    NrUlGrantPowerTestCase() : TestCase("UL full-grant MCS is independent of observed allocation width") {}
++
++  private:
++    void AllocationTests(Ptr<const SpectrumModel> model, Ptr<NrAmc> amc, Ptr<NrLteMiErrorModel> error);
++    void DoRun() override
++    {
++        Bands bands;
++        for (uint32_t rb = 0; rb < 53; ++rb)
++        {
++            const double fc = 2e9 + rb * 180000;
++            bands.push_back({fc - 90000, fc, fc + 90000});
++        }
++        auto model = Create<SpectrumModel>(bands);
++        auto amc = CreateObject<NrAmc>();
++        amc->SetUlMode();
++        auto error = CreateObject<NrLteMiErrorModel>();
++        auto ue = std::make_shared<NrMacSchedulerUeInfoRR>(1, BeamId(0, 0), [] { return 1; });
++        ue->m_ulAmc = amc;
++        ue->m_ulMcs = 22;
++        ue->m_ulGrantPowerAwareMcs = true;
++        NrMacSchedulerCQIManagement cqi;
++        cqi.InstallGetNrAmcUlFn([amc] { return amc; });
++        cqi.InstallGetStartMcsUlFn([] { return 0; });
++        uint32_t checked = 0;
++        for (double totalSinr : {0.1, 3.0, 30.0, 300.0, 3000.0})
++        {
++            std::vector<uint8_t> reference;
++            for (uint32_t observed : {1u, 3u, 7u, 30u, 53u})
++            {
++                uint32_t transition = 0;
++                NrMacSchedSapProvider::SchedUlCqiInfoReqParameters report{};
++                report.m_ulCqi.m_sinr.assign(53, 0);
++                std::vector<bool> mask(53, false);
++                for (uint32_t rb = 0; rb < observed; ++rb)
++                {
++                    report.m_ulCqi.m_sinr[rb] = totalSinr / observed;
++                    mask[rb] = true;
++                }
++                cqi.UlSBCQIReported(100, 100, report, ue, mask, 1, model);
++                NS_TEST_ASSERT_MSG_EQ_TOL(ue->m_ulTotalPowerSinr, totalSinr, 1e-9,
++                                          "allocation-normalized observation");
++                for (uint32_t width = 1; width <= 53; ++width)
++                {
++                    for (uint32_t symbols : {1u, 7u, 13u})
++                    {
++                        ue->m_ulRBG.clear();
++                        SpectrumValue predicted(model);
++                        std::vector<int> active;
++                        // Shift the mask to exercise RBs absent from the observation.
++                        for (uint32_t rb = 53 - width; rb < 53; ++rb)
++                        {
++                            predicted[rb] = totalSinr / width;
++                            active.push_back(rb);
++                            for (uint32_t s = 0; s < symbols; ++s) ue->m_ulRBG.push_back(rb);
++                        }
++                        const auto grant = ue->GetUlGrant();
++                        const auto selected = grant.mcs;
++                        if (totalSinr == 30 && symbols == 13 && width == 1)
++                            NS_TEST_ASSERT_MSG_GT(selected, 15, "narrow high-SINR grants use efficient modulation");
++                        if (totalSinr == 30 && symbols == 13 && width == 30)
++                            NS_TEST_ASSERT_MSG_LT(selected, 10, "wide grant cannot reuse narrow-grant MCS 22");
++                        ue->UpdateUlMetric();
++                        const auto bytes = grant.tbSize;
++                        NS_TEST_ASSERT_MSG_EQ(ue->m_ulTbSize, bytes, "allocation metric uses grant MCS");
++                        if (bytes > 0)
++                        {
++                            auto result = error->GetTbDecodificationStats(predicted, active, bytes, selected, {});
++                            NS_TEST_ASSERT_MSG_LT_OR_EQ(result->m_tbler, 0.1,
++                                                       "selected full TB meets target if feasible");
++                        }
++                        // Changing only the observed width must not alter the
++                        // decision for the same future physical grant.
++                        if (observed == 1)
++                        {
++                            reference.push_back(selected);
++                        }
++                        else
++                        {
++                            NS_TEST_ASSERT_MSG_EQ(selected, reference.at(transition),
++                                                  "past grant width does not bias future MCS");
++                        }
++                        ++transition;
++                        ++checked;
++                    }
++                }
++            }
++        }
++        NS_TEST_ASSERT_MSG_EQ(checked, 3975, "grant transition coverage");
++        ue->m_ulMcs = 17;
++        ue->m_ulCqi.m_timer = 0;
++        NS_TEST_ASSERT_MSG_EQ(ue->GetUlMcsForGrant(), 17, "expired CQI never supplies a prediction");
++        std::unordered_map<uint16_t, std::shared_ptr<NrMacSchedulerUeInfo>> ues{{1, ue}};
++        cqi.RefreshUlCqiMaps(ues);
++        NS_TEST_ASSERT_MSG_EQ(ue->GetUlMcsForGrant(), 0, "expiry restores starting MCS");
++        ue->m_ulCqi.m_timer = 10;
++        ue->m_ulGrantPowerAwareMcs = false;
++        ue->m_ulMcs = 11;
++        NS_TEST_ASSERT_MSG_EQ(ue->GetUlMcsForGrant(), 11, "disabled correction preserves configured MCS");
++        ue->m_ulGrantPowerAwareMcs = true;
++        ue->m_ulRBG.clear();
++        NS_TEST_ASSERT_MSG_EQ(ue->GetUlMcsForGrant(), 11, "no grant retains cached MCS");
++        ue->m_ulRBG.assign(13, 0);
++        ue->m_ulTotalPowerSinr = 0;
++        NS_TEST_ASSERT_MSG_EQ(ue->GetUlMcsForGrant(), 0, "deep fade cannot reuse high MCS");
++        // Two RBs per RBG, repeated across symbols. The final observed RBG is
++        // partial; CQI bookkeeping must not read beyond the 53-RB spectrum.
++        auto grouped = std::make_shared<NrMacSchedulerUeInfoRR>(2, BeamId(0, 0), [] { return 2; });
++        grouped->m_ulAmc = amc;
++        grouped->m_ulGrantPowerAwareMcs = true;
++        NrMacSchedSapProvider::SchedUlCqiInfoReqParameters report{};
++        report.m_ulCqi.m_sinr.assign(53, 30.0 / 53);
++        cqi.UlSBCQIReported(100, 100, report, grouped, std::vector<bool>(27, true), 2, model);
++        NS_TEST_ASSERT_MSG_EQ_TOL(grouped->m_ulTotalPowerSinr, 30, 1e-9, "partial source RBG bounded");
++        grouped->m_ulRBG = {2, 2, 2, 5, 5, 5};
++        SpectrumValue physical(model);
++        std::vector<int> map{4, 5, 10, 11};
++        for (auto rb : map) physical[rb] = 7.5;
++        const auto selected = grouped->GetUlMcsForGrant();
++        const auto bytes = amc->CalculateTbSize(selected, 1, 12);
++        auto result = error->GetTbDecodificationStats(physical, map, bytes, selected, {});
++        NS_TEST_ASSERT_MSG_LT_OR_EQ(result->m_tbler, 0.1, "RBG repetitions do not dilute per-RB power");
++        AllocationTests(model, amc, error);
++        amc->Dispose();
++        error->Dispose();
++    }
++};
++
++
++void
++NrUlGrantPowerTestCase::AllocationTests(Ptr<const SpectrumModel> model, Ptr<NrAmc> amc,
++                                       Ptr<NrLteMiErrorModel> error)
++{
++    auto scheduler = CreateObject<GrantBudgetScheduler>();
++    GrantCschedSapUser csap;
++    GrantSchedSapUser sap;
++    scheduler->SetMacCschedSapUser(&csap);
++    scheduler->SetMacSchedSapUser(&sap);
++    scheduler->InstallUlAmc(amc);
++    NrMacCschedSapProvider::CschedCellConfigReqParameters cell{};
++    cell.m_dlBandwidth = 53;
++    cell.m_ulBandwidth = 53;
++    scheduler->GetMacCschedSapProvider()->CschedCellConfigReq(cell);
++    const BeamId beam(0, 0);
++    for (uint32_t backlog : {1u, 10u, 1000000u})
++    for (const auto& powers : {std::vector<double>{3.0}, std::vector<double>{3.0, 3000.0},
++                               std::vector<double>{0.0, 3000.0}, std::vector<double>{0.0}})
++    {
++        NrMacSchedulerNs3::ActiveUeMap active;
++        std::vector<std::shared_ptr<NrMacSchedulerUeInfoRR>> ues;
++        uint16_t rnti = 1;
++        for (auto power : powers)
++        {
++            auto ue = std::make_shared<NrMacSchedulerUeInfoRR>(rnti++, beam, [] { return 1; });
++            ue->m_ulAmc = amc;
++            ue->m_ulGrantPowerAwareMcs = true;
++            ue->m_ulTotalPowerSinr = power;
++            ue->m_ulCqiSpectrumModel = model;
++            ue->m_ulCqi.m_timer = 100;
++            active[beam].push_back({ue, backlog});
++            ues.push_back(ue);
++        }
++        const auto symbols = scheduler->AssignULRBG(13, active);
++        NrMacSchedulerNs3::PointInFTPlane point(0, 13);
++        std::set<uint32_t> assigned;
++        for (auto ue : ues)
++        {
++            if (ue->m_ulRBG.empty())
++            {
++                NS_TEST_ASSERT_MSG_EQ(ue->m_ulTotalPowerSinr, 0, "only an outage UE is deferred");
++                continue;
++            }
++            const auto dci = scheduler->CreateUlDci(&point, ue, symbols.at(beam));
++            NS_TEST_ASSERT_MSG_NE(dci, nullptr, "a usable allocation creates a DCI");
++            NS_TEST_ASSERT_MSG_GT_OR_EQ(dci->m_tbSize, 15,
++                                       "grant fits BSR, MAC header and minimum RLC opportunity");
++            std::vector<int> rbMap;
++            SpectrumValue sinr(model);
++            for (uint32_t rb = 0; rb < dci->m_rbgBitmask.size(); ++rb)
++            {
++                if (dci->m_rbgBitmask[rb])
++                {
++                    NS_TEST_ASSERT_MSG_EQ(assigned.insert(rb).second, true, "UE grants do not overlap");
++                    rbMap.push_back(rb);
++                }
++            }
++            for (auto rb : rbMap) sinr[rb] = ue->m_ulTotalPowerSinr / rbMap.size();
++            auto result = error->GetTbDecodificationStats(sinr, rbMap, dci->m_tbSize, dci->m_mcs, {});
++            NS_TEST_ASSERT_MSG_LT_OR_EQ(result->m_tbler, 0.1, "actual emitted DCI meets power budget");
++            NS_TEST_ASSERT_MSG_EQ(dci->m_tbSize, ue->m_ulTbSize, "metric and emitted grant agree");
++            if (ue->m_ulTotalPowerSinr == 3)
++                NS_TEST_ASSERT_MSG_LT(rbMap.size(), 53, "power-limited UE retains a narrower feasible grant");
++        }
++        if (powers.size() == 2 && backlog == 1000000)
++            NS_TEST_ASSERT_MSG_EQ(assigned.size(), 53, "resources refused by weak UE remain available to strong UE");
++    }
++    scheduler->Dispose();
++    Simulator::Destroy();
++}
++
++/** @ingroup test Grant-aware UL AMC regression suite. */
++class NrUlGrantPowerTestSuite : public TestSuite
++{
++  public:
++    NrUlGrantPowerTestSuite() : TestSuite("nr-ul-grant-power", Type::UNIT)
++    {
++        AddTestCase(new NrUlGrantPowerTestCase(), Duration::QUICK);
++    }
++};
++static NrUlGrantPowerTestSuite g_nrUlGrantPowerTestSuite;
++} // namespace ns3

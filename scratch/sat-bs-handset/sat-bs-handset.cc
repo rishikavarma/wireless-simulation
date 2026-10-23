@@ -188,7 +188,9 @@ main(int argc, char* argv[])
     nr.phyMetrics->OpenSinrTraces(traces.sinrDlCsv, traces.sinrUlCsv);
     ue->AddApplication(ueApp);
     if(sim.directWorkload.empty()) {
-        ueApp->SetStartTime(trafficStart);ueApp->SetStopTime(trafficStop);
+        ueApp->SetStartTime(trafficStart);
+        ueApp->SetStopTime(simStop);
+        Simulator::Schedule(trafficStop, &UeTcpClient::StopGenerating, ueApp);
     } else {
         // Keep the legacy application unstarted; native sources supply their own transport samples.
         ueApp->SetStartTime(simStop+Seconds(1));
@@ -319,14 +321,10 @@ main(int argc, char* argv[])
     }
     std::cout << "result ntnRxBoundaryAdjustments=" << boundaryAdjustments << " maxToleranceNs=" << 100 << '\n';
 
-    if (sim.directWorkload.empty() && !ueApp->EverConnected())
-    {
-        Simulator::Destroy();
-        nr.phyMetrics->CloseTraces();
-        std::filesystem::remove_all(traces.directory);
-        std::cout << "discard: UE never connected, removed " << traces.directory << '\n';
-        return 1;
-    }
+    // A connection failure is an observed network outcome. Retain all traces
+    // and write the normal application report, including zero delivery.
+    if (sim.directWorkload.empty())
+        std::cout << "result application everConnected=" << ueApp->EverConnected() << '\n';
 
     const UeAppMetrics ueM = sim.directWorkload.empty()?ueApp->GetMetrics():flows.front()->GetMetrics();
     const BsAppMetrics bsM = bsApp->GetMetrics();

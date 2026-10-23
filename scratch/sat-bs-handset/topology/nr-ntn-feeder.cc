@@ -99,9 +99,6 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
                            EnumValue(NrGnbRrc::RLC_AM_ALWAYS));
         Config::SetDefault("ns3::NrRlcAm::PollRetransmitTimer", TimeValue(MilliSeconds(100)));
         Config::SetDefault("ns3::NrRlcAm::ReorderingTimer", TimeValue(MilliSeconds(100)));
-        // Current NR RLC AM cannot resegment a NACKed PDU. Bound new PDUs
-        // within the typical 10 MHz MCS-0 uplink grant to avoid a stuck SN.
-        Config::SetDefault("ns3::NrRlcAm::MaxDataFieldBytes", UintegerValue(120));
     }
 
     CcBwpCreator ccBwpCreator;
@@ -216,6 +213,14 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     ulUePhy->SetNoiseFigure(sim.ueNoiseFigureDb);
     dlUePhy->SetTxPower(uplinkTxPower);
     ulUePhy->SetTxPower(uplinkTxPower);
+    // The scalar bent-pipe channel is flat across RBs. Match grant prediction
+    // to the actual UE power policy; other power policies keep their own AMC.
+    BooleanValue uplinkPowerControl;
+    ulUePhy->GetAttribute("EnableUplinkPowerControl", uplinkPowerControl);
+    const bool grantPowerCorrection = sim.IsHandheld() && !uplinkPowerControl.Get() &&
+        ulUePhy->GetPowerAllocationType() == NrSpectrumValueHelper::UNIFORM_POWER_ALLOCATION_USED;
+    DynamicCast<NrGnbNetDevice>(out.gnbNetDev.Get(0))->GetScheduler(1)->SetAttribute(
+        "UlGrantPowerAwareMcs", BooleanValue(grantPowerCorrection));
     dlGnbPhy->SetPattern("DL|DL|DL|DL|DL|DL|DL|DL|DL|DL|");
     ulGnbPhy->SetPattern("UL|UL|UL|UL|UL|UL|UL|UL|UL|UL|");
     NrHelper::GetBwpManagerGnb(out.gnbNetDev.Get(0))->SetOutputLink(1, 0);

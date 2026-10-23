@@ -39,10 +39,22 @@ The dataset scripts currently use the repository's `ns-3-dev` path; provide a
 symlink there when using another checkout. Re-running setup preserves an
 already patched checkout and rejects conflicting edits or a different commit.
 
+## RLC recovery and decoder regressions
+
+The maintained NR patch supports RLC AM retransmission resegmentation and
+missing-byte recovery, fills downlink grants with multiple bounded RLC PDUs,
+and corrects scalar-channel decoder power scaling. The handheld reference uses
+grant-sized initial PDUs without the historical 120-byte cap. See [implementation and regression commands](docs/rlc-am-retransmission.md)
+for the supported format, recovery behavior, and extensive loss/grant tests.
+UL grant prediction now accounts for the handheld UE's fixed total transmit
+power and full TB size. Echo traffic stops generating before its receiver closes,
+so `appDrain` can count late replies. The same document describes these fixes
+and their regression commands.
+
 ## Comparison dataset and plots
 
-Run these commands from the repository root with a **fresh output directory
-and unused prefix**:
+Run this command from the repository root to start or resume the comparison
+dataset. Add `--clean` to restart in the same directory with the same prefix:
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset comparison --out-dir results/full-example --run-prefix full-example --jobs 8
@@ -66,9 +78,10 @@ of the available knobs. Adding support for a knob does not multiply that design.
 
 `--preset full` reads [`scripts/dataset/full_dataset.json`](scripts/dataset/full_dataset.json).
 Its default is **2,000 configurations × 20 matched RNG repeats = 40,000 runs**.
-It uses 49 controlled profiles with automatic relay switching enabled, plus
-1,951 sampled joint configurations, stratified across nine applications, six
-TCP algorithms or UDP, and supported traffic directions. Enabling selection
+It uses 49 controlled profiles with automatic relay switching enabled and 1,951
+sampled joint configurations, stratified across nine applications, six TCP
+algorithms or UDP, supported traffic directions, and TCP socket enlargement.
+Deliberate stress profiles are currently disabled. Enabling selection
 merges the formerly separate baseline and switch profile. Source/load rates,
 queue budgets, movement, bandwidth and attenuation vary together. Orbit altitude
 stays fixed at **800 km**, with 53° inclination and 8° relay spacing; automatic
@@ -99,13 +112,34 @@ Later, explicitly execute that saved plan and the remaining stages:
 python3 scripts/dataset/run_dataset.py --out-dir results/full-training --run --post --analyze --report --jobs 8
 ```
 
+Use the fixed directory `results/full-training` to start or resume all stages:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --out-dir results/full-training --run-prefix full-training --jobs 8
+```
+
+To discard this campaign and its recorded raw outputs, then restart in the same
+directory, explicitly add `--clean`:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full \
+  --out-dir results/full-training --run-prefix full-training --clean --jobs 8
+```
+
+Omit `--clean` on subsequent runs to continue partial execution; completed
+simulation statuses are reused. Add `--plan` to the cleanup command to reset and
+write configurations without simulating. Cleanup never runs by default and does
+not delete unrelated experiments. Source/model changes still require a restart.
+
 `--profile-count`, `--replicates` and `--design-seed` override planning defaults.
 `--target-windows` can instead raise the profile count to meet an explicit
 20-token-window target. For example, `--preset full --target-windows 35000000
 --describe` describes **714,300 runs / 35,000,700 windows** without creating or
 executing a plan. This is much larger than the default; a time-token count must
 not be confused with a window count when comparing datasets.
-At least 49 full-preset profiles are retained for controlled comparisons. Resuming uses the
+At least 49 full-preset profiles are required for the controlled comparisons.
+Deliberate stress profiles are disabled by `includeStressProfiles: false` in the
+full preset; ordinary candidate ranges and finite buffers remain active. Resuming uses the
 settings saved in the manifest, even if the JSON preset has since changed.
 The full preset writes bounded-size transport/radio shards, rather than loading
 the entire collection into memory. `dataset-index.json` and `radio-index.json`
@@ -123,24 +157,43 @@ sharding bounds processing memory, not total disk use.
 
 [`experiments/knob-sweep/`](experiments/knob-sweep/) is a separate controlled
 experiment for inspecting every full-dataset knob. It does not launch the
-40,000-run dataset. Run it from the repository root:
+40,000-run dataset. Run it from the repository root. The output directory is
+fixed at `results/knob-sweep`; this command starts or resumes the saved plan:
 
 ```bash
-python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --jobs 8
+python3 experiments/knob-sweep/run.py --jobs 8
 ```
 
-Use a fresh directory after changing the model. The command builds the scenario
-and calibration observer, measures a fresh clear-link queue reference, runs the
-sweeps, and renders the report. If a matching accepted reference already exists,
-provide `--reference path/to/reference.json` on the initial command to reuse it.
-The versioned older reference must be recalibrated after the carrier-frequency
-change; the runner rejects stale references rather than relabeling old results.
+To delete this experiment and its recorded raw outputs, then restart in the same
+directory using the current accepted queue calibration:
 
-The design covers **30 sweeps**, using all candidate values from
+```bash
+python3 experiments/knob-sweep/run.py --clean \
+  --reference experiments/queue-calibration/reference.json --jobs 8
+```
+
+Afterward, resume with the first command, omitting both `--clean` and
+`--reference`. Add `--plan-only` to the cleanup command to prepare configurations
+without simulating. `--out-dir` optionally selects another fixed directory.
+Cleanup includes interrupted raw outputs and nested automatic calibration
+outputs; unrelated experiments and original observations reused from another
+sweep remain.
+
+The runner builds the scenario and calibration observer, runs the sweeps, and
+renders the report. Without `--reference`, a new plan measures its own clear-link
+queue reference. Supplied references must match the current model; stale
+references are rejected. After source/model changes, use `--clean` or a fresh
+directory rather than combining observations from different versions.
+
+The design covers **33 sweeps**, using all candidate values from
 [`full_dataset.json`](scripts/dataset/full_dataset.json), plus separate north/east
 gateway offsets, all applications, TCP/UDP, six TCP algorithms, data direction
 and relay-switching controls. The background-rate sweep also includes the
-comparison anchors' 5/20/80 kbit/s levels. Each sweep holds its other settings
+comparison anchors' 5/20/80 kbit/s levels. Additional controls sweep queue budgets
+at 20 MHz and background UE count with automatic relay switching enabled.
+The `socket-enlargement` sweep compares default TCP sockets against enlarged
+finite send/receive buffers using identical backlogged traffic and queue budgets.
+The sweep does not include the deliberate failure profiles. Each sweep holds its other settings
 fixed; queue and TCP-algorithm comparisons use backlogged bulk traffic, while
 shared network sweeps use native TCP CBR at 32 kbit/s. Application-specific
 sweeps use the corresponding workload. Identical configurations are shared
@@ -156,8 +209,9 @@ Three 1 MB file cases remain unfinished at the run cutoff; their measurements
 are included and flagged. Seven crashes from the earlier switching/background
 pilot are preserved separately in its `reused-provenance/` audit.
 
-Background sweeps hold relay switching **disabled at every level**, including
-the zero-background control, to isolate contention. The earlier pilot exposed
+The original background sweeps hold relay switching **disabled at every level**,
+including the zero-background control, to isolate contention. The additional
+`backgroundCountSwitching` sweep enables it at every count level. The earlier pilot exposed
 an NR PHY timing bug when a switch shortened the relay path: an already scheduled
 uplink allocation retained the old timing advance and arrived during another
 UE's data or SRS reception. The maintained NR patch now rephases pending uplink
@@ -207,14 +261,29 @@ are also exported. TCP fields remain unavailable for UDP, and missing PHY
 attempts are never plotted as zero errors. Heatmaps display 1 s bins; selected
 TCP curves sampled every 5 ms with 50 ms windows remain in `series/*.npz`.
 
-Resume an unchanged experiment by repeating its command **without** initial
-`--reference`, `--seeds` or `--only` options. Completed runs are reused; changed
-sources/binaries/configs are rejected. Replot without rebuilding or simulating:
+The maintained TCP patch retains the earliest unacknowledged timestamp when
+an ACK is delayed, and advances the last acknowledged sequence for piggybacked
+ACKs. Its `tcp-timestamp` regressions cover both delayed ACK pairs and repeated
+bidirectional exchanges. Run them in the patched ns-3 checkout:
 
 ```bash
-python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --analyze-only
+cd ns-3-dev
+./ns3 configure --enable-tests --enable-examples --filter-module-examples-and-tests=internet
+./ns3 build test-runner -j 4
+./test.py --no-build -s tcp-timestamp
+```
+
+Resume an unchanged experiment by repeating its command **without `--clean`** and without initial
+`--reference`, `--seeds`, `--only` or `--tcp-buffer-policy` options. Completed runs are reused; changed
+sources/binaries/configs are rejected. To restart in the same directory, use
+`--clean` (optionally with `--plan-only`). Cleanup includes only recorded raw
+outputs and nested automatic calibration outputs; other experiments and original
+observations reused from another sweep remain. Replot without rebuilding or simulating:
+
+```bash
+python3 experiments/knob-sweep/run.py --analyze-only
 # Also verify metric extraction against the preserved compressed raw traces:
-python3 experiments/knob-sweep/run.py --out-dir results/knob-sweep-new --analyze-only --reextract
+python3 experiments/knob-sweep/run.py --analyze-only --reextract
 # A smaller new experiment, using a current accepted queue reference:
 python3 experiments/knob-sweep/run.py --out-dir results/knob-links-new --reference path/to/reference.json --only serviceExcessLossDb feederExcessLossDb --jobs 8
 # Reuse exact configuration/seed matches from an earlier experiment:
@@ -231,6 +300,81 @@ Movement changes geometry; this model does not introduce Doppler/fast fading.
 seed, measurement definitions, metric-extractor hashes, and raw/cache checksums.
 It keeps original run identities and provenance; immutable raw traces are
 hard-linked where possible. Changed physical models require fresh simulations.
+
+The transport CSV and full dataset also export four causal progress features:
+
+| Feature | Meaning |
+|---|---|
+| `tcp_pending_bytes` | TCP bytes queued or awaiting acknowledgment |
+| `tcp_ack_age_s` | Time since forward ACK progress; missing before the first observed advance |
+| `tcp_no_progress_s` | Time continuously backlogged without ACK progress; zero when idle |
+| `tcp_rtt_update_age_s` | Time since a changed positive `LastRTT` trace value; this does not count every RTT sample |
+
+These fields are missing for UDP. Use backlog and progress together: silence from
+an idle IoT/RPC flow is not an outage. Whole-run total outage time is a retrospective
+outcome requiring an explicit service/timeout policy; it should not be used as a
+causal input for predicting the same run's future. Held SRTT remains estimator
+state. New `*-progress.png` pages show delivery, backlog and ACK progress for
+each seed. Heatmaps hatch partially observed seed aggregates and export exact
+counts in `observed-seed-coverage.csv`.
+Cumulative stall time up to the current sample can be causal, but still needs a
+defined threshold and active-demand rule. The current continuous stall age
+avoids choosing a universal outage threshold or counting intentional idle time.
+
+Connected-mode random access after unanswered scheduling requests preserves the
+established C-RNTI and bearers. Msg3 carries a C-RNTI control element under its
+temporary grant identity; a real new-data grant resolves access. Failed Msg3
+resolution times out and retries without falsely reporting recovery. After
+building `sat-bs-handset` and `test-runner`, run the focused full-duration
+seed/control checks from the repository root:
+
+```bash
+python3 experiments/relay-recovery-regression/run.py --out-dir results/relay-recovery-regression --jobs 6
+python3 experiments/relay-recovery-regression/analyze.py --out-dir results/relay-recovery-regression
+```
+
+The runner resumes completed cases only when the recorded model and binary
+hashes match. It preserves configs, logs, source hashes, per-case outcomes and
+losslessly compressed raw CSVs. Its 25 full-duration cases cover four background
+counts with switching and three seeds, fixed-relay controls, 6/9 dB attenuation,
+finite scheduling-request retries, UDP, enlarged-socket bulk TCP and a 20 MHz
+control.
+
+Healthy paced TCP cases must retain their established C-RNTI, resume delivery
+after switching and deliver more than 99% of accepted bytes by cutoff. Weak-link
+cases remain observations and are not required to meet that delivery threshold.
+TCP progress fields must be nonnegative, with zero no-progress age when idle
+and missing values for UDP. Native application reports must state their actual
+workload and positive-byte criterion.
+
+The analyzer compares background counts and attenuation using 18 unique runs.
+It renders individual-seed delivery/progress pages, summary panels and heatmaps
+with observation coverage. It exports all 77 transport features through the
+production token/window/quantile functions, holds out complete seed-30003 runs,
+fits boundaries on training runs only and checks missingness preservation.
+This small export checks the pipeline; it is not a replacement training dataset.
+
+UL schedulers also enforce the UE's minimum useful data grant: 15 bytes
+(5-byte buffer report, 3-byte MAC header, 7-byte RLC opportunity). Smaller
+grants previously transmitted buffer reports repeatedly without draining data,
+creating artificial weak-link stalls. Scheduler allocation, resource reaping
+and DCI creation now use the same minimum in TDMA and OFDMA.
+These model changes require regenerated
+results and a current queue calibration; old plots remain historical results.
+
+Native suites `nr-connected-ra` and `nr-ul-grant-power` exercise the underlying
+MAC and scheduler fixes. The first tests actual C-RNTI Msg3 bytes, established
+identity preservation, decoded control-element handling, malformed
+control-element rejection, finite timeout and grant-based resolution. The
+second includes small backlogs and requires every emitted useful UL grant to
+fit the 15-byte minimum, alongside grant-power and resource-accounting checks.
+
+Native application success means **some accepted and delivered bytes**, not
+completion or a delivery quality guarantee. Source writes and TCP sink reads
+cannot be compared as message counts, and unpaced TCP may retain accepted bytes
+in buffers at cutoff. Reports state the actual native workload and byte-based
+criterion. Assess delivery shortfall, progress and recovery separately from this
+smoke-test flag. Failed outcomes remain in the dataset.
 
 ## Queue calibration experiments
 
@@ -261,47 +405,60 @@ It measures UL and DL at both **10 and 20 MHz**, with three independent RNG runs
 (20001–20003, separate from the full dataset). Every simulation lasts 130 s;
 measurements use 20–119 s and exclude five seconds on either side of the switch.
 
-- Unloaded RTT: native TCP CBR, 128 B at 1 kbit/s. An observer attaches after
-  warm-up and records socket `LastRTT` changes, excluding the SYN handshake.
-  The reference is the median of the three per-run minimum data RTTs. This
-  includes scheduling, processing and the configured TCP delayed ACK behavior;
-  it is neither geometric propagation RTT nor rolling SRTT.
-- Service capacity: UDP CBR, 512 B, offered loads of 8, 32, 128, 512 and
-  2048 kbit/s, plus an 8192 kbit/s confirmation for the 20 MHz uplink, with a
-  fixed 64 KiB queue. The two highest loads must give
-  delivered rates within 15%, and the highest load must exceed delivery by at
-  least 50%. A 128 KiB control at the highest load checks buffer sensitivity.
-  Capacity uses received PDCP SDU rate, with application goodput reported
-  separately. This is sustainable service in this model, including its
-  scheduler, errors, RLC AM and 120 B new-PDU limit; it is not peak radio bitrate.
+- Unloaded path RTT: native TCP CBR, 128 B at 1 kbit/s, with
+  `TcpSocket::DelAckCount=1` **only in the calibration probes**. The observer
+  records actual socket ACK settings and post-handshake `LastRTT` samples.
+  The reference is the median of the three per-run minimum RTTs. It includes
+  radio scheduling and processing, while excluding receiver delayed-ACK waiting;
+  it is neither geometric propagation RTT nor rolling SRTT. Matched default
+  delayed-ACK controls are recorded separately. Workload sweeps retain their
+  default delayed ACKs.
+- Service capacity: UDP CBR, 512 B, offered loads of 512, 2048, 8192, 16384
+  and 32768 kbit/s, with a fixed 256 KiB queue. **Every seed** must show a
+  plateau within 15% between the top two offered loads, and the highest offered
+  load must exceed delivered PDCP rate by at least 50%. A matched 512 KiB
+  queue control at the highest load checks buffer sensitivity for every seed.
+  Capacity is received PDCP SDU rate, with application goodput reported separately.
+  It measures service under the current scheduler, errors and RLC recovery;
+  the historical 120-byte initial-PDU cap is removed.
 
-Measured reference after the relay-switch timing fix (three RNG runs per case;
-[79 completed calibration runs](results/relay-switch-calibration-20261021/summary.json)):
+Current accepted reference after the connected-access and minimum UL grant corrections:
+[88 completed runs and validation](results/queue-calibration-20261023-recovery/report.md),
+[capacity and RTT plot](results/queue-calibration-20261023-recovery/calibration.png).
 
-| Bandwidth | Direction | PDCP service capacity | Minimum data RTT | Directional BDP |
+| Bandwidth | Direction | PDCP service capacity | Immediate-ACK path RTT | Directional BDP |
 | --- | --- | ---: | ---: | ---: |
-| 10 MHz | UL | 337.1 kbit/s | 337 ms | 13.87 KiB |
-| 10 MHz | DL | 251.8 kbit/s | 307 ms | 9.44 KiB |
-| 20 MHz | UL | 715.2 kbit/s | 337 ms | 29.42 KiB |
-| 20 MHz | DL | 251.8 kbit/s | 307 ms | 9.44 KiB |
+| 10 MHz | UL | 388.8 kbit/s | 138 ms | 6.55 KiB |
+| 10 MHz | DL | 5240.2 kbit/s | 137 ms | 87.63 KiB |
+| 20 MHz | UL | 410.6 kbit/s | 138 ms | 6.92 KiB |
+| 20 MHz | DL | 10504.2 kbit/s | 137 ms | 175.67 KiB |
 
-The final two offered loads change delivery by less than **0.02%** in every
-case; doubling the buffer produces the same delivered rate for the control RNG.
-All 79 runs completed successfully with one relay switch each. Earlier
-calibration runs and the separate 12-run pilot remain under ignored results.
-All 2,000 full-preset profiles also passed geometry admission
-and calibrated-budget checks, with switching enabled and altitude fixed at
-800 km. The full dataset was not executed.
+All 88 simulations completed with one relay switch each. The top two loads
+and the larger-buffer controls produce identical delivered rates within each
+seed. The previous delayed-ACK/capped-model reference is preserved in
+[the old reference snapshot](results/queue-calibration-20261023-path-rtt/previous-reference.json).
+The full knob sweep and full dataset have not been rerun against this reference.
 
-Actual full-preset per-buffer budgets are:
+Accepted per-buffer budgets, in bytes:
 
-| Bandwidth | 0.5× | 1× | 2× | 4× | 8× | 16× |
+| Bandwidth | 0.5x | 1x | 2x | 4x | 8x | 16x |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 MHz | 10,240 B | 14,201 B | 28,402 B | 56,803 B | 113,605 B | 227,210 B |
-| 20 MHz | 15,065 B | 30,129 B | 60,258 B | 120,516 B | 241,032 B | 482,063 B |
+| 10 MHz | 44,869 | 89,738 | 179,476 | 358,951 | 717,902 | 1,435,804 |
+| 20 MHz | 89,943 | 179,885 | 359,769 | 719,538 | 1,439,076 | 2,878,152 |
 
-At 10 MHz, the nominal 0.5× budget is clamped to 10 KiB (about 0.72× the
-reference BDP). The other listed factors remain distinct.
+The 10 KiB floor remains available but does not bind any of these levels.
+The common budget now follows the restored downlink capacity; excluding ACK
+waiting does not imply smaller queues when measured service capacity changes.
+The main knob sweep retains configured TCP endpoint limits except in the explicit
+`socket-enlargement` sweep. That sweep compares `default` against
+`socket-enlargement`, using a common finite power-of-two send/receive buffer at
+least `2 * (largest calibrated queue + largest path BDP)` (currently 8 MiB each).
+A flattened queue-size curve remains valid behavior when the default TCP socket
+cannot put enough data in flight to fill a larger queue. On a fresh plan,
+`--tcp-buffer-policy socket-enlargement` also enlarges sockets throughout the
+other TCP sweeps; the socket knob still retains its explicit default control.
+Per-run settings and exact limits are saved in the configurations. UDP and
+workload delayed ACKs are unaffected.
 
 For each bandwidth, queue reference BDP is the **larger of the measured UL and
 DL products** `capacity_bits_per_second * unloaded_RTT_seconds / 8` in bytes.
@@ -343,10 +500,44 @@ additional execution step or a new ns-3 dependency.
 ## Processing and outputs
 
 Outputs include configurations, raw traces, execution logs, per-run summaries,
-metric audits, source hashes, and train/test archives. There are **73 transport
-features** and a separate **23-feature radio/KPI tensor**. Splits hold out entire
+metric audits, source hashes, and train/test archives. There are **77 transport
+features** (73 legacy heads plus four TCP progress heads) and a separate **28-feature radio/KPI tensor** (historical collections
+had 23). Splits hold out entire
 RNG replicates (150 training / 50 test runs in the comparison preset); quantile
 boundaries are fit only on training data. TCP-only observations remain **NaN for UDP**.
+
+The full preset retains weak startup links, visibility gaps, failed connections,
+zero delivery, and background starvation. Geometry/budget predictions are saved
+as diagnostics. Clear-link queue calibration keeps its strict service checks.
+The 14 deliberate stress profiles are currently disabled in the full preset.
+Mixed TCP profiles sample `socket-enlargement` at both `default` and
+`socket-enlargement` levels within each application, congestion-control and
+direction stratum. Controlled anchors retain configured defaults. UDP keeps its
+configured sockets. Per-run socket policy and byte limits are saved in the
+manifest and configuration; both policies retain finite buffers.
+
+`RLC_TX_DROP` events and four per-interval RLC queue-drop counters record actual
+rejected SDUs/bytes by direction. They also appear in the radio tensor, alongside
+path visibility. These are RLC transmit-queue drops, not all network losses.
+`dataset-outcomes.json` retains each run's exit/application label; analysis adds
+delivery, visibility and overflow summaries. Exit 1 is a completed application
+failure and stays in both splits. Simulator crashes are retained for
+investigation and block export. Empty connection windows keep their place in
+the 100 ms grid with missing transport measurements; an unmeasured RTT is never
+filled with zero. A native application's positive-delivery criterion can pass
+despite heavy loss, so use delivery shortfall and drop counts too.
+
+Run the focused 34-run check (including a loaded multi-UE case) without launching a full campaign:
+
+```bash
+python3 -m unittest discover -s scripts/dataset -p 'test_*.py'
+python3 experiments/failure-regression/run.py --out-dir results/failure-check-new --plan --run --check --jobs 4
+```
+
+The [latest failure audit](results/failure-audit-20261023/report.md) verifies all
+34 runs in the exported splits, including four application failures and 16 runs
+with primary-UE RLC overflow. The audit also documents the remaining limits of
+the radio-failure model.
 
 Saved experiment runs and their provenance hashes remain untouched by repository
 reorganization. `run_dataset.py` executes planning, simulation, postprocessing,

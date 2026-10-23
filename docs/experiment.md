@@ -14,10 +14,11 @@ RLC AM. TCP or UDP runs above the same radio stack.
 The reference uses an 800 km orbit at 53° inclination, two relays separated by
 8°, paired 10 MHz carriers at 2135 MHz DL / 1945 MHz UL on both service and
 feeder links, and a handheld UE with 23 dBm conducted power and 0 dBi gain. Both ground-to-satellite paths
-must meet a 30° elevation mask. Planning checks the complete run at 0.5 s
-intervals with a conservative movement envelope and a 5° visibility margin.
-It also checks initial uplink budget and the expected relay-switch timing.
-These checks screen configurations; they do not guarantee packet delivery.
+normally use a 30° elevation mask. Planning samples the complete run at 0.5 s
+intervals with a conservative movement envelope. Visibility margins, initial
+uplink budget and expected relay-switch timing are diagnostics for full-dataset
+profiles. Clear-link calibration and legacy comparison controls require service;
+the full dataset retains adverse network conditions and failures.
 
 Relay switching changes the selected satellite path within the same NR cell.
 It is not an inter-cell RRC handover. UE slot timing follows the changing
@@ -56,8 +57,9 @@ The separately selected `--preset full` is defined by
 [`full_dataset.json`](../scripts/dataset/full_dataset.json). It defaults to 2,000
 profiles and 20 independent RNG repeats per profile. It derives 49 controlled
 anchors from `comparison`, enabling automatic relay selection in each and
-merging the now-identical baseline and relay-switch profile. Another 1,951
-profiles sample joint conditions within balanced application/transport/direction strata. The
+merging the now-identical baseline and relay-switch profile. The remaining 1,951
+profiles sample joint conditions within balanced application/transport/direction strata.
+Deliberate stress profiles are currently disabled (`includeStressProfiles: false`). The
 design is a stratified sample of the joint space, not its full Cartesian product.
 Native apps have UL/DL strata; the five synthetic apps originate UL.
 The table gives candidate levels for the additional profiles. Anchors retain
@@ -68,14 +70,15 @@ their original settings, including the 5/20/80 kbit/s background sources.
 | Applications | All nine; sizes, timing and source rates also vary where supported |
 | TCP | NewReno, CUBIC, BBR, Vegas, Hybla, WestwoodPlus, crossed with each application |
 | UDP | Every application; TCP-only feature heads remain NaN |
+| socket-enlargement | TCP strata compare configured defaults and enlarged finite send/receive buffers (currently 8 MiB each); controlled anchors keep defaults |
 | Source pacing | 0.5, 2, 10, 32, 128, 512 kbit/s for paced workloads; TCP bulk remains backlogged |
 | Packet/write size | 128, 256, 512, 1200 B for probe/file/native bulk/CBR/OnOff |
-| Queue budget | 0.5, 1, 2, 4, 8, 16 × measured clear-link capacity/unloaded-RTT BDP; 10 KiB minimum |
+| Queue budget | 0.125, 0.25, 0.5, 1, 2, 4, 8, 16 × measured clear-link capacity/unloaded-RTT BDP; 10 KiB minimum |
 | Motion | Stationary or 0.5, 1.4, 5, 10, 15, 30, 50 m/s; disks of 0.1, 0.5, 5, 20, 50 km |
 | Background | 0, 1, 3, 8 stationary UEs; 2, 10, 32, 128 kbit/s per UE; relay 0/1; 0.5, 5, 50 km separation |
 | Geometry | Orbit altitude fixed at 800 km, inclination 53°, relay spacing 8°; gateway north/east offsets −20, 0, 20 km |
 | Paired service bandwidth | 10 or 20 MHz per direction; carrier center frequencies stay fixed |
-| Attenuation | Service 0, 0.75, 1.5, 2.25, 3 dB; feeder 0, 6, 12, 18, 24, 30 dB |
+| Attenuation | Service 0, 0.75, 1.5, 2.25, 3, 6, 9 dB; feeder 0, 6, 12, 18, 24, 30 dB (the simulator accepts 0–30 dB per hop) |
 | Switching | Automatic relay selection enabled in every configuration, within the same NR cell |
 | File | Median content 16 kB/128 kB/1 MB; reading means 0.1/1/3/10 s |
 | RPC | Requests 64/128/512 B; response scale 64/128/512 B; reading means 0.2/1.5/5 s |
@@ -84,7 +87,7 @@ their original settings, including the 5/20/80 kbit/s background sources.
 
 Inactive rate knobs are not randomized: VoIP keeps its native codec-traffic
 defaults, and `dataRate` does not cap TCP bulk or pace RPC/stream/IoT. Native
-OnOff retains its fixed 1 s ON/1 s OFF phases. RLC AM, the 120-byte new-PDU cap,
+OnOff retains its fixed 1 s ON/1 s OFF phases. RLC AM (without the historical 120-byte new-PDU cap),
 LOS assumptions and the absence of waveform/Doppler outputs remain part of the
 model; changing bandwidth does not make this a peak-capacity measurement.
 
@@ -102,18 +105,55 @@ retain their legacy offered-rate/geometric-RTT sizing when no explicit byte
 budget is supplied.
 
 Relay selection follows the existing visibility, path advantage, hysteresis and
-time-to-trigger rules. Full-preset admission selects geometries predicting one
-switch inside the measurement window. The `comparison` preset retains its
+time-to-trigger rules. Full-preset planning records predicted switches without
+requiring successful switching. The `comparison` preset retains its
 original switch-disabled controls.
 
-Full-preset admission checks use a conservative envelope covering both the
-primary UE's disk and background separation. Candidates outside visibility,
-bootstrap-budget or switch-time constraints are rejected before configurations
-are emitted. Only admitted configurations enter the manifest; those checks do
-not prove successful application delivery. Poor-performance interaction runs
-remain observations when they finish without crashing, including zero-delivery
-background flows. Geometry constraints also mean not every listed combination
-can be admitted.
+Full-preset diagnostics use a conservative envelope covering both the primary
+UE's disk and background separation. Visibility, bootstrap-budget and switch-time
+warnings do not reject a candidate; duplicate configurations are rejected.
+Completed network failures remain observations, including failed TCP connection
+setup, zero delivery and background starvation. Their traces are retained.
+Simulator crashes and broken telemetry accounting still block export.
+
+The optional 14 stress profiles, excluded from the current full preset, comprise
+UDP overload (2.048 Mbit/s UL, 32.768 Mbit/s DL),
+unpaced TCP with 0.125x queues, and unpaced TCP with 16x queues, each at 10/20 MHz
+and in both directions. The remaining two use a constant 20 dB service attenuation
+proxy and a 70-degree elevation mask to create weak startup and visibility-gap
+conditions. These are deliberate experimental regimes, not measured deployment
+frequencies or a calibrated obstruction/fade time series. Configured finite TCP
+socket defaults remain active in those optional stress profiles. In the mixed
+full dataset, `socket-enlargement` is balanced within each TCP application,
+algorithm and direction stratum; UDP is unaffected. Enlarged buffers use one
+finite power-of-two budget covering twice the largest calibrated queue plus
+path BDP. The Python runners apply saved per-run limits to both TCP send and
+receive sockets; socket policy and exact bytes are recorded in each configuration
+and in the manifest knobs. No delayed-ACK setting changes.
+
+RLC transmit-queue rejection events contain direction, RNTI, LCID and rejected
+PDCP PDU bytes (including the PDCP header). Per-second counters expose dropped
+SDUs and bytes separately for UL/DL. They reconcile against the event log and
+extend the radio tensor from 23 to 28 features, including path visibility.
+These counters do not cover IP/AQM drops or every HARQ/RLC failure cause. TCP
+loss detections, TB decoding failures and application delivery shortfall remain
+separate measurements. A passing native application criterion only requires
+positive source and sink bytes; it does not establish acceptable delivery.
+
+Failed/late/interrupted connection histories occupy the same 990 fixed time
+bins, with unavailable features left missing. No observed RTT means missing
+RTT, not zero latency. Per-run application labels are exported separately in
+`dataset-outcomes.json`, keyed by the run IDs stored with the sequence arrays.
+The focused failure regression checks actual overflow, outages and zero delivery
+through both training and held-out test exports.
+
+These controls do not establish complete radio-link-failure realism. The PHY is
+analytical, the RLC wire format is the model's legacy 10-bit format, and the
+existing UE RRC `RlcMaxRetxTriggersRlf` setting defaults to false (the gNB does
+not install the corresponding max-retry callback). Thus this setup does not
+claim a validated finite-retry-to-RRC-release procedure in both directions.
+Visibility loss and transport failure are observed, but full RLF/reestablishment,
+time-varying fading, blockage and Doppler require separate model validation.
 
 All profiles share the same 20 RNG run numbers (10001–10020); these are matched
 comparisons across profiles, with independent repeats within each profile.
@@ -241,9 +281,9 @@ SRTT is expressed in units of 100 ms in the CSV. Dedicated PHY files retain
 reports separately from held values on transport samples.
 
 The full run folds transport samples into fixed 100 ms tokens for both TCP
-and UDP. The transport dataset has 73 features; TCP-only fields remain NaN for
-UDP. Separate radio arrays contain 23 continuous features over 99 one-second
-measurement intervals, with shape `[runs, 99, 23]`. Idle rates/counts are zero;
+and UDP. The transport dataset has 77 features (73 legacy plus four causal TCP progress heads); TCP-only fields remain NaN for
+UDP. Separate radio arrays contain 28 continuous features over 99 one-second
+measurement intervals, with shape `[runs, 99, 28]`. Idle rates/counts are zero;
 unobserved delay, SINR, MCS and BSR values are NaN.
 
 For the comparison preset, training/test separation holds out the fourth RNG replicate as a complete
@@ -251,3 +291,35 @@ group: 150 training runs and 50 test runs. Quantile boundaries are fitted only
 on training data. Transport examples have 10 history and 10 future tokens.
 Raw configs, logs, execution outcomes and source hashes identify each run.
 Reports, plots, slides and raw data are generated artifacts and remain ignored.
+
+## Transport progress and connection recovery
+
+New collections append `tcp_pending_bytes`, `tcp_ack_age_s`,
+`tcp_no_progress_s` and `tcp_rtt_update_age_s` to the transport heads. Pending
+bytes include unsent and unacknowledged TCP data. ACK age measures the time since
+the transmit-buffer head advanced. No-progress age accumulates only while bytes
+remain pending and resets on progress or when the buffer becomes empty. Thus
+normal source-idle periods have zero backlogged no-progress time. RTT-update age
+refers to changes of the LastRTT trace value, not an exact sample count. UDP
+leaves these TCP-only fields missing. Per-run total outage duration depends on a
+service definition and is retrospective; use causal ages for prediction inputs.
+
+Relay-switch recovery preserves the existing connected bearer identity through
+MAC random access. The temporary RAR identity addresses the physical Msg3 grant,
+while a decoded C-RNTI control element requests scheduling of the existing
+bearer. An addressed new-data grant, rather than receipt of a RAR alone, resolves
+the procedure. Finite contention timeouts and decoding failures remain active.
+The analytical model's broader RLF/reestablishment limitations still apply.
+
+Both UL scheduler families require at least 15 bytes for a useful data grant:
+the UE reserves five bytes for BSR, three for its MAC subheader and at least
+seven for RLC AM. Allocation targets, starvation resource reaping and emitted
+DCIs share that limit. The former 12-byte scheduler threshold could produce
+long sequences of BSR-only transmissions despite queued data; those stalls
+were a model artifact rather than realistic RF outages.
+
+Native source/sink success remains a positive-byte smoke check; the report names
+the actual criterion. It is not a completion/SLA label. Delivery shortfall at
+cutoff includes endpoint backlog and must not be equated with permanent packet
+loss. Use received throughput, pending bytes, ACK age and post-switch recovery
+together when evaluating service.

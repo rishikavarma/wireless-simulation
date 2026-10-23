@@ -43,6 +43,11 @@ def sweeps(settings, calibration):
             bdp = calibration['bandwidthBudgets'][bandwidth]['referenceBdpBytes']
             cfg['application']['queueSizeBytes'] = max(calibration['minimumQueueBytes'],
                 math.ceil(cfg['application']['queueSizeBdp'] * bdp))
+            policy = cfg['application'].get('socket-enlargement', settings.get('tcpBufferPolicy', 'default'))
+            cfg['application']['socket-enlargement'] = policy if cfg['application'].get('transport', 'tcp') == 'tcp' else 'default'
+            cfg['application']['tcpSocketBufferBytes'] = (
+                dataset_presets.enlarged_socket_bytes(calibration)
+                if cfg['application']['socket-enlargement'] == 'socket-enlargement' else 0)
             cfg['output']['prefix'] = ''
             proof = dataset_presets.preflight(cfg)
             if not proof:
@@ -67,6 +72,10 @@ def sweeps(settings, calibration):
         assign('application', 'transport'), 'tcp', 'Matched native CBR sources. TCP metrics are unavailable for UDP.')
     add('tcpVariant', 'TCP congestion control (backlogged bulk)', candidates['tcpVariants'],
         base('iperf'), assign('application', 'tcpVariant'), 'TcpNewReno')
+    add('socket-enlargement', 'TCP socket enlargement (backlogged bulk)',
+        ranges['socket-enlargement'], base('iperf'),
+        assign('application', 'socket-enlargement'), 'default',
+        'Compare configured socket limits with a common enlarged finite send/receive buffer; queues and delayed ACKs stay fixed.')
     add('direction', 'Primary data direction (native CBR)', ['ul', 'dl'], base(),
         assign('application', 'direction'), 'ul')
     add('relaySwitch', 'Automatic relay switching', [False, True], base(),
@@ -78,6 +87,11 @@ def sweeps(settings, calibration):
     add('queueSizeBdp', 'Queue budget (multiples of calibrated BDP)', ranges['queueSizeBdp'],
         base('iperf'), assign('application', 'queueSizeBdp'), 2,
         'Backlogged TCP bulk exposes buffering; 10 KiB floor can make low factors identical.')
+    context = base('iperf')
+    context['radio'].update(bandwidthHz=20e6, dlBandwidthHz=20e6, ulBandwidthHz=20e6)
+    add('queueSizeBdp20MHz', 'Queue budget at 20 MHz (multiples of calibrated BDP)',
+        ranges['queueSizeBdp'], context, assign('application', 'queueSizeBdp'), 2,
+        'Backlogged TCP bulk at 20 MHz uses its own calibrated byte budgets; configured endpoint limits may bind.')
     context = base()
     context['topology']['ueDistanceM'] = 50000
     add('ueSpeedMps', 'UE speed (m/s), 50 km disk', ranges['ueSpeedMps'], context,
@@ -108,6 +122,11 @@ def sweeps(settings, calibration):
         add(key, title, values, base(background=True), setter, reference,
             'Other background settings fixed at 3 UEs, 32 kbit/s each, 500 m, relay 0; only the named factor changes. '
             'Relay switching is disabled to isolate contention; the separate relay-switch regression covers concurrent switching/background traffic.')
+    context = base(background=True)
+    context['handover']['enabled'] = True
+    add('backgroundCountSwitching', 'Background UE count with relay switching',
+        ranges['backgroundCount'], context, assign('background', 'count'), 3,
+        'Same count levels and background traffic as the fixed-relay count sweep, with automatic relay switching enabled.')
     add('probeTraffic', 'Probe traffic pattern', ranges['probeTraffic'], base('probe'),
         nested('probe', 'traffic'), 'cbr')
     add('fileMedianBytes', 'Median file content size (bytes)', ranges['fileMedianBytes'], base('file'),

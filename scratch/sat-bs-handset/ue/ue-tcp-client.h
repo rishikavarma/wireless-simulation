@@ -44,7 +44,11 @@ class UeTcpClient : public Application
     bool EverConnected() const;
     UeAppMetrics GetMetrics() const;
 
+    /** Stop generating requests while retaining reception and transport feedback. */
+    void StopGenerating();
+
   private:
+    bool m_draining{false}; //!< Traffic has stopped; replies may still arrive
     enum class SendResume
     {
         None,

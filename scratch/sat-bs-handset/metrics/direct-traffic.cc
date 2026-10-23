@@ -7,7 +7,7 @@ namespace ns3 {
 void DirectTraffic::Install(Ptr<Node> source, Ptr<Node> receiver, Ipv4Address destination,
                             uint16_t port,std::string workload,std::string transport,
                             DataRate rate,uint32_t packetBytes,Time start,Time stop,const std::string& csv) {
-    m_start=start;m_stop=stop;m_previous=start;
+    m_start=start;m_stop=stop;m_previous=start;m_workload=workload;
     const std::string protocol=transport=="udp"?"ns3::UdpSocketFactory":"ns3::TcpSocketFactory";
     PacketSinkHelper sink(protocol,InetSocketAddress(Ipv4Address::GetAny(),port));
     auto receiverApps=sink.Install(receiver);receiverApps.Start(Seconds(0));receiverApps.Stop(stop+Seconds(9));
@@ -56,6 +56,8 @@ void DirectTraffic::Tick() {
 }
 UeAppMetrics DirectTraffic::GetMetrics() const {
     auto m=m_metrics.GetMetrics();m.success=m_tx>0 && m_rx>0;
+    m.workloadLabel=m_workload;
+    m.criterion="accepted_bytes>0 and delivered_bytes>0 (positive delivery, not completion or QoS)";
     // TCP stream segmentation makes source writes and sink read counts incomparable.
     m.deliveryRatio=m_tx?static_cast<double>(m_rx)/m_tx:0;
     m.lossRatio=std::max(0.0,1-m.deliveryRatio);m.lost=0;

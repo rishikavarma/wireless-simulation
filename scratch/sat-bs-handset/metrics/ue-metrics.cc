@@ -162,6 +162,11 @@ UeMetrics::Start(Ptr<Socket> socket)
     // Per-socket TCP state cannot be carried across a new connection. Keep
     // application counters, cumulative loss and the run's trace file.
     m_srtt = Time();
+    m_haveAckProgress = false;
+    m_haveRttUpdate = false;
+    m_progressPending = false;
+    m_pendingBytes = 0;
+    m_progressOrigin = Simulator::Now();
     m_rttvarUs = 0.0;
     m_minRttUs = 0.0;
     m_haveVar = false;
@@ -232,7 +237,8 @@ UeMetrics::OpenTcpTrace(const std::string& path)
     AppendWindowHeader(m_tcpTrace, "inflight");
     AppendWindowHeader(m_tcpTrace, "lost");
     m_tcpTrace << ",time_delta,rtt_rate,loss_db,acked_rate,dr_ratio,bdp_cwnd,dr,"
-                  "cwnd_unacked_rate,dr_max,dr_max_ratio,pre_act,sinr_dl_db,sinr_ul_db\n";
+                  "cwnd_unacked_rate,dr_max,dr_max_ratio,pre_act,sinr_dl_db,sinr_ul_db,"
+                  "tcp_pending_bytes,tcp_ack_age_s,tcp_no_progress_s,tcp_rtt_update_age_s\n";
 }
 
 /** Store the shared PHY collector used to append the latest available SINR to each TCP row.
@@ -296,6 +302,12 @@ UeMetrics::WriteTcpRow(Time now)
     {
         m_tcpTrace << held.ulDb;
     }
+    m_tcpTrace << ',' << m_pendingBytes << ',';
+    if (m_haveAckProgress) m_tcpTrace << (now-m_lastAckProgress).GetSeconds();
+    else m_tcpTrace << "nan";
+    m_tcpTrace << ',' << (m_progressPending ? (now-m_progressOrigin).GetSeconds() : 0.0) << ',';
+    if (m_haveRttUpdate) m_tcpTrace << (now-m_lastRttUpdate).GetSeconds();
+    else m_tcpTrace << "nan";
     m_tcpTrace << '\n';
 }
 
@@ -348,6 +360,8 @@ UeMetrics::OnLastRtt(Time /*oldRtt*/, Time newRtt)
     {
         return;
     }
+    m_lastRttUpdate = Simulator::Now();
+    m_haveRttUpdate = true;
     if (!(m_minRttUs > 0.0) || sampleUs < m_minRttUs)
     {
         m_minRttUs = sampleUs;
@@ -411,7 +425,7 @@ UeMetrics::Poll()
             if (held.haveDl) m_tcpTrace << held.dlDb; else m_tcpTrace << "nan";
             m_tcpTrace << ',';
             if (held.haveUl) m_tcpTrace << held.ulDb; else m_tcpTrace << "nan";
-            m_tcpTrace << '\n';
+            m_tcpTrace << ",nan,nan,nan,nan\n";
         }
     }
     else Commit();
@@ -452,6 +466,15 @@ UeMetrics::Commit()
     const uint32_t sent = ForwardDelta(snd, m_prevSnd);
 
     const Time now = Simulator::Now();
+    if (delivered > 0)
+    {
+        m_lastAckProgress = now;
+        m_haveAckProgress = true;
+    }
+    m_pendingBytes = tx->Size();
+    const bool pending = m_pendingBytes > 0;
+    if (!pending || !m_progressPending || delivered > 0) m_progressOrigin = now;
+    m_progressPending = pending;
     const double dtUs = static_cast<double>((now - m_lastRecord).GetMicroSeconds());
     const double dtSec = dtUs > 0.0 ? dtUs / 1.0e6 : 1.0e-6;
     const uint64_t lostBytes = m_pendingLostBytes;

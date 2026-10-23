@@ -67,7 +67,7 @@ WriteRunMetrics(std::ostream& os,
     const SageFeatures& sage = ue.tcp;
 
     os << "path UE " << ueAddr << " --bent-pipe--> BS " << bsAddr << " (app)\n";
-    os << "metrics.ue workload=" << AppWorkloadToString(ue.workload) << " sent=" << ue.sent
+    os << "metrics.ue workload=" << (ue.workloadLabel.empty()?AppWorkloadToString(ue.workload):ue.workloadLabel) << " sent=" << ue.sent
        << " recv=" << ue.received << " lost=" << ue.lost << " delivery=" << ue.deliveryRatio
        << " lossRatio=" << ue.lossRatio << " bytesTx=" << ue.bytesSent
        << " bytesRx=" << ue.bytesReceived << '\n';
@@ -101,11 +101,17 @@ WriteRunMetrics(std::ostream& os,
 void
 WriteAppOutcome(std::ostream& os, const UeAppMetrics& ue)
 {
-    os << "application workload=" << AppWorkloadToString(ue.workload)
+    os << "application workload=" << (ue.workloadLabel.empty()?AppWorkloadToString(ue.workload):ue.workloadLabel)
        << " success=" << (ue.success ? 1 : 0) << '\n';
     os << "application sent=" << ue.sent << " recv=" << ue.received
        << " delivery=" << ue.deliveryRatio << " bytesTx=" << ue.bytesSent
        << " bytesRx=" << ue.bytesReceived << '\n';
+    if (!ue.criterion.empty())
+    {
+        os << "application criterion=" << ue.criterion << '\n';
+        os << "application accounting=accepted_vs_delivered_bytes_at_cutoff;shortfall_includes_backlog\n";
+        return;
+    }
     switch (ue.workload)
     {
     case AppWorkload::File:

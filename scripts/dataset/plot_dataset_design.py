@@ -234,10 +234,10 @@ def draw_admission(ax):
          "SAMPLING  ·  5 apps × 2 switch states × 2 UE states = 20 balanced cases/cycle; service/feeder loss rotate",
          size=11.2, weight="bold")
     text(ax, .049, .050,
-         "ADMISSION  ·  0.5 s whole-run geometry check; both active hops ≥35°; estimated bootstrap UL C/N ≥2 dB",
+         "DIAGNOSTICS  ·  full preset retains weak startup links and visibility gaps; clear-link calibration requires service",
          size=10.6)
     text(ax, .049, .029,
-         "RETENTION  ·  keep completed runs with application exchange and matching switch count; original metrics/feature heads",
+         "RETENTION  ·  completed failures and zero delivery stay; crashes block export; missing RTT stays missing",
          size=10.6)
 
 

@@ -202,6 +202,12 @@ regression_link="$NS3_DIR/scratch/relay-switch-regression"
 regression_target="$(realpath --relative-to="$NS3_DIR/scratch" "$regression_src")"
 ln -sfn "$regression_target" "$regression_link"
 
+# Application lifecycle regression exercises late replies after generation stops.
+drain_src="$ROOT_DIR/experiments/echo-drain-regression"
+drain_link="$NS3_DIR/scratch/echo-drain-regression"
+drain_target="$(realpath --relative-to="$NS3_DIR/scratch" "$drain_src")"
+ln -sfn "$drain_target" "$drain_link"
+
 echo "==> Configuring and building ns-3 (optimized; examples off)"
 echo "    this can take several minutes to around an hour depending on hardware"
 cd "$NS3_DIR"

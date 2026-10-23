@@ -223,6 +223,8 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
     lock_rtt = bool(cfg_get(cfg, "output.tokenRttLock", False))
     if mode not in ("rtt", "fixed"):
         raise SystemExit(f"output.tokenMode must be rtt or fixed, got {mode}")
+    if mode == 'fixed' and fixed_s <= 0:
+        raise ValueError('fixed token interval must be positive')
     if aggregate not in ("weighted", "mean", "last"):
         raise SystemExit(
             f"output.tokenAggregate must be weighted, mean, or last, got {aggregate}"
@@ -234,21 +236,32 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
     count = len(tcp_rows)
 
     if mode == "fixed":
-        # Fixed wall-clock windows (legacy); still use configured aggregate.
+        # A shared wall-clock grid retains failed connections and reconnect gaps.
+        # Empty windows contain missing measurements, never invented zeros.
+        start_s = cfg_get(cfg, 'time.warmUp', 0) + cfg_get(cfg, 'time.measureStart', 0)
+        end_s = (cfg_get(cfg, 'time.simTime', 0) - cfg_get(cfg, 'time.appDrain', 0)
+                 - cfg_get(cfg, 'time.measureEnd', 0))
+        if end_s <= start_s:
+            raise ValueError('fixed tokens require a positive configured measurement window')
         index = 0
-        while index < count:
-            start_us = times_us[index]
+        start_us = microseconds(start_s)
+        stop_us = microseconds(end_s)
+        while start_us + microseconds(fixed_s) <= stop_us:
             end_us = start_us + microseconds(fixed_s)
+            while index < count and times_us[index] < start_us:
+                index += 1
             group = []
             group_dts = []
             while index < count and times_us[index] < end_us:
                 group.append(tcp_rows[index])
                 group_dts.append(dts[index])
                 index += 1
-            if not group:
-                index += 1
-                continue
-            token = collapse_group(group, group_dts, feature_keys, aggregate, None)
+            if group:
+                token = collapse_group(group, group_dts, feature_keys, aggregate, None)
+            else:
+                token = {key: None for key in feature_keys}
+                token['n_samples'] = 0
+            token['t_start_s'] = start_us / 1e6
             token["token"] = float(len(tokens))
             token["t_end_s"] = end_us / 1e6
             token["window_s"] = (end_us - start_us) / 1e6
@@ -256,6 +269,7 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
                 token["sinr_dl_db"] = hold_last(sinr_dl, end_us)
                 token["sinr_ul_db"] = hold_last(sinr_ul, end_us)
             tokens.append(token)
+            start_us = end_us
         return tokens
 
     # RTT mode — UNUM: accumulate until locked (or per-window) base RTT.

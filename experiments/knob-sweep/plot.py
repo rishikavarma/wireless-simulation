@@ -13,6 +13,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.patches import Rectangle
 import numpy as np
 
 from metrics import METRICS, mean, summarize
@@ -52,13 +53,128 @@ def export_csv(path, rows):
         writer.writerows(rows)
 
 
+def progress_series(cache, key, cfg):
+    """Select delivery in this run's source direction, including mixed-direction sweeps."""
+    if key == 'pdcp_data_kbps':
+        key = 'pdcp_'+cfg['application'].get('direction', 'ul')+'_kbps'
+    return cache.get(key, np.full(len(cache['time_s']), np.nan))
+
+
 def context_label(cfg):
     a, r, t, bg = (cfg[k] for k in ('application', 'radio', 'topology', 'background'))
     speed = t['ueSpeedMps'] if t['receiverMobility'] else 0
     return (f"Context: {a['workload']} / {a.get('transport', 'tcp').upper()} / {a.get('direction', 'ul').upper()}, "
             f"{a['dataRate']} where paced; {r['ulBandwidthHz']/1e6:g} MHz, "
             f"queue {a['queueSizeBdp']:g}× BDP; speed {speed:g} m/s, disk {t['ueDistanceM']/1000:g} km; "
-            f"{bg['count']} background UEs; switching {'on' if cfg['handover']['enabled'] else 'off'}")
+            f"{bg['count']} background UEs; switching {'on' if cfg['handover']['enabled'] else 'off'}; "
+            f"sockets {a.get('socket-enlargement', 'default')}"
+            + (f" ({a['tcpSocketBufferBytes']:,} bytes)" if a.get('tcpSocketBufferBytes') else ''))
+
+
+def analyze_ages(out):
+    """Render stall-age comparisons from saved observations without rerunning simulations."""
+    out = Path(out)
+    manifest = json.loads((out/'manifest.json').read_text())
+    rows = [json.loads((out/'runs'/(rec['id']+'.json')).read_text())
+            for rec in manifest['runs']]
+    lookup = {(r['configId'], r['rngRun']): r for r in rows}
+    caches = {}
+    for row in rows:
+        path = out/'series'/(row['id']+'.npz')
+        if hashlib.sha256(path.read_bytes()).hexdigest() != row['cacheSha256']:
+            raise RuntimeError('Preserved metric cache changed: '+row['id'])
+        with np.load(path) as z:
+            caches[row['id']] = {k: z[k] for k in ('time_s', 'tcp_no_progress_s') if k in z}
+    figures = out/'figures'
+    figures.mkdir(exist_ok=True)
+    seeds = manifest['settings']['rngRuns']
+    details = []
+    with PdfPages(figures/'knob-stall-ages.pdf') as pdf:
+        for group in manifest['groups']:
+            fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+            levels = group['levels']
+            labels = [str(l['value']).removeprefix('Tcp') for l in levels]
+            x = np.arange(len(levels))
+            for ax, key, title in zip(axes[:2], ('tcp_no_progress_s', 'tcp_no_progress_s_max'),
+                    ('Mean backlogged stall age', 'Maximum backlogged stall age (5 ms samples)')):
+                centers = []
+                for i, level in enumerate(levels):
+                    values = np.array([number(lookup[level['configId'], seed]['metrics'].get(key))
+                                       for seed in seeds])
+                    valid = values[np.isfinite(values)]
+                    centers.append(median(valid))
+                    for seed, value in zip(seeds, values):
+                        details.append(dict(knob=group['key'], value=level['value'], rngRun=seed,
+                                            statistic=key, age_s=float(value)))
+                    if len(valid):
+                        ax.vlines(i, valid.min(), valid.max(), color=TEAL, alpha=.6)
+                        ax.scatter(i+np.linspace(-.1, .1, len(seeds)), values, s=18, color=INK)
+                    else:
+                        ax.text(i, .5, 'N/A', ha='center', transform=ax.get_xaxis_transform())
+                ax.plot(x, centers, '-o', color=TEAL)
+                ref = centers[group['reference']]
+                if math.isfinite(ref):
+                    ax.axhline(ref, color=ORANGE, ls='--', lw=1)
+                    ax.scatter(group['reference'], ref, marker='*', s=100, color=ORANGE, zorder=5)
+                ax.set_xticks(x, labels, rotation=35, ha='right')
+                ax.set(title=title, ylabel='Seconds', ylim=(0, None))
+                ax.grid(axis='y', alpha=.2)
+            data, counts = [], []
+            for level in levels:
+                per_seed = [caches[lookup[level['configId'], seed]['id']] for seed in seeds]
+                times = per_seed[0]['time_s']
+                values = np.asarray([c.get('tcp_no_progress_s', np.full(len(times), np.nan))
+                                     for c in per_seed])
+                data.append(temporal_median(values))
+                counts.append(np.isfinite(values).sum(axis=0))
+            data, counts = np.asarray(data), np.asarray(counts)
+            color = plt.get_cmap('viridis').copy()
+            color.set_bad('#dfe3e7')
+            finite = data[np.isfinite(data)]
+            step = manifest['settings']['displayBinS']
+            start, end = times[0]-step/2, times[-1]+step/2
+            im = axes[2].imshow(np.ma.masked_invalid(data), aspect='auto', interpolation='nearest',
+                extent=(start, end, len(levels)-.5, -.5), cmap=color, vmin=0,
+                vmax=max(float(finite.max()), .001) if len(finite) else 1)
+            for i, j in np.argwhere((counts > 0) & (counts < len(seeds))):
+                axes[2].add_patch(Rectangle((start+j*step, i-.5), step, 1, fill=False,
+                    hatch='////', edgecolor='#222222', linewidth=0))
+            axes[2].set_yticks(x, labels)
+            axes[2].set(title='Stall age over time: median of per-seed 1 s means',
+                        xlabel='Simulation time (s)')
+            fig.colorbar(im, ax=axes[2], label='Seconds')
+            fig.suptitle(group['title']+' — backlogged time without ACK progress')
+            fig.text(.5, .015, 'Zero when idle; resets on forward ACK progress. UDP: unavailable. '
+                     'Dots: seeds; line: median; whiskers: range; orange: reference.\n'
+                     'Maximum panel preserves short peaks hidden by 1 s means. '
+                     'Gray: unavailable; hatching: partial seed coverage. Stall age is not a direct RF-outage measure.',
+                     ha='center', fontsize=8)
+            fig.tight_layout(rect=(0, .10, 1, .93))
+            fig.savefig(figures/(group['key']+'-age.png'), dpi=160, bbox_inches='tight')
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+    export_csv(out/'stall-age-summary.csv', details)
+    lines = ['# Backlogged transport stall age', '',
+        'The age is continuous time with pending TCP bytes and no forward ACK progress. '
+        'It resets on progress and is zero while idle. UDP has no TCP age. '
+        'Summaries cover 20–119 s. A transport stall can reflect queues, retransmission or '
+        'receiver backpressure; it is not by itself an RF outage.', '',
+        '[All age comparison pages](figures/knob-stall-ages.pdf) · '
+        '[Individual-seed statistics](stall-age-summary.csv)', '']
+    for group in manifest['groups']:
+        lines += [f"## {group['title']}", '', f"![{group['title']}](figures/{group['key']}-age.png)", '']
+    (out/'stall-age-report.md').write_text('\n'.join(lines))
+    code = Path(__file__)
+    revision = hashlib.sha256(code.read_bytes()).hexdigest()[:12]
+    snapshot = out/'age-analysis-code'/revision
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for source in (code, code.with_name('metrics.py')):
+        if source.resolve() != (snapshot/source.name).resolve():
+            shutil.copy2(source, snapshot/source.name)
+    (out/'age-analysis-provenance.json').write_text(json.dumps(dict(
+        codeDirectory=str(snapshot.relative_to(out)), metric='tcp_no_progress_s',
+        groups=len(manifest['groups']), runs=len(rows), cachedObservationsUnchanged=True), indent=2)+'\n')
+    print(f"Rendered {len(manifest['groups'])} stall-age pages: {figures}", flush=True)
 
 
 def analyze(out, reextract=False):
@@ -94,6 +210,8 @@ def analyze(out, reextract=False):
     by_config = {}
     for row in rows:
         by_config.setdefault(row['configId'], []).append(row)
+    configs = {cid: json.loads((out/records[0]['config']).read_text())
+               for cid, records in by_config.items()}
     flat = [dict(id=r['id'], configId=r['configId'], rngRun=r['rngRun'],
                  exit=r['exit'], **r['metrics']) for r in rows]
     export_csv(out/'run-summary.csv', flat)
@@ -101,7 +219,7 @@ def analyze(out, reextract=False):
         'axes.spines.right': False, 'figure.dpi': 130, 'axes.titleweight': 'semibold'})
     figures = out/'figures'
     figures.mkdir(exist_ok=True)
-    summaries, details, effects = [], [], []
+    summaries, details, effects, coverage_rows = [], [], [], []
     seeds = manifest['settings']['rngRuns']
     lookup = {(r['configId'], r['rngRun']): r for r in rows}
     def values(level, key):
@@ -173,9 +291,17 @@ def analyze(out, reextract=False):
             fig, axes = plt.subplots(2, 4, figsize=(16, 8.5))
             for ax, (key, title, unit) in zip(axes.flat, METRICS):
                 data = []
+                observed = []
                 for level in levels:
-                    data.append(temporal_median([caches[lookup[level['configId'], seed]['id']][key] for seed in seeds]))
+                    per_seed = np.asarray([caches[lookup[level['configId'], seed]['id']][key] for seed in seeds])
+                    data.append(temporal_median(per_seed))
+                    observed.append(np.isfinite(per_seed).sum(axis=0))
                 data = np.asarray(data)
+                observed = np.asarray(observed)
+                for i, level in enumerate(levels):
+                    for j, count in enumerate(observed[i]):
+                        coverage_rows.append(dict(knob=group['key'],value=level['value'],metric=key,
+                            time_s=20+j+.5,observedSeeds=int(count),plannedSeeds=len(seeds)))
                 finite = data[np.isfinite(data)]
                 color = plt.get_cmap('viridis').copy()
                 color.set_bad('#dfe3e7')
@@ -185,6 +311,14 @@ def analyze(out, reextract=False):
                     vmax = vmin+1
                 image = ax.imshow(np.ma.masked_invalid(data), aspect='auto', interpolation='nearest',
                     origin='upper', extent=(20, 119, len(levels)-.5, -.5), cmap=color, vmin=vmin, vmax=vmax)
+                if np.any((observed>0)&(observed<len(seeds))):
+                    # Hatch partially observed cells; one surviving seed must
+                    # not silently look like agreement among all repeats.
+                    # Mark exact cells; contour interpolation would extend
+                    # missingness into adjacent, fully observed knob levels.
+                    for i,j in np.argwhere((observed>0)&(observed<len(seeds))):
+                        ax.add_patch(Rectangle((20+j,i-.5),1,1,fill=False,
+                            hatch='////',edgecolor='#222222',linewidth=0))
                 ax.set_yticks(x, [label+(' ★' if i == group['reference'] else '') for i, label in enumerate(labels)])
                 ax.set_xlabel('Simulation time (s)')
                 ax.set_title(title, fontsize=10)
@@ -199,13 +333,42 @@ def analyze(out, reextract=False):
             fig.text(.5, .94, 'Each row is one knob value; colors use the same scale across values within each panel.', ha='center')
             fig.text(.5, .015,
                 f"Cell: median of {len(seeds)} per-run 1 s bins; underlying TCP windows are 50 ms. "
-                "White ticks: median completed relay-switch time; gray: unavailable.\n"
+                "White ticks: median switch time; gray: unavailable; hatching: fewer observed seeds than planned.\n"
                 "Transport gaps remain missing. Sparse PHY bins average observed attempts only; no attempt is not zero failure.",
                 ha='center', fontsize=8)
             fig.tight_layout(rect=(0, .065, 1, .92), h_pad=2)
             save(fig, group['key']+'-time', time_pdf)
+            progress = [('pdcp_data_kbps', 'Delivered PDCP rate, each run\'s data direction', 'kbit/s'),
+                        ('tcp_pending_bytes', 'TCP bytes queued or awaiting ACK', 'bytes'),
+                        ('tcp_ack_age_s', 'Time since forward ACK progress', 's'),
+                        ('tcp_no_progress_s', 'Backlogged time without ACK progress', 's')]
+            if any('tcp_no_progress_s' in caches[lookup[l['configId'],seed]['id']]
+                   for l in levels for seed in seeds):
+                fig, axs = plt.subplots(2,2,figsize=(13,8))
+                for ax,(key,title,unit) in zip(axs.flat,progress):
+                    for level_index,(level,label) in enumerate(zip(levels,labels)):
+                        per_seed = [progress_series(caches[lookup[level['configId'],seed]['id']],
+                                                    key, configs[level['configId']]) for seed in seeds]
+                        # Show each repeat so a median cannot conceal failed seeds.
+                        for i,values_for_seed in enumerate(per_seed):
+                            ax.plot(caches[lookup[level['configId'],seeds[i]]['id']]['time_s'],
+                                    values_for_seed,lw=.9,alpha=.65,
+                                    color=plt.get_cmap('tab10')(level_index%10),
+                                    linestyle=['-','--',':','-.'][i%4],
+                                    label=f'{label}, seed {seeds[i]}')
+                    ax.set(title=title,xlabel='Simulation time (s)',ylabel=unit)
+                    ax.grid(alpha=.2)
+                axs[0,0].legend(fontsize=6,ncol=2)
+                fig.suptitle(group['title']+' — delivery and transport progress')
+                fig.text(.5,.012,'Color: knob value; line style: seed. Curves are per-run 1 s means; '
+                         'raw TCP-age maxima are in run-summary.csv.',ha='center',fontsize=8)
+                fig.tight_layout(rect=(0,.04,1,.95))
+                fig.savefig(figures/(group['key']+'-progress.png'),dpi=160,bbox_inches='tight')
+                fig.savefig(figures/(group['key']+'-progress.pdf'),bbox_inches='tight')
+                plt.close(fig)
             summaries.append(dict(key=group['key'], title=group['title'], context=context_label(cfg), note=group['note']))
     export_csv(out/'level-summary.csv', details)
+    export_csv(out/'observed-seed-coverage.csv', coverage_rows)
     effect_matrix = np.asarray(effects)
     scales = np.array([max((abs(v) for v in effect_matrix[:, i] if np.isfinite(v)), default=1) or 1 for i in range(len(METRICS))])
     fig, ax = plt.subplots(figsize=(15, max(7, .36*len(summaries))))
@@ -224,6 +387,7 @@ def analyze(out, reextract=False):
     fig.savefig(figures/'overview.png', dpi=170, bbox_inches='tight')
     fig.savefig(figures/'overview.pdf', bbox_inches='tight')
     plt.close(fig)
+    analyze_ages(out)
     report(out, manifest, rows, summaries, details)
     validation = dict(completedRuns=len(rows), uniqueConfigurations=len(by_config),
         sweepGroups=len(summaries), rngRuns=seeds, applicationPassed=sum(r['applicationPassed'] for r in rows),
@@ -264,8 +428,11 @@ def report(out, manifest, rows, summaries, details):
         '[Overview](figures/overview.png) · [All summary panels](figures/knob-comparisons.pdf) · '
         '[All time/value heatmaps](figures/knob-timeseries.pdf) · [Per-run data](run-summary.csv) · '
         '[Per-level paired differences](level-summary.csv)', '',
+        '[Backlogged stall-age comparisons](stall-age-report.md)', '',
         '## Metric definitions and selection', '',
         '- **SRTT:** sample mean of valid TCP SRTT over the trailing 50 ms, converted to ms. '
+        'This is held estimator state, not a fresh RTT measurement at every poll. '
+        'Check the delivery/progress pages and ACK age before interpreting stalled periods. '
         'The summary is its time-sample mean during 20–119 s; per-run p90 is also exported.',
         '- **RTTVAR:** trailing 50 ms mean of the trace’s smoothed absolute RTT-error estimator, in ms; '
         'it is not statistical RTT variance in ms².',
@@ -307,15 +474,30 @@ def report(out, manifest, rows, summaries, details):
         'Bandwidth changes also adjust bytes to retain the same calibrated BDP multiplier. '
         'Queue budgets use a fresh clear-link reference and a 10 KiB floor; equal low-factor byte '
         'budgets can produce identical results. Full saved configurations are authoritative.', '',
-        '**Background sweep scope:** relay switching is held disabled for every background level, '
+        '**Background sweep scope:** the original background sweeps hold relay switching disabled at every level, '
         'including its zero-background control. The broader pilot exposed a relay-switch uplink '
-        'timing bug, now fixed and covered by `experiments/relay-switch-regression/`. Failed pilot logs are '
+        'timing bug and a connected-access identity bug. Regression coverage is in '
+        '`experiments/relay-recovery-regression/`. Failed pilot logs are '
         'preserved under `reused-provenance/` when prior results are reused. The separate switching '
-        'sweep retains enabled/disabled controls without background UEs. These plots do not establish '
-        'behavior for the combined switching/background interaction.', '',
+        'sweep retains enabled/disabled controls without background UEs. '
+        + ('The additional background-count sweep enables switching at every count level to observe the combined interaction.'
+           if any(g['key'] == 'backgroundCountSwitching' for g in manifest['groups']) else
+           'These plots do not establish behavior for the combined switching/background interaction.'), '',
         '## Observed changes', '',
         '| Knob | Largest paired SRTT change (ms) | RTTVAR change (ms) | UL SINR change (dB) | TB failure change (percentage points) |',
         '|---|---:|---:|---:|---:|']
+    if manifest['settings'].get('tcpSocketBufferBytes'):
+        size = manifest['settings']['tcpSocketBufferBytes']
+        text[4:4] = [f'TCP send/receive buffers use {size:,} bytes per endpoint '
+                      'except the explicit default level of the socket-enlargement sweep. '
+                      'The enlarged buffer covers the largest planned/calibrated queue plus path BDP. '
+                      'Workloads retain their default delayed-ACK policy; immediate ACKs are used '
+                      'only to measure the unloaded queue-reference RTT.', '']
+    elif manifest['settings'].get('tcpBufferPolicy') == 'default':
+        text[4:4] = ['TCP endpoints retain their configured model limits except explicit socket-enlargement levels. A queue-size plateau '
+                      'may reflect an endpoint/window limit rather than the radio queue alone. '
+                      'The socket-enlargement sweep compares default and enlarged buffers with the same traffic and queues. '
+                      'Workloads retain their default delayed-ACK policy.', '']
     for group in summaries:
         cells = []
         for metric in ('srtt_ms', 'rttvar_ms', 'sinr_ul_db', 'tb_fail_data_pct'):
@@ -332,20 +514,33 @@ def report(out, manifest, rows, summaries, details):
         file_cases = [r for r in rows if not r['applicationPassed'] and
                       json.loads((out/r['config']).read_text())['application']['workload'] == 'file']
         if file_cases:
-            text += ['', f'{len(file_cases)} of these are file transfers that did not complete a whole file '
-                     'before the run cutoff. The file success criterion requires at least one completed file; '
-                     'it is distinct from successful TCP data/ACK delivery. Their transport and PHY observations '
-                     'remain included. At 32 kbit/s, the 105 s application interval permits about 420 kB of '
-                     'paced bodies before overhead/backpressure, so 1 MB median files can remain unfinished.']
+            text += ['', f'{len(file_cases)} failed runs use the file workload. Inspect the saved application '
+                     'criterion and accepted/delivered byte counts before interpreting them as file completion. '
+                     'Native stream runs use a positive-byte smoke criterion; legacy framed probes can use '
+                     'message/file completion. Their transport and PHY observations remain included.']
     text += ['', '## Individual sweep pages', '']
     for group in summaries:
         text += [f"### {group['title']}", '', group['context']+'. '+group['note'], '',
                  f"![{group['title']}](figures/{group['key']}.png)", '',
                  f"[Time/value heatmaps](figures/{group['key']}-time.png)", '']
+        if (out/'figures'/(group['key']+'-progress.png')).exists():
+            text += [f"[Delivery and transport progress, individual seeds](figures/{group['key']}-progress.png)", '']
     text += ['## Reproduce or compare a code change', '',
         'Re-render this preserved run: `python3 experiments/knob-sweep/run.py --out-dir '+str(out)+' --analyze-only`.', '',
-        'To recompute metrics from compressed raw traces, add `--reextract`. To run changed code, use a fresh '
-        'output directory; resume checks reject changed sources/binaries. A new run automatically recalibrates '
+        'To recompute metrics from compressed raw traces, add `--reextract`. To run changed code in the same '
+        'output directory, use `--clean`; this deletes that campaign. Resume checks reject changed sources/binaries. A new run automatically recalibrates '
         'queue budgets unless given an accepted reference for the current model. Source snapshots, hashes, '
         'configuration hashes, settings, seeds and calibration are retained in this directory.', '']
     (out/'report.md').write_text('\n'.join(text))
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out-dir', type=Path, required=True)
+    parser.add_argument('--ages-only', action='store_true', help='render only the backlogged stall-age comparisons')
+    args = parser.parse_args()
+    if args.ages_only:
+        analyze_ages(args.out_dir)
+    else:
+        analyze(args.out_dir)

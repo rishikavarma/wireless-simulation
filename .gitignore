@@ -1,6 +1,7 @@
 # Upstream source checkout or symlink; maintained changes live in patches/.
 ns-3-dev
 ns-3-dev/
+/ns-3-dev-master-backup-*/
 
 # Generated datasets, traces, figures, and local investigations.
 /results/
@@ -16,6 +17,7 @@ ns-3-dev/
 /docs/*
 !/docs/experiment.md
 !/docs/application-rates.md
+!/docs/rlc-am-retransmission.md
 
 # Dataset archives generated outside results/.
 *.npz
@@ -34,3 +36,16 @@ ns-3-dev/
 __pycache__/
 *.pyc
 .python-version
+
+# Local Python tests and test output.
+test_*.py
+*_test.py
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environments and credentials.
+.venv/
+venv/
+/.aws/

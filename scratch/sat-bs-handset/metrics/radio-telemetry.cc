@@ -4,6 +4,7 @@
 #include "ns3/nr-pdcp-header.h"
 #include "ns3/nr-pdcp-tag.h"
 #include "ns3/nr-rlc-am-header.h"
+#include "ns3/nr-radio-bearer-info.h"
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -18,14 +19,15 @@ void RadioTelemetry::Connect(const MetricOutputPaths& paths, const ScenarioConfi
     NS_ABORT_MSG_IF(!m_events || !m_tb || !m_kpi, "cannot open radio telemetry");
     m_events << "time_s,event,direction,rnti,lcid,sequence_number,size_bytes,value,details\n";
     m_tb << "time_s,event,direction,rnti,tb_bytes,mac_bytes,mcs,rv,ndi,harq_id,prbs,num_symbols,sinr_db,tbler,crc_pass_model\n";
-    m_kpi << "time_s,interval_s,ue_index,rnti,DRB.PdcpSduVolumeDL_kB,DRB.PdcpSduVolumeUL_kB,DRB.RlcSduDelayDl_us,RRU.PrbTotDl,RRU.PrbTotUl,DRB.UEThpDl_Mbps,DRB.UEThpUl_Mbps,dl_prb_symbols,ul_prb_symbols,dl_delay_samples\n";
+    m_kpi << "time_s,interval_s,ue_index,rnti,DRB.PdcpSduVolumeDL_kB,DRB.PdcpSduVolumeUL_kB,DRB.RlcSduDelayDl_us,RRU.PrbTotDl,RRU.PrbTotUl,DRB.UEThpDl_Mbps,DRB.UEThpUl_Mbps,dl_prb_symbols,ul_prb_symbols,dl_delay_samples,rlc_tx_drop_dl_pdus,rlc_tx_drop_ul_pdus,rlc_tx_drop_dl_bytes,rlc_tx_drop_ul_bytes,rnti_history\n";
     if (m_payload) m_payload << "time_s,event,direction,rnti,packet_uid,size_bytes,hex\n";
     for (auto* f : {&m_events,&m_tb,&m_kpi,&m_payload}) *f << std::setprecision(12);
     for (uint32_t i=0; i<ues.GetN(); ++i) {
         auto dev = DynamicCast<NrUeNetDevice>(ues.Get(i));
+        m_imsiUe[dev->GetImsi()] = i;
         auto rrc = dev->GetRrc();
         for (const auto& name : {"RandomAccessSuccessful","RandomAccessError","ConnectionEstablished",
-                                "ConnectionReconfiguration","HandoverEndOk","HandoverEndError","Sib2Received"})
+                                "ConnectionReconfiguration","HandoverEndOk","HandoverEndError","Sib2Received","RadioLinkFailure"})
             rrc->TraceConnectWithoutContext(name, MakeCallback(&RadioTelemetry::Rrc,this).Bind(std::string(name)));
         rrc->TraceConnectWithoutContext("DrbCreated", MakeCallback(&RadioTelemetry::Drb,this));
         for (uint8_t b=0;b<2;++b) {
@@ -37,11 +39,14 @@ void RadioTelemetry::Connect(const MetricOutputPaths& paths, const ScenarioConfi
             phy->TraceConnectWithoutContext("NtnBoundaryOverlap",MakeCallback(&RadioTelemetry::Boundary,this).Bind(true));
             phy->TraceConnectWithoutContext("HarqDecision",MakeCallback(&RadioTelemetry::Harq,this).Bind(true));
             auto mac=NrHelper::GetUeMac(dev,b);
+            mac->TraceConnectWithoutContext("ConnectedRaMsg3",MakeCallback(&RadioTelemetry::ConnectedRaMsg3,this));
             mac->TraceConnectWithoutContext("UeMacTxedCtrlMsgsTrace",MakeCallback(&RadioTelemetry::Control,this).Bind(std::string("UE_CTRL_TX")));
             mac->TraceConnectWithoutContext("UeMacRxedCtrlMsgsTrace",MakeCallback(&RadioTelemetry::Control,this).Bind(std::string("UE_CTRL_RX")));
         }
     }
     for (uint8_t b=0;b<2;++b) {
+        NrHelper::GetGnbMac(gnbs.Get(0),b)->TraceConnectWithoutContext("ConnectedRaIdentity",
+            MakeCallback(&RadioTelemetry::ConnectedRa,this));
         auto phy=NrHelper::GetGnbPhy(gnbs.Get(0),b)->GetSpectrumPhy();
         phy->TraceConnectWithoutContext("TxTransportBlock",MakeCallback(&RadioTelemetry::Tx,this).Bind(true,
             NrHelper::GetGnbMac(gnbs.Get(0),b)->GetNumRbPerRbg(),NrHelper::GetGnbPhy(gnbs.Get(0),b)->GetRbNum()));
@@ -65,12 +70,40 @@ void RadioTelemetry::Discover() {
             object->TraceConnectWithoutContext("TxPduPacket",MakeCallback(&RadioTelemetry::Pdu,this).Bind(pdcp,!ue,true));
             object->TraceConnectWithoutContext("RxPduPacket",MakeCallback(&RadioTelemetry::Pdu,this).Bind(pdcp,ue,false));
             if (pdcp) object->TraceConnectWithoutContext("RxPDU",MakeCallback(&RadioTelemetry::PdcpRx,this).Bind(ue));
+            else {
+                const auto path=matches.GetMatchedPath(i);
+                const auto bearerPath=path.substr(0,path.rfind("/NrRlc"));
+                auto bearer=DynamicCast<NrDataRadioBearerInfo>(Config::LookupMatches(bearerPath).Get(0));
+                const auto rrcPath=path.substr(0,path.find("/DataRadioBearerMap/"));
+                auto rrc=Config::LookupMatches(rrcPath).Get(0);
+                const uint16_t rnti=ue ? DynamicCast<NrUeRrc>(rrc)->GetRnti()
+                                       : DynamicCast<NrUeManager>(rrc)->GetRnti();
+                NS_ABORT_MSG_IF(!object->TraceConnectWithoutContext("TxDrop",
+                    MakeCallback(&RadioTelemetry::RlcDrop,this).Bind(!ue,rnti,bearer->m_logicalChannelIdentity)),
+                    "RLC queue drop trace is unavailable");
+            }
         }
     }
 }
 void RadioTelemetry::Rrc(std::string event,uint64_t imsi,uint16_t cell,uint16_t rnti) {
+    if (rnti) {
+        const auto index=m_imsiUe.at(imsi);
+        auto [found, inserted]=m_rntiUe.emplace(rnti,index);
+        NS_ABORT_MSG_IF(!inserted && found->second!=index,"RNTI reused across UEs within telemetry run");
+    }
     m_events<<Simulator::Now().GetSeconds()<<','<<event<<",,"<<rnti<<",,,,,imsi="<<imsi<<";cell="<<cell<<'\n';
     Simulator::ScheduleNow(&RadioTelemetry::Discover,this);
+}
+void RadioTelemetry::ConnectedRa(uint16_t temporaryRnti,uint16_t establishedRnti) {
+    m_events<<Simulator::Now().GetSeconds()<<",CRNTI_RECOVERY,UL,"<<establishedRnti
+            <<",58,,,,temporary_rnti="<<temporaryRnti<<'\n';
+}
+void RadioTelemetry::ConnectedRaMsg3(uint64_t imsi,uint16_t temporaryRnti,uint16_t establishedRnti) {
+    const auto index=m_imsiUe.at(imsi);
+    auto [found,inserted]=m_rntiUe.emplace(temporaryRnti,index);
+    NS_ABORT_MSG_IF(!inserted && found->second!=index,"temporary RNTI reused across UEs");
+    m_events<<Simulator::Now().GetSeconds()<<",CRNTI_MSG3,UL,"<<establishedRnti
+            <<",58,,,,imsi="<<imsi<<";temporary_rnti="<<temporaryRnti<<'\n';
 }
 void RadioTelemetry::Control(std::string event,uint64_t imsi,SfnSf,uint16_t cell,uint16_t rnti,uint8_t bwp,Ptr<const NrControlMessage> msg) {
     m_events<<Simulator::Now().GetSeconds()<<','<<event<<",,"<<rnti<<",,,,"<<msg->GetMessageType()<<",imsi="<<imsi<<";cell="<<cell<<";bwp="<<+bwp;
@@ -117,6 +150,13 @@ void RadioTelemetry::Pdu(bool pdcp,bool dl,bool tx,uint16_t rnti,uint8_t lcid,Pt
 void RadioTelemetry::PdcpRx(bool dl,uint16_t rnti,uint8_t lcid,uint32_t,uint64_t delayNs) {
     if(dl && lcid>2) {auto& c=m_counts[rnti];c.delayUs+=delayNs/1000.0;++c.delayN;}
 }
+void RadioTelemetry::RlcDrop(bool dl,uint16_t rnti,uint8_t lcid,Ptr<const Packet> packet) {
+    m_events<<Simulator::Now().GetSeconds()<<",RLC_TX_DROP,"<<(dl?"DL":"UL")<<','
+            <<rnti<<','<<+lcid<<",,"<<packet->GetSize()<<",,reason=tx_buffer_full\n";
+    auto& c=m_counts[rnti];
+    ++(dl?c.dropsDl:c.dropsUl);
+    (dl?c.dropBytesDl:c.dropBytesUl)+=packet->GetSize();
+}
 void RadioTelemetry::Payload(const char* event,bool dl,uint16_t rnti,Ptr<const Packet> packet) {
     std::vector<uint8_t> data(packet->GetSize());packet->CopyData(data.data(),data.size());
     m_payload<<Simulator::Now().GetSeconds()<<','<<event<<','<<(dl?"DL":"UL")<<','<<rnti<<','<<packet->GetUid()<<','<<data.size()<<',';
@@ -128,9 +168,27 @@ void RadioTelemetry::Tick() {
     if(dt<=0) return;
     for(uint32_t i=0;i<m_ues.GetN();++i) {
         auto dev=DynamicCast<NrUeNetDevice>(m_ues.Get(i)); const uint16_t rnti=dev->GetRrc()->GetRnti();
-        auto& c=m_counts[rnti];
-        m_kpi<<now.GetSeconds()<<','<<dt<<','<<i<<','<<rnti<<','<<c.txDl/1000<<','<<c.txUl/1000<<','<<(c.delayN?c.delayUs/c.delayN:std::numeric_limits<double>::quiet_NaN())<<','<<c.prbDl<<','<<c.prbUl<<','<<c.rxDl*8/dt/1e6<<','<<c.rxUl*8/dt/1e6<<','<<c.symDl<<','<<c.symUl<<','<<c.delayN<<'\n';
+        if (rnti) m_rntiUe.emplace(rnti,i);
+        Counters c;
+        std::string history;
+        // A reconnect may change RNTI between ticks. Attribute both the old
+        // and new identities to the stable UE instead of discarding old work.
+        for (const auto& [identity,index]:m_rntiUe) if(index==i) {
+            if(!history.empty()) history+='|';
+            history+=std::to_string(identity);
+            const auto found=m_counts.find(identity);
+            if(found==m_counts.end()) continue;
+            const auto& x=found->second;
+            c.txDl+=x.txDl;c.txUl+=x.txUl;c.rxDl+=x.rxDl;c.rxUl+=x.rxUl;
+            c.prbDl+=x.prbDl;c.prbUl+=x.prbUl;c.symDl+=x.symDl;c.symUl+=x.symUl;
+            c.delayUs+=x.delayUs;c.delayN+=x.delayN;
+            c.dropsDl+=x.dropsDl;c.dropsUl+=x.dropsUl;
+            c.dropBytesDl+=x.dropBytesDl;c.dropBytesUl+=x.dropBytesUl;
+        }
+        m_kpi<<now.GetSeconds()<<','<<dt<<','<<i<<','<<rnti<<','<<c.txDl/1000<<','<<c.txUl/1000<<','<<(c.delayN?c.delayUs/c.delayN:std::numeric_limits<double>::quiet_NaN())<<','<<c.prbDl<<','<<c.prbUl<<','<<c.rxDl*8/dt/1e6<<','<<c.rxUl*8/dt/1e6<<','<<c.symDl<<','<<c.symUl<<','<<c.delayN<<','<<c.dropsDl<<','<<c.dropsUl<<','<<c.dropBytesDl<<','<<c.dropBytesUl<<','<<history<<'\n';
     }
+    for (const auto& [identity,c]:m_counts)
+        NS_ABORT_MSG_IF(identity && !m_rntiUe.count(identity),"unmapped RNTI in radio telemetry");
     m_counts.clear();m_previous=now;
     if(now+m_period<m_stop) m_tick=Simulator::Schedule(m_period,&RadioTelemetry::Tick,this);
 }

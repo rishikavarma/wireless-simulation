@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -31,7 +32,11 @@ def model_hashes():
     paths = list((ROOT / 'scratch/sat-bs-handset').rglob('*.cc'))
     paths += list((ROOT / 'scratch/sat-bs-handset').rglob('*.h'))
     paths += list((ROOT / 'patches').glob('*.patch'))
-    paths += [HERE / 'queue-calibration.cc', HERE / 'calibrate.py', HERE / 'settings.json']
+    paths += [HERE / name for name in ('queue-calibration.cc', 'calibrate.py', 'settings.json', 'CMakeLists.txt')]
+    paths += [ROOT/'scratch/sat-bs-handset/config/dataset-baseline.json']
+    paths += [ROOT/'scripts/dataset'/name for name in
+              ('run_dataset.py', 'dataset_presets.py', 'campaign_config.py')]
+    paths += [p for p in (ROOT/'ns-3-dev/build/lib').glob('libns3*.so') if '-test-' not in p.name]
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(paths)}
 
@@ -49,20 +54,22 @@ def design(out, settings, pilot=False, existing=None):
                 rates = sorted(set(settings['offeredRatesKbps'] +
                     settings.get('extraOfferedRatesKbps', {}).get(f'{bandwidth}-{direction}', [])))
                 specs += [('capacity', rate, settings['capacityQueueBytes'])
-                          for rate in ([128, 512] if pilot else rates)]
-                if not pilot and rng == settings['rngRuns'][0]:
+                          for rate in (rates[-2:] if pilot else rates)]
+                if not pilot:
                     specs += [('buffer-check', max(rates), settings['checkQueueBytes'])]
+                if settings.get('rttDelayedAckControl') and rng == settings['rngRuns'][0]:
+                    specs += [('rtt-delayed-control', settings['rttRateKbps'], settings['capacityQueueBytes'])]
                 for kind, rate, queue in specs:
                     cfg = copy.deepcopy(base)
                     cfg['application'].update(workload='cbr', direction=direction,
-                        transport='tcp' if kind == 'rtt' else 'udp', tcpVariant='TcpNewReno',
+                        transport='tcp' if kind.startswith('rtt') else 'udp', tcpVariant='TcpNewReno',
                         dataRate=f'{rate:g}kbps', queueSizeBytes=queue,
-                        packetSize=settings['rttPacketBytes'] if kind == 'rtt' else settings['capacityPacketBytes'])
+                        packetSize=settings['rttPacketBytes'] if kind.startswith('rtt') else settings['capacityPacketBytes'])
                     cfg['radio'].update(bandwidthHz=bandwidth*1e6,
                                         ulBandwidthHz=bandwidth*1e6, dlBandwidthHz=bandwidth*1e6)
                     prefix = f'{out.name}-{bandwidth}mhz-{direction}-{kind}-{rate:g}k-{rng}'
                     cfg['output']['prefix'] = prefix
-                    if not preflight(cfg):
+                    if not preflight(cfg, require_service=True):
                         raise RuntimeError(f'geometry admission failed: {prefix}')
                     if prefix in existing:
                         previous = json.loads((ROOT / existing[prefix]['config']).read_text())
@@ -76,7 +83,10 @@ def design(out, settings, pilot=False, existing=None):
                     path.write_text(json.dumps(cfg, indent=2)+'\n')
                     rows.append(dict(prefix=prefix, config=str(path.relative_to(ROOT)),
                         bandwidthMHz=bandwidth, direction=direction, kind=kind,
-                        offeredKbps=rate, queueBytes=queue, rngRun=rng))
+                        offeredKbps=rate, queueBytes=queue, rngRun=rng,
+                        tcpAckPolicy=settings['rttAckPolicy'] if kind == 'rtt' else
+                                     ('default-delayed' if kind == 'rtt-delayed-control' else 'not-applicable'),
+                        configSha256=hashlib.sha256(path.read_bytes()).hexdigest()))
     return rows
 
 
@@ -88,6 +98,12 @@ def plan(out, pilot=False):
     manifest = dict(settings=settings, runs=rows, modelHashes=model_hashes(), pilot=pilot)
     out.mkdir(parents=True, exist_ok=True)
     (out/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+    for name in manifest['modelHashes']:
+        if name.startswith('ns-3-dev/'):
+            continue
+        target = out/'source-snapshot'/name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT/name, target)
     print(f'Planned {len(rows)} calibration runs', flush=True)
 
 
@@ -116,6 +132,18 @@ def extend(out):
     print('Added',len(rows)-len(previous_rows),'saturation confirmation runs',flush=True)
 
 
+def simulation_command(row, out):
+    """Only the unloaded baseline disables receiver ACK waiting."""
+    command = [str(BIN), '--config='+str(ROOT/row['config']), '--RngRun='+str(row['rngRun'])]
+    if row['kind'].startswith('rtt'):
+        command += ['--calibrationRttCsv='+str(out/'logs'/f"{row['prefix']}-rtt.csv")]
+    if row['kind'] == 'rtt':
+        if row['tcpAckPolicy'] != 'immediate':
+            raise ValueError('unloaded path RTT calibration requires immediate ACKs')
+        command += ['--ns3::TcpSocket::DelAckCount=1']
+    return command
+
+
 def run(out, jobs):
     manifest = json.loads((out/'manifest.json').read_text())
     if manifest['modelHashes'] != model_hashes():
@@ -128,16 +156,17 @@ def run(out, jobs):
     (out/'logs').mkdir(exist_ok=True)
 
     def one(row):
+        if hashlib.sha256((ROOT/row['config']).read_bytes()).hexdigest() != row['configSha256']:
+            raise RuntimeError('saved configuration changed: '+row['prefix'])
         status = out/'logs'/f"{row['prefix']}.json"
         if status.exists():
             return json.loads(status.read_text())
         before = time.monotonic()
-        command = [str(BIN), '--config='+str(ROOT/row['config']), '--RngRun='+str(row['rngRun'])]
-        if row['kind'] == 'rtt':
-            command += ['--calibrationRttCsv='+str(out/'logs'/f"{row['prefix']}-rtt.csv")]
+        command = simulation_command(row, out)
         with (out/'logs'/f"{row['prefix']}.log").open('w') as log:
             completed = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-        result = dict(row, exit=completed.returncode, wallS=round(time.monotonic()-before, 2))
+        result = dict(row, command=command, exit=completed.returncode,
+                      wallS=round(time.monotonic()-before, 2))
         status.write_text(json.dumps(result, indent=2)+'\n')
         print(row['prefix'], 'exit', result['exit'], 'wall', result['wallS'], flush=True)
         return result
@@ -160,7 +189,7 @@ def plot_summary(out, rows, cohorts):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for key, cohort in cohorts.items():
+    for index, (key, cohort) in enumerate(cohorts.items()):
         subset = [r for r in rows if r['bandwidthMHz']==cohort['bandwidthMHz']
                   and r['direction']==cohort['direction']]
         rates = sorted({r['offeredKbps'] for r in subset if r['kind']=='capacity'})
@@ -172,12 +201,17 @@ def plot_summary(out, rows, cohorts):
         axes[0].errorbar(rates, centers, yerr=errors, marker='o', capsize=3,
                         label=f"{cohort['bandwidthMHz']} MHz {cohort['direction'].upper()}")
         minima = [r['minRttMs'] for r in subset if r['kind']=='rtt']
-        axes[1].scatter([key]*len(minima), minima, alpha=.6)
+        axes[1].scatter([key]*len(minima), minima, alpha=.6,
+                        label='Immediate ACK baseline' if index == 0 else None)
+        controls = [r['minRttMs'] for r in subset if r['kind']=='rtt-delayed-control']
+        axes[1].scatter([key]*len(controls), controls, marker='x', color='tab:red',
+                        label='Default delayed ACK control' if index == 0 else None)
     axes[0].set(xscale='log', xlabel='Offered UDP payload rate (kbit/s)',
                 ylabel='Delivered PDCP SDU rate (kbit/s)')
     axes[0].legend(fontsize=8)
     axes[1].set(xlabel='Bandwidth (MHz) and traffic direction',
                 ylabel='Minimum data RTT per RNG run (ms)')
+    axes[1].legend(fontsize=8)
     for ax in axes:
         ax.grid(alpha=.2)
     fig.suptitle('Queue calibration: 800 km, stationary UE, relay switching enabled')
@@ -193,6 +227,8 @@ def analyze(out, reference=None):
     rows = []
     for rec in manifest['runs']:
         prefix = rec['prefix']
+        if 'configSha256' in rec and hashlib.sha256((ROOT/rec['config']).read_bytes()).hexdigest() != rec['configSha256']:
+            raise RuntimeError(f'saved configuration changed: {prefix}')
         status = json.loads((out/'logs'/f'{prefix}.json').read_text())
         if status['exit'] != 0:
             raise RuntimeError(f'calibration simulation did not pass: {prefix}')
@@ -219,7 +255,13 @@ def analyze(out, reference=None):
         row = dict(rec, pdcpKbps=pdcp, applicationGoodputKbps=goodput,
                    measuredSeconds=len(primary), switchTimeS=switches[0],
                    pdcpBeforeSwitchKbps=before, pdcpAfterSwitchKbps=after)
-        if rec['kind']=='rtt':
+        if rec['kind'].startswith('rtt'):
+            policy = re.findall(r'del_ack_count=(\d+)',
+                (out/'logs'/f'{prefix}-rtt.csv').read_text())
+            row['observedDelAckCounts'] = sorted(set(map(int, policy)))
+            if rec['kind'] == 'rtt':
+                if not policy or any(int(n) != 1 for n in policy):
+                    raise RuntimeError(f'immediate-ACK policy not confirmed on sockets: {prefix}')
             raw = read_csv(out/'logs'/f'{prefix}-rtt.csv')
             values = [float(r['rtt_ms']) for r in raw if keep(float(r['time_s']))]
             if len(values)<3:
@@ -239,13 +281,26 @@ def analyze(out, reference=None):
             plateau = relative<=s['plateauTolerance'] and rates[-1]>1.5*last
             if not plateau:
                 issues.append(f'{bandwidth}MHz {direction}: no stable plateau ({relative:.1%})')
-            checks = [r['pdcpKbps'] for r in subset if r['kind']=='buffer-check'
-                      and r['offeredKbps']==rates[-1]]
-            seed_top = next(r['pdcpKbps'] for r in subset if r['kind']=='capacity'
-                            and r['offeredKbps']==rates[-1] and r['rngRun']==s['rngRuns'][0])
-            buffer_delta = abs(checks[0]-seed_top)/seed_top if checks else None
-            if not checks and not manifest['pilot']:
-                issues.append(f'{bandwidth}MHz {direction}: missing larger-buffer control')
+            seed_checks = []
+            buffer_checks = []
+            for rng in s['rngRuns'][:1] if manifest['pilot'] else s['rngRuns']:
+                seed_rates = {r['offeredKbps']: r['pdcpKbps'] for r in subset
+                              if r['kind']=='capacity' and r['rngRun']==rng}
+                top, prior = seed_rates[rates[-1]], seed_rates[rates[-2]]
+                delta = abs(top-prior)/max(top,prior)
+                passed = delta <= s['plateauTolerance'] and rates[-1] > 1.5*top
+                seed_checks.append(dict(rngRun=rng, relativeDifference=delta,
+                                        oversubscription=rates[-1]/top, passed=passed))
+                if not passed:
+                    issues.append(f'{bandwidth}MHz {direction} seed {rng}: no stable saturated plateau')
+                check = next((r['pdcpKbps'] for r in subset if r['kind']=='buffer-check'
+                              and r['offeredKbps']==rates[-1] and r['rngRun']==rng), None)
+                if check is None:
+                    if not manifest['pilot']:
+                        issues.append(f'{bandwidth}MHz {direction} seed {rng}: missing larger-buffer control')
+                else:
+                    buffer_checks.append(dict(rngRun=rng, relativeDifference=abs(check-top)/top))
+            buffer_delta = max((r['relativeDifference'] for r in buffer_checks), default=None)
             if buffer_delta is not None and buffer_delta>s['plateauTolerance']:
                 issues.append(f'{bandwidth}MHz {direction}: capacity changes with larger buffer')
             minima = [r['minRttMs'] for r in subset if r['kind']=='rtt']
@@ -257,14 +312,18 @@ def analyze(out, reference=None):
                 rttMinimumRangeMs=[min(minima),max(minima)], rngReplicates=len(minima),
                 offeredRateMediansKbps={str(k):v for k,v in by_rate.items()},
                 plateauRelativeDifference=relative, plateauPassed=plateau,
-                largerBufferRelativeDifference=buffer_delta)
+                largerBufferRelativeDifference=buffer_delta,
+                plateauChecksBySeed=seed_checks, largerBufferChecksBySeed=buffer_checks)
     budgets = {}
     for bandwidth in s['bandwidthMHz']:
         bdp = max(c['bdpBytes'] for c in cohorts.values() if c['bandwidthMHz']==bandwidth)
         budgets[str(bandwidth)] = dict(referenceBdpBytes=bdp,
             bytesByMultiplier={str(m): max(s['minimumQueueBytes'], math.ceil(m*bdp))
                                for m in s['queueMultipliers']})
-    result = dict(schemaVersion=1, method='median per-seed unloaded data RTT and saturated PDCP SDU service rate',
+    result = dict(schemaVersion=2,
+        method='median per-seed unloaded data RTT with immediate ACKs and saturated PDCP SDU service rate',
+        rttAckPolicy='immediate (DelAckCount=1); workload sweeps keep default delayed ACKs',
+        rttMeaning='non-congested network path including radio scheduling/processing; receiver delayed-ACK waiting excluded',
         experiment=str(out.relative_to(ROOT)), modelHashes=manifest['modelHashes'],
         binarySha256=(out/'binary-hash.txt').read_text().strip(),
         settings=s, cohorts=cohorts, bandwidthBudgets=budgets,

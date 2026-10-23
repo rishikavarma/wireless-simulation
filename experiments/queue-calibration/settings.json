@@ -13,17 +13,19 @@
     20003
   ],
   "offeredRatesKbps": [
-    8,
-    32,
-    128,
     512,
-    2048
+    2048,
+    8192,
+    16384,
+    32768
   ],
   "capacityPacketBytes": 512,
-  "capacityQueueBytes": 65536,
-  "checkQueueBytes": 131072,
+  "capacityQueueBytes": 262144,
+  "checkQueueBytes": 524288,
   "rttRateKbps": 1,
   "rttPacketBytes": 128,
+  "rttAckPolicy": "immediate",
+  "rttDelayedAckControl": true,
   "measurementStartS": 20,
   "measurementEndS": 119,
   "switchExclusionS": 5,
@@ -37,9 +39,5 @@
     8,
     16
   ],
-  "extraOfferedRatesKbps": {
-    "20-ul": [
-      8192
-    ]
-  }
+  "extraOfferedRatesKbps": {}
 }

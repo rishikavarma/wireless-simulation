@@ -4,6 +4,7 @@ import argparse,concurrent.futures as cf,copy,hashlib,json,random,re,subprocess,
 from pathlib import Path
 import campaign_config
 import dataset_presets
+from experiment_cleanup import clean_experiment, mark_experiment
 ROOT=Path(__file__).resolve().parents[2]
 BIN=ROOT/'ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized'
 def profiles():
@@ -53,6 +54,7 @@ def plan(out,stem,settings=None):
  settings=settings or dataset_presets.settings()
  out.mkdir(parents=True,exist_ok=True)
  if (out/'manifest.json').exists():raise SystemExit('manifest already exists; use --run to resume')
+ mark_experiment(out,'dataset')
  selected,rejected=dataset_presets.expand_profiles(profiles(),settings)
  proofs={name:(dataset_presets.preflight(cfg) if settings['preset']=='full' else campaign_config.preflight(cfg)) for name,_,cfg in selected}
  if not all(proofs.values()):raise RuntimeError('geometry admission failed')
@@ -68,16 +70,23 @@ def plan(out,stem,settings=None):
                 'tcpVariant':cfg['application']['tcpVariant'],'direction':cfg['application'].get('direction','ul'),
                 'dataRate':cfg['application']['dataRate'],'queueSizeBdp':cfg['application']['queueSizeBdp'],
                 'queueSizeBytes':cfg['application'].get('queueSizeBytes'),
+                'socket-enlargement':cfg['application'].get('socket-enlargement','default'),
+                'tcpSocketBufferBytes':cfg['application'].get('tcpSocketBufferBytes'),
                 'queueBudgetMultiplier':cfg['application']['queueSizeBdp'],
                 'serviceExcessLossDb':cfg['radio']['serviceExcessLossDb'],'feederExcessLossDb':cfg['radio']['feederExcessLossDb'],
                 'bandwidthMHz':cfg['radio']['ulBandwidthHz']/1e6,'altitudeKm':cfg['satellite']['altitudeKm'],
                 'receiverMobility':cfg['topology']['receiverMobility'],
                 'ueSpeedMps':cfg['topology']['ueSpeedMps'] if cfg['topology']['receiverMobility'] else 0,
                 'backgroundCount':cfg.get('background',{}).get('count',0)}})
- manifest={'design':f"{len(selected)} profiles x {settings['replicates']} matched RNG replicates; {settings['anchorProfileCount']} controlled anchors plus sampled cross-factor profiles",
+ manifest={'design':f"{len(selected)} profiles x {settings['replicates']} matched RNG replicates; {settings['anchorProfileCount']} controlled anchors, {settings.get('stressProfileCount',0)} stress profiles, plus sampled cross-factor profiles",
            'preset':settings['preset'],'settings':settings,'plannedSize':dataset_presets.planned_size(settings),
            'rejectedProfileCandidates':rejected,
-           'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'73 legacy transport/SINR features plus separate radio/KPI logs',
+           'candidateRejectionPolicy':'duplicates only in full preset; network service warnings retained',
+           'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'77 transport/SINR features (73 legacy plus four TCP progress heads), plus separate radio/KPI logs',
+           'progressFeatures':{'tcp_pending_bytes':'TCP bytes queued or awaiting ACK',
+              'tcp_ack_age_s':'seconds since forward TCP transmit-buffer head progress; missing before first observation',
+              'tcp_no_progress_s':'seconds continuously backlogged without forward ACK progress; zero when idle',
+              'tcp_rtt_update_age_s':'seconds since a changed positive LastRTT trace value; not a packet RTT sample count'},
            'runs':runs}
  (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  print('planned',len(runs),'runs',flush=True)
@@ -91,7 +100,7 @@ def run(out,jobs):
  sources['nrPatch']=hashlib.sha256((ROOT/'patches/nr-v5.1-local-ntn.patch').read_bytes()).hexdigest()
  sources['configs']={r['prefix']:hashlib.sha256(Path(r['config']).read_bytes()).hexdigest() for r in manifest['runs']}
  stamp=out/'source-hashes.json'
- if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; select a fresh campaign')
+ if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; use --clean to restart this campaign or select a fresh directory')
  stamp.write_text(json.dumps(sources,indent=2)+'\n')
  for name in sources:
   if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
@@ -102,8 +111,10 @@ def run(out,jobs):
   if status.exists():return json.loads(status.read_text())
   before=time.monotonic()
   with (out/'logs'/(prefix+'.log')).open('w') as log:
-   completed=subprocess.run([str(BIN),'--config='+rec['config'],'--RngRun='+str(rec['rngRun'])],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
-  row={**rec,'exit':completed.returncode,'wallS':round(time.monotonic()-before,2)}
+   cfg=json.loads(Path(rec['config']).read_text())
+   command=[str(BIN),'--config='+rec['config'],'--RngRun='+str(rec['rngRun'])]+dataset_presets.socket_buffer_arguments(cfg)
+   completed=subprocess.run(command,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+  row={**rec,'exit':completed.returncode,'wallS':round(time.monotonic()-before,2),'command':command}
   status.write_text(json.dumps(row,indent=2)+'\n')
   print(prefix,'exit',completed.returncode,'seconds',row['wallS'],flush=True)
   return row
@@ -152,6 +163,12 @@ def prepare_features(rec):
 
 def post(out,jobs):
  manifest=json.loads((out/'manifest.json').read_text())
+ outcomes=json.loads((out/'run-outcomes.json').read_text())['runs']
+ if any(r['exit'] not in (0,1) for r in outcomes):raise ValueError('simulator crashes must be investigated before dataset export')
+ labels={r['prefix']:{'exit':r['exit'],'applicationPassed':r['exit']==0,
+    'case':r['case'],'group':r['group'],'replicate':r['replicate']} for r in outcomes}
+ if set(labels)!={r['prefix'] for r in manifest['runs']}:raise ValueError('incomplete run outcome coverage')
+ (out/'dataset-outcomes.json').write_text(json.dumps({'policy':'retain all completed network outcomes; missing observations remain missing','runs':labels},indent=2)+'\n')
  with cf.ThreadPoolExecutor(max_workers=jobs) as pool:list(pool.map(prepare_features,manifest['runs']))
  if manifest.get('settings',{}).get('shardRuns',0):
   from dataset_storage import post_sharded
@@ -163,6 +180,7 @@ def post(out,jobs):
  from make_datasets import load_run_windows,fit_boundaries_on_train,tokenize_multi,save_split
  files=[ROOT/'results'/r['prefix']/(r['prefix']+'-features.csv') for r in manifest['runs']]
  values,names,ids,_=load_run_windows(files,seq_len=20,stride=10)
+ if set(ids)!=set(labels):raise ValueError('a completed run has no training windows')
  held_out=dataset_presets.test_replicates(manifest)
  test_prefixes={r['prefix'] for r in manifest['runs'] if r['replicate'] in held_out}
  test=np.array([r in test_prefixes for r in ids]);edges=fit_boundaries_on_train(values[~test],names,50)
@@ -179,8 +197,9 @@ def main():
  """Run the complete dataset workflow by default, or only explicitly selected stages."""
  p=argparse.ArgumentParser(description=__doc__)
  p.add_argument('--out-dir',type=Path)
+ p.add_argument('--clean',action='store_true',help='delete this campaign and its recorded raw outputs before replanning; omit to resume')
  p.add_argument('--preset',choices=('comparison','full'),help='comparison: 200 runs (default); full: settings in full_dataset.json')
- p.add_argument('--profile-count',type=int,help='full-preset profile count, including the 49 switching-enabled anchors')
+ p.add_argument('--profile-count',type=int,help='full-preset profile count, including 49 switching-enabled anchors and any enabled stress profiles')
  p.add_argument('--replicates',type=int,help='matched RNG repeats per profile; comparison defaults to 4, full to 20')
  p.add_argument('--design-seed',type=int,help='seed for sampling the full-preset configurations')
  p.add_argument('--target-windows',type=int,help='increase the full-preset profile count to reach this many 20-token windows')
@@ -192,22 +211,33 @@ def main():
  p.add_argument('--analyze',action='store_true',help='audit the dataset and generate comparison plots')
  p.add_argument('--report',action='store_true',help='write the results summary')
  p.add_argument('--jobs',type=int,default=8)
- p.epilog='Without --describe or stage flags, runs plan, simulation, postprocessing, analysis and report in order. Use a fresh output directory and prefix.'
+ p.epilog='Without stage flags, creates a plan if missing, then runs simulation, postprocessing, analysis and report. Existing plans resume; --clean restarts in the same directory.'
  a=p.parse_args()
  if a.jobs<1:p.error('--jobs must be positive')
  if a.describe:
-  if any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with execution stages')
+  if a.clean or any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with --clean or execution stages')
   try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
   except ValueError as e:p.error(str(e))
   print(json.dumps({'settings':configuration,'plannedSize':dataset_presets.planned_size(configuration)},indent=2));return
  if a.out_dir is None:p.error('--out-dir is required unless --describe is used')
  out=a.out_dir.resolve()
+ try:previous=json.loads((out/'manifest.json').read_text()) if (out/'manifest.json').exists() else {}
+ except json.JSONDecodeError:
+  if not a.clean:p.error('saved manifest is incomplete; use --clean to restart')
+  previous={}
  if not any((a.plan,a.run,a.post,a.analyze,a.report)):
-  a.plan=a.run=a.post=a.analyze=a.report=True
+  a.plan=a.clean or not (out/'manifest.json').exists()
+  a.run=a.post=a.analyze=a.report=True
+ if a.clean:
+  if not (a.plan or a.run):p.error('--clean requires planning or simulation, not postprocessing alone')
+  a.plan=True
  if a.plan:
   if not a.run_prefix or any(not (c.isalnum() or c in '-_') for c in a.run_prefix):p.error('invalid --run-prefix')
-  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
+  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows)
   except ValueError as e:p.error(str(e))
+  if a.clean:
+   try:clean_experiment(out,ROOT/'results','dataset')
+   except ValueError as e:p.error(str(e))
   plan(out,a.run_prefix,configuration)
  else:
   if any(value is not None for value in (a.profile_count,a.replicates,a.design_seed,a.target_windows)):p.error('design overrides require the planning stage')

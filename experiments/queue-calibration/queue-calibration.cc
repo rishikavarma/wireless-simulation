@@ -4,6 +4,7 @@
 #undef main
 
 #include <vector>
+#include "ns3/uinteger.h"
 
 namespace
 {
@@ -26,6 +27,19 @@ AttachRttObserver(std::ostream* output)
         "/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/LastRTT",
         MakeBoundCallback(&RecordLastRtt, output));
     *output << "# observer_attached=" << attached << '\n';
+    const auto sockets = Config::LookupMatches("/NodeList/*/$ns3::TcpL4Protocol/SocketList/*");
+    for (uint32_t i = 0; i < sockets.GetN(); ++i)
+    {
+        UintegerValue count;
+        if (sockets.Get(i)->GetAttributeFailSafe("DelAckCount", count))
+        {
+            TimeValue timeout;
+            sockets.Get(i)->GetAttribute("DelAckTimeout", timeout);
+            *output << "# ack_policy socket=" << sockets.GetMatchedPath(i)
+                    << " del_ack_count=" << count.Get()
+                    << " del_ack_timeout_ms=" << timeout.Get().GetMilliSeconds() << '\n';
+        }
+    }
 }
 } // namespace
 

@@ -32,6 +32,7 @@ private:
     UeMetrics m_metrics; ///< TCP schema collector; all TCP fields NaN for UDP.
     std::ofstream m_csv; ///< Flow-specific application measurements.
     uint64_t m_tx{0}, m_rx{0}, m_lastRx{0}; ///< Accepted and delivered byte totals.
+    std::string m_workload; ///< Actual native traffic workload.
     Time m_start, m_stop, m_previous; ///< Application and reporting boundaries.
     EventId m_event; ///< Pending report event.
 };

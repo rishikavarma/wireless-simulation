@@ -319,6 +319,10 @@ UeTcpClient::Transmit(const std::vector<uint8_t>& body, SendResume resume)
 void
 UeTcpClient::ScheduleResume()
 {
+    if (m_draining)
+    {
+        return;
+    }
     switch (m_resume)
     {
     case SendResume::Probe:
@@ -361,8 +365,19 @@ UeTcpClient::ScheduleResume()
 void
 UeTcpClient::StartApplication()
 {
+    m_draining = false;
     m_running = true;
     OpenConnection();
+}
+
+void
+UeTcpClient::StopGenerating()
+{
+    m_draining = true;
+    m_sending = false;
+    Simulator::Cancel(m_sendEvent);
+    Simulator::Cancel(m_phaseEvent);
+    Simulator::Cancel(m_retryEvent);
 }
 
 /** Create a socket only while running and no socket exists, register connection/read/send/close
@@ -371,6 +386,10 @@ UeTcpClient::StartApplication()
 void
 UeTcpClient::OpenConnection()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_running || m_socket)
     {
         return;
@@ -501,6 +520,10 @@ UeTcpClient::NotifySend(Ptr<Socket> socket, uint32_t /*available*/)
 void
 UeTcpClient::StartWorkload()
 {
+    if (m_draining)
+    {
+        return;
+    }
     switch (m_cfg.workload)
     {
     case AppWorkload::Probe:
@@ -539,6 +562,10 @@ UeTcpClient::StartWorkload()
 void
 UeTcpClient::EnterOn()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected)
     {
         return;
@@ -554,6 +581,10 @@ UeTcpClient::EnterOn()
 void
 UeTcpClient::EnterOff()
 {
+    if (m_draining)
+    {
+        return;
+    }
     m_sending = false;
     Simulator::Cancel(m_sendEvent);
     m_phaseEvent = Simulator::Schedule(OffDuration(), &UeTcpClient::EnterOn, this);
@@ -565,6 +596,10 @@ UeTcpClient::EnterOff()
 void
 UeTcpClient::SendProbe()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected || !m_sending || m_sendBlocked)
     {
         return;
@@ -584,6 +619,10 @@ UeTcpClient::SendProbe()
 void
 UeTcpClient::BeginFile()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_running || !m_socket || !m_connected)
     {
         return;
@@ -605,6 +644,10 @@ UeTcpClient::BeginFile()
 void
 UeTcpClient::SendFileChunk()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected || m_fileGapPending || m_sendBlocked ||
         m_fileNextChunk >= m_fileChunksTotal)
     {
@@ -641,6 +684,10 @@ UeTcpClient::SendFileChunk()
 void
 UeTcpClient::StartRpcPage()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_running || !m_socket || !m_connected)
     {
         return;
@@ -659,6 +706,10 @@ UeTcpClient::StartRpcPage()
 void
 UeTcpClient::SendRpc()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected || m_rpcInFlight || m_sendBlocked || m_rpcObjectsLeft == 0)
     {
         return;
@@ -685,6 +736,10 @@ UeTcpClient::SendRpc()
 void
 UeTcpClient::StartFrame()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_running || !m_socket || !m_connected)
     {
         return;
@@ -701,6 +756,10 @@ UeTcpClient::StartFrame()
 void
 UeTcpClient::SendStreamChunk()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected || m_sendBlocked || m_slicesLeft == 0)
     {
         return;
@@ -731,6 +790,10 @@ UeTcpClient::SendStreamChunk()
 void
 UeTcpClient::SendIot()
 {
+    if (m_draining)
+    {
+        return;
+    }
     if (!m_socket || !m_connected || m_sendBlocked)
     {
         return;
