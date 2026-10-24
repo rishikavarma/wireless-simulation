@@ -1,10 +1,187 @@
 """Bounded-memory dataset shards and split metadata for large collections."""
 import json
+import os
+import shutil
 import zipfile
 
 import numpy as np
 
 from dataset_presets import test_replicates
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    os.replace(temporary, path)
+
+
+def atomic_npz(path, **arrays):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    with temporary.open('wb') as handle:
+        np.savez_compressed(handle, **arrays)
+    os.replace(temporary, path)
+
+
+def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
+                    run_batch, prepare_features):
+    """Run, tokenize and discard each part; assign saved parts to splits at the end."""
+    from make_datasets import load_run_windows, fit_boundaries_on_train
+    from analyze_dataset import RADIO_FEATURES, summarize
+
+    runs = manifest['runs']
+    held_out = test_replicates(manifest)
+    train_replicates = sorted({r['replicate'] for r in runs} - held_out)
+    if not train_replicates:
+        raise ValueError('no training replicate available for calibration')
+    candidates = [r for r in runs if r['replicate'] == train_replicates[0]]
+    count = min(calibration_runs, len(candidates))
+    chosen = [candidates[i] for i in np.linspace(0, len(candidates)-1, count, dtype=int)]
+    calibration_ids = {r['prefix'] for r in chosen}
+    parts = [chosen]
+    for replicate in sorted({r['replicate'] for r in runs}):
+        remaining = [r for r in runs if r['replicate'] == replicate and r['prefix'] not in calibration_ids]
+        parts.extend(batches(remaining, batch_runs))
+
+    progress_path = out/'stream-progress.json'
+    expected = dict(format='stream-parts-v1', batchRuns=batch_runs,
+                    calibrationRuns=count, calibrationIds=[r['prefix'] for r in chosen],
+                    parts=[])
+    progress = json.loads(progress_path.read_text()) if progress_path.exists() else expected
+    for key in ('format', 'batchRuns', 'calibrationRuns', 'calibrationIds'):
+        if progress[key] != expected[key]:
+            raise ValueError('stream settings changed; resume with the original batch and calibration sizes')
+    completed = progress['parts']
+    if [p['number'] for p in completed] != list(range(len(completed))):
+        raise ValueError('stream progress has incomplete part numbering')
+    if len(completed) > len(parts):
+        raise ValueError('stream progress exceeds the planned run count')
+    for number, group in enumerate(parts):
+        if number < len(completed) and completed[number]['runs'] != [r['prefix'] for r in group]:
+            raise ValueError('saved stream parts disagree with the manifest')
+
+    def raw_path(rec):
+        prefix = rec['prefix']
+        if not prefix or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in prefix):
+            raise ValueError('unsafe raw output prefix: '+repr(prefix))
+        return root/'results'/prefix
+
+    def discard(group):
+        for rec in group:
+            path = raw_path(rec)
+            if path.is_symlink():
+                raise ValueError('refusing to remove a symlinked raw output: '+str(path))
+            if path.exists():
+                shutil.rmtree(path)
+
+    # Source integrity is checked on every invocation, including a completed resume.
+    run_batch([], True)
+    for number, group in enumerate(parts):
+        if number < len(completed):
+            discard(group)
+            continue
+        outcomes = run_batch(group, False)
+        if any(r['exit'] not in (0, 1) for r in outcomes):
+            raise ValueError('simulation crash in part '+str(number))
+        for rec in group:
+            prepare_features(rec)
+        paths = [raw_path(r)/(r['prefix']+'-features.csv') for r in group]
+        if number == 0:
+            sample, names, ids, _ = load_run_windows(paths, seq_len=1, stride=1)
+            if set(ids) != calibration_ids:
+                raise ValueError('calibration run has no feature tokens')
+            edges = fit_boundaries_on_train(sample, names, 50)
+            progress['calibrationTokens'] = len(sample)
+            atomic_json(out/'dataset-boundaries.json', edges)
+            del sample
+        else:
+            edges = json.loads((out/'dataset-boundaries.json').read_text())
+        values, names, ids, _ = load_run_windows(paths, seq_len=20,
+                                                  stride=manifest['settings']['windowStride'])
+        if set(ids) != {r['prefix'] for r in group}:
+            raise ValueError('a completed run has no training windows')
+        if number and names != progress['sourceFeatureNames']:
+            raise ValueError('feature schema changed between parts')
+        tokens, columns = vector_tokenize(values, names, edges)
+        if number == 0:
+            progress['sourceFeatureNames'] = names
+            progress['featureNames'] = columns
+        target = out/'dataset-parts'/f'{number:05d}.npz'
+        atomic_npz(target, sequences=tokens, feature_names=np.asarray(columns),
+                   source_feature_names=np.asarray(names), run_ids=np.asarray(ids),
+                   truncated=np.zeros(len(ids), dtype=bool))
+        del values, tokens
+        radios = []
+        for rec in outcomes:
+            _, _, radio = summarize(rec)
+            radios.append(radio)
+        atomic_npz(out/'radio-parts'/f'{number:05d}.npz', values=np.stack(radios),
+                   run_ids=np.asarray([r['prefix'] for r in group]),
+                   feature_names=np.asarray(RADIO_FEATURES),
+                   start_s=np.arange(20,119), end_s=np.arange(21,120))
+        with np.load(target) as saved:
+            if saved['sequences'].shape != (len(ids), 20, len(names)) or set(saved['run_ids']) != set(ids):
+                raise ValueError('token archive failed verification for part '+str(number))
+        with np.load(out/'radio-parts'/f'{number:05d}.npz') as saved:
+            if saved['values'].shape != (len(group), 99, len(RADIO_FEATURES)) or set(saved['run_ids']) != set(r['prefix'] for r in group):
+                raise ValueError('radio archive failed verification for part '+str(number))
+        completed.append(dict(number=number, runs=[r['prefix'] for r in group],
+                              replicate=group[0]['replicate'], windows=len(ids)))
+        atomic_json(progress_path, progress)
+        discard(group)
+        print('stream part', number+1, '/', len(parts), 'saved and raw files removed', flush=True)
+
+    index = dict(format='sharded-npz-v1', context=10, future=10,
+                 splitUnit='matched RNG replicate', testReplicates=sorted(held_out),
+                 windowStride=manifest['settings']['windowStride'],
+                 source_feature_names=progress['sourceFeatureNames'],
+                 feature_names=progress['featureNames'],
+                 quantileFit=dict(method='stratified calibration runs from training replicate',
+                                  runIds=progress['calibrationIds'],
+                                  seenTrainTokens=progress['calibrationTokens']), splits={})
+    radio_index = dict(format='sharded-radio-npz-v1', feature_names=RADIO_FEATURES, splits={})
+    for split, is_test in [('train', False), ('test', True)]:
+        selected = [p for p in completed if (p['replicate'] in held_out) == is_test]
+        entry = dict(runs=[r for p in selected for r in p['runs']],
+                     windows=sum(p['windows'] for p in selected), shards=[])
+        radio_index['splits'][split] = []
+        for ordinal, part in enumerate(selected):
+            number = part['number']
+            filename = f'dataset-{split}/{ordinal:05d}.npz'
+            destination = out/filename
+            destination.parent.mkdir(exist_ok=True)
+            source = out/'dataset-parts'/f'{number:05d}.npz'
+            if source.exists():
+                os.replace(source, destination)
+            elif not destination.exists():
+                raise ValueError('missing token archive for part '+str(number))
+            entry['shards'].append(dict(path=filename, windows=part['windows'], runs=part['runs']))
+            radio_file = f'radio-{split}/{ordinal:05d}.npz'
+            radio_destination = out/radio_file
+            radio_destination.parent.mkdir(exist_ok=True)
+            radio_source = out/'radio-parts'/f'{number:05d}.npz'
+            if radio_source.exists():
+                os.replace(radio_source, radio_destination)
+            elif not radio_destination.exists():
+                raise ValueError('missing radio archive for part '+str(number))
+            radio_index['splits'][split].append(dict(path=radio_file, runs=part['runs']))
+        index['splits'][split] = entry
+    atomic_json(out/'dataset-index.json', index)
+    atomic_json(out/'radio-index.json', radio_index)
+    for directory in (out/'dataset-parts', out/'radio-parts'):
+        if directory.exists():
+            directory.rmdir()
+    outcomes = [json.loads((out/'logs'/(r['prefix']+'.json')).read_text()) for r in runs]
+    atomic_json(out/'run-outcomes.json', dict(runs=outcomes))
+    atomic_json(out/'dataset-outcomes.json', dict(
+        policy='retain all completed network outcomes; missing observations remain missing',
+        runs={r['prefix']:dict(exit=r['exit'], applicationPassed=r['exit']==0,
+                               case=r['case'], group=r['group'], replicate=r['replicate'])
+              for r in outcomes}))
+    atomic_json(out/'post-complete.json', dict(runs=len(runs), format=index['format'],
+        trainWindows=index['splits']['train']['windows'],
+        testWindows=index['splits']['test']['windows']))
+    print('streamed', len(runs), 'runs into train/test indexed shards', flush=True)
 
 
 def batches(items, size):

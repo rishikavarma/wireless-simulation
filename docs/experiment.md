@@ -206,6 +206,15 @@ preset retains its existing archives and exact quantile fitting. The sharded
 layout requires an index-aware training loader, rather than a loader expecting
 a single `dataset-train.npz` file.
 
+With `--stream`, the runner fits shared boundaries from `--calibration-runs`
+training runs spread across the planned profiles, then processes at most
+`--batch-runs` runs at a time. Each part's transport and radio archives are
+saved before its raw simulator files are deleted. After every part finishes,
+the archives are assigned to the held-out RNG replicate split. This mode uses
+the calibration part for quantiles instead of the uniform sample described
+above, and cannot generate the raw-data plots and report. Progress and source
+hashes remain in the campaign directory so the command can be resumed.
+
 ## Metric coverage
 
 Collection uses `metrics.physical: true`; optional `metrics.payload: true`

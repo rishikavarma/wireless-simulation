@@ -39,6 +39,7 @@ __pycache__/
 
 # Local Python tests and test output.
 test_*.py
+!scripts/dataset/test_stream.py
 *_test.py
 .pytest_cache/
 .coverage

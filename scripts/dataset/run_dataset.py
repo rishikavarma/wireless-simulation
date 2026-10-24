@@ -91,21 +91,22 @@ def plan(out,stem,settings=None):
  (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  print('planned',len(runs),'runs',flush=True)
 
-def run(out,jobs):
+def run(out,jobs,records=None,verify_sources=True):
  manifest=json.loads((out/'manifest.json').read_text());(out/'logs').mkdir(exist_ok=True)
- sources={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'scratch/sat-bs-handset').rglob('*') if p.is_file() and p.suffix in ('.cc','.h')}
- sources['binary']=hashlib.sha256(BIN.read_bytes()).hexdigest()
- sources['nrLibrary']=hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-nr-optimized.so').read_bytes()).hexdigest()
- sources['ns3Patch']=hashlib.sha256((ROOT/'patches/ns3-v3.48-local-ntn.patch').read_bytes()).hexdigest()
- sources['nrPatch']=hashlib.sha256((ROOT/'patches/nr-v5.1-local-ntn.patch').read_bytes()).hexdigest()
- sources['configs']={r['prefix']:hashlib.sha256(Path(r['config']).read_bytes()).hexdigest() for r in manifest['runs']}
- stamp=out/'source-hashes.json'
- if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; use --clean to restart this campaign or select a fresh directory')
- stamp.write_text(json.dumps(sources,indent=2)+'\n')
- for name in sources:
-  if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
-  snapshot=out/'source-snapshot'/name;snapshot.parent.mkdir(parents=True,exist_ok=True)
-  snapshot.write_bytes((ROOT/name).read_bytes())
+ if verify_sources:
+  sources={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'scratch/sat-bs-handset').rglob('*') if p.is_file() and p.suffix in ('.cc','.h')}
+  sources['binary']=hashlib.sha256(BIN.read_bytes()).hexdigest()
+  sources['nrLibrary']=hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-nr-optimized.so').read_bytes()).hexdigest()
+  sources['ns3Patch']=hashlib.sha256((ROOT/'patches/ns3-v3.48-local-ntn.patch').read_bytes()).hexdigest()
+  sources['nrPatch']=hashlib.sha256((ROOT/'patches/nr-v5.1-local-ntn.patch').read_bytes()).hexdigest()
+  sources['configs']={r['prefix']:hashlib.sha256(Path(r['config']).read_bytes()).hexdigest() for r in manifest['runs']}
+  stamp=out/'source-hashes.json'
+  if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; use --clean to restart this campaign or select a fresh directory')
+  stamp.write_text(json.dumps(sources,indent=2)+'\n')
+  for name in sources:
+   if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
+   snapshot=out/'source-snapshot'/name;snapshot.parent.mkdir(parents=True,exist_ok=True)
+   snapshot.write_bytes((ROOT/name).read_bytes())
  def one(rec):
   prefix=rec['prefix'];status=out/'logs'/(prefix+'.json')
   if status.exists():return json.loads(status.read_text())
@@ -118,10 +119,11 @@ def run(out,jobs):
   status.write_text(json.dumps(row,indent=2)+'\n')
   print(prefix,'exit',completed.returncode,'seconds',row['wallS'],flush=True)
   return row
- with cf.ThreadPoolExecutor(max_workers=jobs) as pool:executed=list(pool.map(one,manifest['runs']))
- (out/'run-outcomes.json').write_text(json.dumps({'runs':executed},indent=2)+'\n')
+ with cf.ThreadPoolExecutor(max_workers=jobs) as pool:executed=list(pool.map(one,records if records is not None else manifest['runs']))
+ if records is None:(out/'run-outcomes.json').write_text(json.dumps({'runs':executed},indent=2)+'\n')
  if any(r['exit'] not in (0,1) for r in executed):raise SystemExit('simulation crashes present; inspect run-outcomes.json')
  print('completed',len(executed),'runs; application criteria passed',sum(r['exit']==0 for r in executed),flush=True)
+ return executed
 
 def normalize_reports(rec):
  """Mask legacy text bookkeeping for UDP and label native applications from their config."""
@@ -211,9 +213,14 @@ def main():
  p.add_argument('--analyze',action='store_true',help='audit the dataset and generate comparison plots')
  p.add_argument('--report',action='store_true',help='write the results summary')
  p.add_argument('--jobs',type=int,default=8)
- p.epilog='Without stage flags, creates a plan if missing, then runs simulation, postprocessing, analysis and report. Existing plans resume; --clean restarts in the same directory.'
+ p.add_argument('--stream',action='store_true',help='full preset: run, tokenize and remove raw files in bounded parts; split saved parts at the end')
+ p.add_argument('--batch-runs',type=int,default=4,help='runs per streaming part after calibration (default: 4)')
+ p.add_argument('--calibration-runs',type=int,default=12,help='spread-out training runs used to fit shared token boundaries (default: 12)')
+ p.epilog='Without stage flags, creates a plan if missing and runs all stages. --stream instead processes bounded parts and writes indexed train/test shards. Existing plans resume; --clean restarts in the same directory.'
  a=p.parse_args()
  if a.jobs<1:p.error('--jobs must be positive')
+ if a.batch_runs<1 or a.calibration_runs<1:p.error('--batch-runs and --calibration-runs must be positive')
+ if a.stream and (a.post or a.analyze or a.report):p.error('--stream includes tokenization; --post, --analyze and --report require retained raw files')
  if a.describe:
   if a.clean or any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with --clean or execution stages')
   try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
@@ -227,7 +234,8 @@ def main():
   previous={}
  if not any((a.plan,a.run,a.post,a.analyze,a.report)):
   a.plan=a.clean or not (out/'manifest.json').exists()
-  a.run=a.post=a.analyze=a.report=True
+  a.run=True
+  if not a.stream:a.post=a.analyze=a.report=True
  if a.clean:
   if not (a.plan or a.run):p.error('--clean requires planning or simulation, not postprocessing alone')
   a.plan=True
@@ -240,10 +248,22 @@ def main():
    except ValueError as e:p.error(str(e))
   plan(out,a.run_prefix,configuration)
  else:
-  if any(value is not None for value in (a.profile_count,a.replicates,a.design_seed,a.target_windows)):p.error('design overrides require the planning stage')
+  overrides={'profileCount':a.profile_count,'replicates':a.replicates,
+             'designSeed':a.design_seed,'targetWindows':a.target_windows}
+  if any(value is not None for value in overrides.values()):
+   if not a.stream:p.error('design overrides require the planning stage')
+   saved=previous.get('settings',{})
+   if any(saved.get(key)!=value for key,value in overrides.items() if value is not None):
+    p.error('stream design overrides disagree with the saved manifest')
   if a.preset and a.preset!=json.loads((out/'manifest.json').read_text()).get('preset','comparison'):
    p.error('--preset disagrees with the saved manifest; resume using its existing design')
- if a.run:run(out,a.jobs)
+ if a.stream and a.run:
+  manifest=json.loads((out/'manifest.json').read_text())
+  if manifest.get('preset')!='full':p.error('--stream requires the full preset')
+  from dataset_storage import stream_campaign
+  stream_campaign(ROOT,out,manifest,a.batch_runs,a.calibration_runs,
+                  lambda records,verify:run(out,a.jobs,records,verify),prepare_features)
+ elif a.run:run(out,a.jobs)
  if a.post:post(out,a.jobs)
  if a.analyze:
   subprocess.run([sys.executable,str(Path(__file__).with_name('analyze_dataset.py')),

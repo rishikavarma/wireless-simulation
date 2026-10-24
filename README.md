@@ -148,6 +148,28 @@ Quantile boundaries use a reproducible uniform sample of up to 200,000 training
 tokens, with no test tokens used for fitting. The existing comparison preset
 retains its monolithic archives and exact training-set quantiles.
 
+For a bounded raw-data and memory footprint, use streaming mode. It runs a
+spread-out calibration part from the first training replicate, fits shared token
+boundaries, then runs and tokenizes each later part. After the token and radio
+archives are saved, it removes that part's raw simulation directory. At the end
+it assigns whole-replicate parts to train and test indexes. A stopped command
+resumes from `stream-progress.json`; use the same batch and calibration sizes.
+Streaming does not produce the raw-data comparison plots or report.
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --stream \
+  --out-dir results/full-stream-100x4 --run-prefix full-stream-100x4 \
+  --profile-count 100 --replicates 4 --jobs 2 \
+  --batch-runs 4 --calibration-runs 12
+```
+
+This plan has 400 runs and 19,600 non-overlapping windows, including 4,900 test
+windows. The 12-run calibration part bounds retained raw files; later parts hold
+four runs. For lower peak memory, use `--jobs 1 --batch-runs 2` on a new campaign.
+The calibration part still uses 12 runs; reduce `--calibration-runs` if needed,
+at the cost of less representative token boundaries. `--profile-count` and
+`--replicates` control total work. Rerun the same command to resume.
+
 The full dataset has not been run. The queue calibration below uses short
 ns-3 experiments; the broader cross-factor configurations still need a pilot
 before collecting all 40,000 runs. Raw trace storage and runtime grow with traffic/load;
