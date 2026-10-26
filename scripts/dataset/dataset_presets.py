@@ -61,11 +61,18 @@ def socket_buffer_arguments(cfg, fallback=None):
             '--ns3::TcpSocket::RcvBufSize='+str(size)]
 
 
-def settings(preset='comparison', profile_count=None, replicates=None, design_seed=None, target_windows=None):
+def settings(preset='comparison', profile_count=None, replicates=None, design_seed=None, target_windows=None,
+             design_file=None):
     if preset == 'full':
-        result = json.loads(FULL_SETTINGS.read_text())
+        source = Path(design_file) if design_file is not None else FULL_SETTINGS
+        contents = source.read_bytes()
+        result = json.loads(contents)
+        if design_file is not None:
+            result['designFileSha256'] = hashlib.sha256(contents).hexdigest()
         result['queueCalibration'] = calibrated_queues(result)
     elif preset == 'comparison':
+        if design_file is not None:
+            raise ValueError('--design-file requires the full preset')
         result = dict(profileCount=50, replicates=4, rngStart=701, designSeed=11,
                       testFraction=0.25, windowStride=10, shardRuns=0)
     else:

@@ -170,6 +170,25 @@ The calibration part still uses 12 runs; reduce `--calibration-runs` if needed,
 at the cost of less representative token boundaries. `--profile-count` and
 `--replicates` control total work. Rerun the same command to resume.
 
+For a shorter cross-factor collection, use the separate
+[`short_dataset.json`](scripts/dataset/short_dataset.json) design:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --stream \
+  --design-file scripts/dataset/short_dataset.json \
+  --out-dir results/short-stream-3h --run-prefix short-stream-3h \
+  --jobs 20 --batch-runs 20 --calibration-runs 20
+```
+
+It plans 180 profiles with two matched replicates: 360 runs in 18 parts. The
+49 controlled profiles are retained. The sampled interactions limit background
+users to one, use packet sizes of at least 512 bytes, and avoid the most severe
+link losses; controlled background profiles still include three users. This
+targets roughly three hours of simulation wall time on a 20-core machine,
+excluding feature and radio processing. It is an estimate from a small pilot,
+not a run-time cap. Reuse the same command to resume, and keep the design file
+unchanged after planning.
+
 The full dataset has not been run. The queue calibration below uses short
 ns-3 experiments; the broader cross-factor configurations still need a pilot
 before collecting all 40,000 runs. Raw trace storage and runtime grow with traffic/load;

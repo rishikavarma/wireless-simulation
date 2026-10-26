@@ -201,6 +201,7 @@ def main():
  p.add_argument('--out-dir',type=Path)
  p.add_argument('--clean',action='store_true',help='delete this campaign and its recorded raw outputs before replanning; omit to resume')
  p.add_argument('--preset',choices=('comparison','full'),help='comparison: 200 runs (default); full: settings in full_dataset.json')
+ p.add_argument('--design-file',type=Path,help='alternate full-preset JSON settings for a new campaign')
  p.add_argument('--profile-count',type=int,help='full-preset profile count, including 49 switching-enabled anchors and any enabled stress profiles')
  p.add_argument('--replicates',type=int,help='matched RNG repeats per profile; comparison defaults to 4, full to 20')
  p.add_argument('--design-seed',type=int,help='seed for sampling the full-preset configurations')
@@ -223,7 +224,7 @@ def main():
  if a.stream and (a.post or a.analyze or a.report):p.error('--stream includes tokenization; --post, --analyze and --report require retained raw files')
  if a.describe:
   if a.clean or any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with --clean or execution stages')
-  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows)
+  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file)
   except ValueError as e:p.error(str(e))
   print(json.dumps({'settings':configuration,'plannedSize':dataset_presets.planned_size(configuration)},indent=2));return
  if a.out_dir is None:p.error('--out-dir is required unless --describe is used')
@@ -241,13 +242,18 @@ def main():
   a.plan=True
  if a.plan:
   if not a.run_prefix or any(not (c.isalnum() or c in '-_') for c in a.run_prefix):p.error('invalid --run-prefix')
-  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows)
+  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file)
   except ValueError as e:p.error(str(e))
   if a.clean:
    try:clean_experiment(out,ROOT/'results','dataset')
    except ValueError as e:p.error(str(e))
   plan(out,a.run_prefix,configuration)
  else:
+  if a.design_file:
+   try:digest=hashlib.sha256(a.design_file.read_bytes()).hexdigest()
+   except OSError as e:p.error(str(e))
+   if digest!=previous.get('settings',{}).get('designFileSha256'):
+    p.error('--design-file differs from the saved campaign settings')
   overrides={'profileCount':a.profile_count,'replicates':a.replicates,
              'designSeed':a.design_seed,'targetWindows':a.target_windows}
   if any(value is not None for value in overrides.values()):
