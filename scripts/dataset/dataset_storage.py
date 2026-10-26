@@ -62,7 +62,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
 
     def raw_path(rec):
         prefix = rec['prefix']
-        if not prefix or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in prefix):
+        if prefix in ('', '.', '..') or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in prefix):
             raise ValueError('unsafe raw output prefix: '+repr(prefix))
         return root/'results'/prefix
 
