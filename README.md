@@ -169,9 +169,9 @@ training RNG runs. The short design uses RNG 20001 for training and RNG 20002
 for test. The full design holds out the last 20% of RNG runs (10017–10020 when
 the start is 10001). Windows never cross from one run into another.
 
-Token output for the short TCP design. This resumes the campaign already
-planned in `results/short-stream-tcp-rtt` (180 profiles × RNG 20001 and RNG
-20002). It writes `token-runs/` and, after the last part, the default
+Token output for the short TCP design. This creates a 180-profile campaign
+with RNG 20001 and RNG 20002. Repeating the command resumes an incomplete
+campaign. It writes `token-runs/` and, after the last part, the default
 10-history/10-future windows in `dataset-train/` and `dataset-test/`.
 RNG 20001 is training; RNG 20002 is test.
 
@@ -195,10 +195,8 @@ python3 scripts/dataset/materialize_windows.py \
 
 The short plan is 360 runs. Tokens aggregate TCP measurements over the current
 measured minimum RTT, so the number of windows depends on the run. All primary
-and background UDP traffic is excluded. The earlier fixed-time run remains under
-`results/short-stream-3h`. Add `--clean` to the token command only when
-discarding this campaign; otherwise rerun it to resume. Keep the design file
-unchanged after planning.
+and background UDP traffic is excluded. Keep the design file unchanged after
+planning.
 
 A smaller full-preset pilot uses the same two stages. With four replicates the
 last RNG run is held out:
@@ -573,7 +571,7 @@ are available. The independent **28-feature one-second radio/KPI tensor** remain
 available for interval analysis (historical collections had 23). Splits hold out entire
 RNG replicates (150 training / 50 test runs in the comparison preset); quantile
 boundaries are fit only on training data. TCP-only observations remain **NaN for UDP**.
-The completed `short-stream-3h` archive predates these additions and has 77 features.
+Older fixed-time archives predating these additions had 77 features.
 
 The full preset retains weak startup links, visibility gaps, failed connections,
 zero delivery, and background starvation. Geometry/budget predictions are saved

@@ -47,7 +47,9 @@ def materialize(dataset_dir, out_dir, context, prediction, stride):
             same_rng = [run for run in selected if rng_of(run) == rng_run]
             for group in batches(same_rng, shard_runs):
                 paths = [dataset_dir/available[run['prefix']]['path'] for run in group]
-                sequences, ids, starts = window_token_runs(paths, seq_len, stride, columns)
+                sequences, ids, starts = window_token_runs(
+                    paths, seq_len, stride, columns,
+                    [run['prefix'] for run in group])
                 filename = f'dataset-{split}/{number:05d}.npz'
                 atomic_npz(out_dir/filename, sequences=sequences,
                            context_tokens=sequences[:, :context, :],

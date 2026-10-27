@@ -46,14 +46,18 @@ def archive_run_tokens(features_path, destination, run_id, source_names, edges):
     return len(rows)
 
 
-def window_token_runs(paths, seq_len, stride, expected_columns):
+def window_token_runs(paths, seq_len, stride, expected_columns, expected_run_ids=None):
     """Cut configurable datapoints from complete per-run token lists."""
+    if expected_run_ids is not None and len(paths) != len(expected_run_ids):
+        raise ValueError('token archive and expected run counts differ')
     sequences, run_ids, starts = [], [], []
-    for path in paths:
+    for position, path in enumerate(paths):
         with np.load(path) as archive:
             tokens = archive['tokens']
             columns = [str(name) for name in archive['feature_names']]
             run_id = str(archive['run_id'])
+        if expected_run_ids is not None and run_id != expected_run_ids[position]:
+            raise ValueError(f'token archive run ID mismatch in {path}: {run_id}')
         if columns != expected_columns:
             raise ValueError('token archive schema mismatch in '+str(path))
         if tokens.shape[0] < seq_len:
@@ -145,6 +149,8 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                     count = len(saved['tokens'])
                     if [str(x) for x in saved['source_feature_names']] != names:
                         raise ValueError('saved token schema changed for '+rec['prefix'])
+                    if str(saved['run_id']) != rec['prefix']:
+                        raise ValueError('saved token archive belongs to another run: '+rec['prefix'])
             else:
                 source = raw_path(rec)/(rec['prefix']+'-features.csv')
                 count = archive_run_tokens(source, target, rec['prefix'], names, edges)
@@ -173,7 +179,8 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                 columns = progress['featureNames']
                 rebuilt, ids, _ = window_token_runs(
                     [token_path(rec) for rec in group], 20,
-                    manifest['settings']['windowStride'], columns)
+                    manifest['settings']['windowStride'], columns,
+                    [rec['prefix'] for rec in group])
                 with np.load(saved_part_path(number, group)) as saved:
                     if (rebuilt.shape != saved['sequences'].shape or
                             not np.array_equal(rebuilt, saved['sequences'], equal_nan=True) or
@@ -206,7 +213,8 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         columns = progress['featureNames']
         tokens, ids, starts = window_token_runs(
             [token_path(rec) for rec in group], 20,
-            manifest['settings']['windowStride'], columns)
+            manifest['settings']['windowStride'], columns,
+            [rec['prefix'] for rec in group])
         if set(ids) != {r['prefix'] for r in group}:
             raise ValueError('a completed run has no training windows')
         target = out/'dataset-parts'/f'{number:05d}.npz'
@@ -330,13 +338,17 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
 
 
 def part_rng(part, runs):
-    """Recover the single RNG number for a saved part, including older progress files."""
-    if 'rngRun' in part:
-        return part['rngRun']
-    matches = {rng_of(rec) for rec in runs if rec['replicate'] == part['replicate']}
+    """Verify a saved part against the manifest before assigning its split."""
+    by_prefix = {rec['prefix']: rec for rec in runs}
+    if any(prefix not in by_prefix for prefix in part['runs']):
+        raise ValueError('saved stream part has an unknown run')
+    matches = {rng_of(by_prefix[prefix]) for prefix in part['runs']}
     if len(matches) != 1:
         raise ValueError('saved stream part has no single RNG run')
-    return matches.pop()
+    rng_run = matches.pop()
+    if 'rngRun' in part and part['rngRun'] != rng_run:
+        raise ValueError('saved stream part RNG run disagrees with the manifest')
+    return rng_run
 
 
 def batches(items, size):
