@@ -82,7 +82,7 @@ def plan(out,stem,settings=None):
            'preset':settings['preset'],'settings':settings,'plannedSize':dataset_presets.planned_size(settings),
            'rejectedProfileCandidates':rejected,
            'candidateRejectionPolicy':'duplicates only in full preset; network service warnings retained',
-           'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'77 transport/SINR features (73 legacy plus four TCP progress heads), plus separate radio/KPI logs',
+           'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'minRTT TCP/SINR/radio-event tokens with last-completed one-second KPIs and path samples',
            'progressFeatures':{'tcp_pending_bytes':'TCP bytes queued or awaiting ACK',
               'tcp_ack_age_s':'seconds since forward TCP transmit-buffer head progress; missing before first observation',
               'tcp_no_progress_s':'seconds continuously backlogged without forward ACK progress; zero when idle',
@@ -109,7 +109,10 @@ def run(out,jobs,records=None,verify_sources=True):
    snapshot.write_bytes((ROOT/name).read_bytes())
  def one(rec):
   prefix=rec['prefix'];status=out/'logs'/(prefix+'.json')
-  if status.exists():return json.loads(status.read_text())
+  raw_dir=ROOT/'results'/prefix
+  required=[raw_dir/(prefix+'-'+suffix) for suffix in ('tcp.csv','summary.txt','app.txt')]
+  if status.exists() and all(path.exists() for path in required):
+   return json.loads(status.read_text())
   before=time.monotonic()
   with (out/'logs'/(prefix+'.log')).open('w') as log:
    cfg=json.loads(Path(rec['config']).read_text())
@@ -151,7 +154,7 @@ def prepare_features(rec):
  normalize_reports(rec)
  p=rec['prefix'];d=ROOT/'results'/p;marker=d/'legacy-post-complete.json'
  script_hash=hashlib.sha256(b''.join((ROOT/'scripts/dataset'/f).read_bytes() for f in
-      ['bucketize_metrics.py','fold_tokens.py','metric_io.py'])).hexdigest()
+      ['bucketize_metrics.py','fold_tokens.py','metric_io.py','radio_tokens.py'])).hexdigest()
  signature={'config':hashlib.sha256(Path(rec['config']).read_bytes()).hexdigest(),'scripts':script_hash}
  feature=d/(p+'-features.csv')
  if marker.exists() and feature.exists():
@@ -183,14 +186,16 @@ def post(out,jobs):
  files=[ROOT/'results'/r['prefix']/(r['prefix']+'-features.csv') for r in manifest['runs']]
  values,names,ids,_=load_run_windows(files,seq_len=20,stride=10)
  if set(ids)!=set(labels):raise ValueError('a completed run has no training windows')
+ train_rng,test_rng=dataset_presets.split_rng_runs(manifest)
  held_out=dataset_presets.test_replicates(manifest)
- test_prefixes={r['prefix'] for r in manifest['runs'] if r['replicate'] in held_out}
+ test_prefixes={r['prefix'] for r in manifest['runs'] if dataset_presets.is_test_run(r,test_rng)}
  test=np.array([r in test_prefixes for r in ids]);edges=fit_boundaries_on_train(values[~test],names,50)
  tokens,columns=tokenize_multi(values,names,edges)
  for split,mask in [('train',~test),('test',test)]:
   selected=[r for r,m in zip(ids,mask) if m]
   save_split(out/('dataset-'+split),tokens[mask],10,columns,names,selected,[False]*len(selected),
-             {'split':split,'splitUnit':'matched RNG replicate','testReplicates':sorted(held_out),'context':10,'future':10})
+             {'split':split,'splitUnit':'matched RNG run','testReplicates':sorted(held_out),
+              'testRngRuns':sorted(test_rng),'trainRngRuns':sorted(train_rng),'context':10,'future':10})
  (out/'dataset-boundaries.json').write_text(json.dumps(edges,indent=2)+'\n')
  (out/'post-complete.json').write_text(json.dumps({'runs':len(files),'shape':list(values.shape)},indent=2)+'\n')
  print('postprocessed',len(files),'runs',values.shape,flush=True)

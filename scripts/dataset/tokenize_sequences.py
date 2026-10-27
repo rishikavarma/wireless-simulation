@@ -59,10 +59,11 @@ def build_matrix(
         return data, cols
 
     if mode == "buckets":
-        cols = [f"{name}_bucket" for name in feature_names]
+        bucket_names = [name for name in feature_names if name != "base_rtt"]
+        cols = [f"{name}_bucket" for name in bucket_names]
         data = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
         for i, row in enumerate(rows):
-            for j, name in enumerate(feature_names):
+            for j, name in enumerate(bucket_names):
                 val = row.get(f"{name}_bucket")
                 if val is None:
                     val = row.get(name)
@@ -147,7 +148,7 @@ def main() -> int:
         choices=("multi", "buckets", "values"),
         default="multi",
         help="vector layout: multi=base_rtt float + other buckets (UNUM); "
-        "buckets=all bucket ids; values=all continuous",
+        "buckets=only bucket ids; values=all continuous",
     )
     args = parser.parse_args()
 

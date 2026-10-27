@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""UNUM-style quantile bucketization for every collected sat-bs-handset metric.
+"""UNUM-style quantile bucketization for collected sat-bs-handset metrics.
 
 Pipeline:
   1. Fold 5 ms Sage TCP rows into RTT tokens (fold_tokens.py).
-  2. Add derived base_rtt = rtt_rate * srtt.
-  3. Fit Quantile-N edges on every metric column (including sinr_dl_db / sinr_ul_db).
+  2. Carry measured minrtt as the continuous UNUM base_rtt input.
+  3. Fit Quantile-N edges on every other metric column (including SINR).
   4. Emit continuous feature CSV + multi-head bucketized CSV + boundaries.
 
-Meta columns (token timing) stay continuous. Feature columns each get a
-``*_bucket`` index via np.searchsorted(..., side='right'), matching UNUM's
-offline ``bucket_tokenize.py`` (training path).
+Meta columns (token timing) and base_rtt stay continuous. Other feature
+columns get a ``*_bucket`` index via np.searchsorted(..., side='right'),
+matching UNUM's offline ``bucket_tokenize.py`` (training path).
 TCP loss features reserve class zero for zero loss; their remaining classes
 use quantiles of positive observations only.
 """
@@ -27,9 +27,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fold_tokens import fold, load_config, read_csv, write_tokens  # noqa: E402
+from radio_tokens import attach_radio_tokens  # noqa: E402
 
 
 META_KEYS = ("token", "t_start_s", "t_end_s", "window_s", "n_samples")
+
+
+def is_bucket_feature(name: str) -> bool:
+    """UNUM keeps measured minimum RTT continuous under the base_rtt name."""
+    return name != "base_rtt"
 
 
 def quantile_boundaries(arr: np.ndarray, num_buckets: int) -> list[float]:
@@ -133,13 +139,16 @@ def feature_keys_from_tokens(tokens: list[dict]) -> list[str]:
 
 
 def enrich_token(token: dict) -> dict:
-    """Copy token and ensure base_rtt is present.
+    """Copy token and expose its measured minimum RTT as UNUM base_rtt.
 
-    When fold_tokens locked the flow min RTT (UNUM-style), keep that constant.
-    Otherwise derive ``rtt_rate * srtt`` from the token aggregates.
+    Keep the observed minimum RTT used to size the token when available. Older
+    TCP traces have no explicit minimum and require the ratio-based fallback.
     """
     row = dict(token)
     if row.get("base_rtt") is not None:
+        return row
+    if "minrtt" in row:
+        row["base_rtt"] = row["minrtt"]
         return row
     srtt = row.get("srtt")
     rtt_rate = row.get("rtt_rate")
@@ -166,6 +175,12 @@ def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg
     _, dl = read_csv(sinr_dl) if sinr_dl and sinr_dl.exists() else ([], [])
     _, ul = read_csv(sinr_ul) if sinr_ul and sinr_ul.exists() else ([], [])
     tokens = fold(tcp_rows, sage_keys, dl, ul, cfg)
+    prefix = tcp_path.name.removesuffix('-tcp.csv')
+    kpi_path = tcp_path.parent / f'{prefix}-kpis.csv'
+    if cfg.get('metrics', {}).get('physical') is True and not kpi_path.exists():
+        raise FileNotFoundError(f'physical telemetry is enabled but {kpi_path} is missing')
+    if kpi_path.exists():
+        attach_radio_tokens(tokens, tcp_path.parent, prefix)
     enriched = [enrich_token(token) for token in tokens]
     return tokens, enriched
 
@@ -178,7 +193,7 @@ def fit_boundaries(
     sinr_dl: Path | None = None,
     sinr_ul: Path | None = None,
 ) -> dict[str, list[float]]:
-    """Fit one independent Quantile-N head per feature, with a dedicated zero loss class.
+    """Fit one Quantile-N head per bucket feature, with a dedicated zero loss class.
 
     ``sinr_dl_db`` and ``sinr_ul_db`` are always separate heads. Their edges
     are fit from the dedicated PHY CSVs when present (more samples than the
@@ -190,6 +205,8 @@ def fit_boundaries(
         "sinr_ul_db": sinr_series(sinr_ul),
     }
     for name in feature_keys:
+        if not is_bucket_feature(name):
+            continue
         if name in sinr_override and sinr_override[name].size:
             values = sinr_override[name]
         else:
@@ -212,15 +229,15 @@ def fit_boundaries(
 def apply_boundaries(
     rows: list[dict], feature_keys: list[str], boundaries: dict[str, list[float]]
 ) -> list[dict]:
-    """Copy token timing and continuous features into new rows, appending one bucket ID per
-    feature using the supplied edges.
+    """Copy continuous features and append bucket IDs for all but base_rtt.
     """
     out = []
     for row in rows:
         item = {key: row.get(key) for key in META_KEYS}
         for name in feature_keys:
             item[name] = row.get(name)
-            item[f"{name}_bucket"] = bucketize_value(row.get(name), boundaries.get(name, []))
+            if is_bucket_feature(name):
+                item[f"{name}_bucket"] = bucketize_value(row.get(name), boundaries.get(name, []))
         out.append(item)
     return out
 
@@ -259,16 +276,22 @@ def write_boundaries(
                 "zero_class": has_zero_loss_class(name)
                 and boundaries.get(name, [])[:1] == [float(np.nextafter(0.0, 1.0))],
             }
-            for i, name in enumerate(feature_keys)
+            for i, name in enumerate(feature_keys) if is_bucket_feature(name)
         },
     }
     with open(path.with_suffix(".json"), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
-    # Pickle: {feature_name: edges} and {feature_index: edges} for UNUM-style loaders.
+    # Preserve positions in the full feature vector; base_rtt has no edges.
     pickle_payload = {
-        "by_name": {name: boundaries.get(name, []) for name in feature_keys},
-        "by_index": {i: boundaries.get(name, []) for i, name in enumerate(feature_keys)},
+        "by_name": {
+            name: boundaries.get(name, [])
+            for name in feature_keys if is_bucket_feature(name)
+        },
+        "by_index": {
+            i: boundaries.get(name, [])
+            for i, name in enumerate(feature_keys) if is_bucket_feature(name)
+        },
         "feature_names": list(feature_keys),
     }
     with open(path.with_suffix(".pkl"), "wb") as handle:
@@ -285,6 +308,8 @@ def load_boundaries(path: Path, feature_keys: list[str]) -> dict[str, list[float
         features = payload.get("features", {})
         out = {}
         for name in feature_keys:
+            if not is_bucket_feature(name):
+                continue
             if name in features:
                 out[name] = list(features[name]["edges"])
             else:
@@ -293,13 +318,14 @@ def load_boundaries(path: Path, feature_keys: list[str]) -> dict[str, list[float
     with open(path, "rb") as handle:
         raw = pickle.load(handle)
     if isinstance(raw, dict) and "by_name" in raw:
-        return {name: list(raw["by_name"].get(name, [])) for name in feature_keys}
+        return {name: list(raw["by_name"].get(name, [])) for name in feature_keys if is_bucket_feature(name)}
     # Legacy UNUM-6 pickle {idx: edges} — map by position if names unavailable.
     if isinstance(raw, dict) and raw and all(isinstance(k, int) for k in raw):
         return {
             name: list(raw.get(i, [])) for i, name in enumerate(feature_keys)
+            if is_bucket_feature(name)
         }
-    return {name: list(raw.get(name, [])) for name in feature_keys}
+    return {name: list(raw.get(name, [])) for name in feature_keys if is_bucket_feature(name)}
 
 
 def main() -> int:
@@ -380,7 +406,9 @@ def main() -> int:
     fields, _ = read_csv(tcp_path)
     sage_keys = [k for k in fields if k != "time_s"]
     tokens_path = out_dir / f"{prefix}-tokens.csv"
-    write_tokens(tokens_path, tokens, sage_keys, cfg)
+    extra_keys = [key for key in tokens[0] if key not in META_KEYS and
+                  key not in sage_keys and key not in ('base_rtt', 'sinr_dl_db', 'sinr_ul_db')]
+    write_tokens(tokens_path, tokens, sage_keys + extra_keys, cfg)
 
     continuous_fields = [*META_KEYS, *feature_keys]
     continuous_path = out_dir / f"{prefix}-features.csv"
@@ -388,8 +416,8 @@ def main() -> int:
         continuous_path,
         rows,
         continuous_fields,
-        "# RTT-aggregated continuous features for every collected metric "
-        "(Sage TCP + derived base_rtt + SINR).\n",
+        "# MinRTT tokens: TCP/SINR and primary-UE radio events in each interval; "
+        "KPI/path values are the latest completed observations at token end.\n",
     )
 
     bounds_stem = out_dir / f"{prefix}-boundaries-quantile{args.num_buckets}"
@@ -397,14 +425,16 @@ def main() -> int:
 
     bucket_fields = [*META_KEYS]
     for name in feature_keys:
-        bucket_fields.extend([name, f"{name}_bucket"])
+        bucket_fields.append(name)
+        if is_bucket_feature(name):
+            bucket_fields.append(f"{name}_bucket")
     bucket_path = out_dir / f"{prefix}-bucketized.csv"
     write_csv(
         bucket_path,
         bucketed,
         bucket_fields,
-        f"# Multi-head quantile-{args.num_buckets} bucketization of every collected "
-        "feature, including sinr_dl_db and sinr_ul_db.\n",
+        f"# Multi-head quantile-{args.num_buckets} bucketization of collected "
+        "features; base_rtt remains continuous.\n",
     )
 
     # Compact UNUM-6 view kept for convenience / paper alignment.
@@ -414,12 +444,14 @@ def main() -> int:
     unum6_path = out_dir / f"{prefix}-unum6.csv"
     unum6_fields = [*META_KEYS]
     for name in unum6_present:
-        unum6_fields.extend([name, f"{name}_bucket"])
+        unum6_fields.append(name)
+        if is_bucket_feature(name):
+            unum6_fields.append(f"{name}_bucket")
     write_csv(
         unum6_path,
         bucketed,
         unum6_fields,
-        "# UNUM-6 subset (base_rtt, srtt, thr, rttvar, lost, pre_act) with buckets. "
+        "# UNUM-6 subset: continuous base_rtt plus buckets for the other features. "
         "Full set is in *-features.csv / *-bucketized.csv.\n",
     )
 
@@ -431,6 +463,8 @@ def main() -> int:
         f"out_unum6={unum6_path}"
     )
     for name in feature_keys:
+        if not is_bucket_feature(name):
+            continue
         edges = boundaries.get(name, [])
         print(f"  {name}: n_edges={len(edges)} n_buckets={len(edges)+1}")
     return 0

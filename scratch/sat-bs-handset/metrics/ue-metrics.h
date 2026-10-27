@@ -139,7 +139,7 @@ class UeMetrics
 
     void Poll();
     void Commit();
-    void WriteTcpRow(Time now);
+    void WriteTcpRow(Time now, uint32_t sent, uint32_t delivered, uint64_t lostBytes);
     bool Recording(Time now) const;
     static SageWindow Summarize(const History& history);
 
@@ -168,6 +168,8 @@ class UeMetrics
     uint32_t m_pendingBytes{0}; ///< Accepted TCP bytes still queued or awaiting ACK.
     double m_rttvarUs{0.0};
     double m_minRttUs{0.0};
+    double m_lastRttSampleUs{0.0};
+    uint32_t m_rttUpdatesSincePoll{0};
     bool m_haveVar{false};
     uint32_t m_cwndBytes{0};
     uint32_t m_prevCwndBytes{0};
@@ -205,6 +207,7 @@ class UeMetrics
     Time m_recordStart;
     Time m_recordEnd;
     std::ofstream m_tcpTrace;
+    std::ofstream m_rttSamplesTrace;
 };
 
 } // namespace ns3

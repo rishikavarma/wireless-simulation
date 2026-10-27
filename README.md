@@ -148,13 +148,60 @@ Quantile boundaries use a reproducible uniform sample of up to 200,000 training
 tokens, with no test tokens used for fitting. The existing comparison preset
 retains its monolithic archives and exact training-set quantiles.
 
-For a bounded raw-data and memory footprint, use streaming mode. It runs a
-spread-out calibration part from the first training replicate, fits shared token
-boundaries, then runs and tokenizes each later part. After the token and radio
-archives are saved, it removes that part's raw simulation directory. At the end
-it assigns whole-replicate parts to train and test indexes. A stopped command
-resumes from `stream-progress.json`; use the same batch and calibration sizes.
-Streaming does not produce the raw-data comparison plots or report.
+For a bounded raw-data and memory footprint, collect tokens in streaming mode,
+then build train/test windows from those tokens. Streaming runs a calibration
+part from the first training RNG run, fits shared token boundaries, then runs
+and tokenizes later parts. It saves every run's full RTT token list under
+`token-runs/` before removing that run's raw simulation directory.
+`token-runs-index.json` lists the files, counts, and token fields;
+[the short TCP token schema](docs/token-schema.md) groups its transport and radio fields.
+A stopped token command resumes from `stream-progress.json`; keep the same batch
+and calibration sizes. Streaming does not produce the raw-data comparison plots
+or report.
+
+For one run, `np.load("token-runs/<run-id>.npz")["tokens"]` has shape
+`(number_of_RTT_tokens, number_of_features)`. The archive also has the original
+continuous feature values and timing for every token.
+
+Train and test stay separated by ns-3 RNG run. Every profile that shares an
+RNG number goes to the same set, and quantile boundaries are fit only on
+training RNG runs. The short design uses RNG 20001 for training and RNG 20002
+for test. The full design holds out the last 20% of RNG runs (10017–10020 when
+the start is 10001). Windows never cross from one run into another.
+
+Token output for the short TCP design. This resumes the campaign already
+planned in `results/short-stream-tcp-rtt` (180 profiles × RNG 20001 and RNG
+20002). It writes `token-runs/` and, after the last part, the default
+10-history/10-future windows in `dataset-train/` and `dataset-test/`.
+RNG 20001 is training; RNG 20002 is test.
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --stream \
+  --design-file scripts/dataset/short_dataset.json \
+  --out-dir results/short-stream-tcp-rtt --run-prefix short-stream-tcp-rtt \
+  --jobs 20 --batch-runs 20 --calibration-runs 20
+```
+
+Dataset generation from those saved tokens. This does not rerun ns-3 or refit
+bucket boundaries. Omit `--stride` for non-overlapping windows. The same RNG
+split is applied: every run with RNG 20001 goes to `dataset-train/`, and every
+run with RNG 20002 goes to `dataset-test/`.
+
+```bash
+python3 scripts/dataset/materialize_windows.py \
+  --dataset-dir results/short-stream-tcp-rtt \
+  --context 10 --prediction 10 --stride 20
+```
+
+The short plan is 360 runs. Tokens aggregate TCP measurements over the current
+measured minimum RTT, so the number of windows depends on the run. All primary
+and background UDP traffic is excluded. The earlier fixed-time run remains under
+`results/short-stream-3h`. Add `--clean` to the token command only when
+discarding this campaign; otherwise rerun it to resume. Keep the design file
+unchanged after planning.
+
+A smaller full-preset pilot uses the same two stages. With four replicates the
+last RNG run is held out:
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset full --stream \
@@ -163,31 +210,9 @@ python3 scripts/dataset/run_dataset.py --preset full --stream \
   --batch-runs 4 --calibration-runs 12
 ```
 
-This plan has 400 runs and 19,600 non-overlapping windows, including 4,900 test
-windows. The 12-run calibration part bounds retained raw files; later parts hold
-four runs. For lower peak memory, use `--jobs 1 --batch-runs 2` on a new campaign.
-The calibration part still uses 12 runs; reduce `--calibration-runs` if needed,
-at the cost of less representative token boundaries. `--profile-count` and
-`--replicates` control total work. Rerun the same command to resume.
-
-For a shorter cross-factor collection, use the separate
-[`short_dataset.json`](scripts/dataset/short_dataset.json) design:
-
-```bash
-python3 scripts/dataset/run_dataset.py --preset full --stream \
-  --design-file scripts/dataset/short_dataset.json \
-  --out-dir results/short-stream-3h --run-prefix short-stream-3h \
-  --jobs 20 --batch-runs 20 --calibration-runs 20
-```
-
-It plans 180 profiles with two matched replicates: 360 runs in 18 parts. The
-49 controlled profiles are retained. The sampled interactions limit background
-users to one, use packet sizes of at least 512 bytes, and avoid the most severe
-link losses; controlled background profiles still include three users. This
-targets roughly three hours of simulation wall time on a 20-core machine,
-excluding feature and radio processing. It is an estimate from a small pilot,
-not a run-time cap. Reuse the same command to resume, and keep the design file
-unchanged after planning.
+This plan has 400 runs. The 12-run calibration part is drawn from the first
+training RNG run. Later parts hold four runs of one RNG number. For lower peak
+memory, use `--jobs 1 --batch-runs 2` on a new campaign.
 
 The full dataset has not been run. The queue calibration below uses short
 ns-3 experiments; the broader cross-factor configurations still need a pilot
@@ -390,7 +415,7 @@ workload and positive-byte criterion.
 
 The analyzer compares background counts and attenuation using 18 unique runs.
 It renders individual-seed delivery/progress pages, summary panels and heatmaps
-with observation coverage. It exports all 77 transport features through the
+with observation coverage. It exports all 84 transport features through the
 production token/window/quantile functions, holds out complete seed-30003 runs,
 fits boundaries on training runs only and checks missingness preservation.
 This small export checks the pipeline; it is not a replacement training dataset.
@@ -541,11 +566,14 @@ additional execution step or a new ns-3 dependency.
 ## Processing and outputs
 
 Outputs include configurations, raw traces, execution logs, per-run summaries,
-metric audits, source hashes, and train/test archives. There are **77 transport
-features** (73 legacy heads plus four TCP progress heads) and a separate **28-feature radio/KPI tensor** (historical collections
-had 23). Splits hold out entire
+metric audits, source hashes, and train/test archives. New collections have **84 transport
+features** (73 legacy heads, four TCP progress heads, and seven explicit TCP
+measurements) plus **177 primary-UE radio/KPI token features** when physical traces
+are available. The independent **28-feature one-second radio/KPI tensor** remains
+available for interval analysis (historical collections had 23). Splits hold out entire
 RNG replicates (150 training / 50 test runs in the comparison preset); quantile
 boundaries are fit only on training data. TCP-only observations remain **NaN for UDP**.
+The completed `short-stream-3h` archive predates these additions and has 77 features.
 
 The full preset retains weak startup links, visibility gaps, failed connections,
 zero delivery, and background starvation. Geometry/budget predictions are saved

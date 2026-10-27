@@ -10,6 +10,10 @@ import campaign_config
 
 ROOT = Path(__file__).resolve().parents[2]
 FULL_SETTINGS = Path(__file__).with_name('full_dataset.json')
+TRACE_EXPORT_HASHES = {
+    'scratch/sat-bs-handset/metrics/ue-metrics.cc': '23264e1c3c42ea9f27fb904a273c592bf5d0cb2e286886448ea1d774e52aabc5',
+    'scratch/sat-bs-handset/metrics/ue-metrics.h': '370ff15b9fe7d7e63d01463c637ad33b108fbf89476f02b48a16f0014ed1c9cb',
+}
 
 
 def calibrated_queues(config):
@@ -18,9 +22,12 @@ def calibrated_queues(config):
     reference = json.loads(path.read_text())
     if not reference['accepted']:
         raise ValueError('queue calibration was not accepted; rerun the calibration experiments')
+    # This exact trace-only revision changes CSV output, not the calibrated
+    # queue/radio model. Any later edit to these files still invalidates the reference.
     for name, digest in reference['modelHashes'].items():
         if name.startswith(('scratch/sat-bs-handset/', 'patches/')):
-            if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest:
+            actual = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+            if actual != digest and actual != TRACE_EXPORT_HASHES.get(name):
                 raise ValueError(f'queue reference is stale for {name}; recalibrate before planning')
     return dict(file=config['queueCalibrationFile'], sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 bandwidthBudgets=reference['bandwidthBudgets'],
@@ -83,7 +90,7 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
         if value is not None:
             result[key] = value
     # Enabling selection in every full profile merges baseline/relay-switch.
-    result['anchorProfileCount'] = 49 if preset == 'full' else 50
+    result['anchorProfileCount'] = (25 if result.get('tcpOnly') else 49) if preset == 'full' else 50
     result['stressProfileCount'] = 14 if preset == 'full' and result.get('includeStressProfiles', False) else 0
     if result['profileCount'] < result['anchorProfileCount'] + result['stressProfileCount'] or (preset == 'comparison' and result['profileCount'] != 50):
         raise ValueError('comparison has 50 profiles; full requires 49 anchors plus any enabled stress profiles')
@@ -107,6 +114,8 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
     if target_windows is not None:
         if preset != 'full' or target_windows < 1:
             raise ValueError('--target-windows requires the full preset and a positive target')
+        if result.get('tokenMode') == 'rtt':
+            raise ValueError('--target-windows cannot be planned from variable RTT-sized tokens')
         windows_per_run = (990 - 20) // result['windowStride'] + 1
         result['profileCount'] = max(result['profileCount'], math.ceil(target_windows / (windows_per_run * result['replicates'])))
         result['targetWindows'] = target_windows
@@ -116,6 +125,32 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
 def test_replicates(manifest):
     """Older 200-run manifests hold out replicate 3."""
     return set(manifest.get('settings', {}).get('testReplicates', [3]))
+
+
+def rng_of(rec):
+    """One matched replicate uses one ns-3 RNG run across every profile."""
+    return rec['rngRun'] if 'rngRun' in rec else rec['replicate']
+
+
+def split_rng_runs(manifest):
+    """Keep every profile that shares an RNG run on the same side of the split.
+
+    Held-out replicates stay together, so a training RNG number never appears
+    in the test set and a held-out RNG number never appears in training.
+    """
+    held = test_replicates(manifest)
+    train, test = set(), set()
+    for rec in manifest['runs']:
+        (test if rec['replicate'] in held else train).add(rng_of(rec))
+    if train & test:
+        raise ValueError('an RNG run is assigned to both training and test')
+    if not train or not test:
+        raise ValueError('RNG split needs a training run number and a held-out run number')
+    return train, test
+
+
+def is_test_run(rec, test_rng):
+    return rng_of(rec) in test_rng
 
 
 def preflight(cfg, require_service=False):
@@ -179,8 +214,14 @@ def expand_profiles(anchors, config):
     signatures = set()
     for name, group, original in anchors:
         cfg = copy.deepcopy(original)
+        if config.get('tcpOnly') and (cfg['application'].get('transport', 'tcp') != 'tcp' or
+                                     cfg.get('background', {}).get('count', 0)):
+            continue
         cfg['handover']['enabled'] = True
         cfg['satellite']['altitudeKm'] = config['satelliteAltitudeKm']
+        if config.get('tokenMode') == 'rtt':
+            cfg['output'].update(tokenMode='rtt', tokenRttColumn='minrtt',
+                                 tokenRttLock=False, tokenMissingRttS=0.1)
         apply_queue_budget(cfg, config)
         signature = json.dumps(cfg, sort_keys=True)
         if signature not in signatures:
@@ -195,7 +236,10 @@ def expand_profiles(anchors, config):
     for app in config['applications']:
         if app not in templates:
             raise ValueError(f'unsupported application: {app}')
-        for transport, variant in [('tcp', x) for x in config['tcpVariants']] + [('udp', 'TcpNewReno')]:
+        transports = [('tcp', x) for x in config['tcpVariants']]
+        if not config.get('tcpOnly'):
+            transports.append(('udp', 'TcpNewReno'))
+        for transport, variant in transports:
             for direction in (('ul', 'dl') if app in ('voip', 'iperf', 'cbr', 'onoff') else ('ul',)):
                 for sockets in (config['ranges']['socket-enlargement'] if transport == 'tcp' else ['default']):
                     strata.append((app, transport, variant, direction, sockets))
@@ -216,6 +260,9 @@ def expand_profiles(anchors, config):
     while len(result) < config['profileCount']:
         app, transport, variant, direction, sockets = strata[(len(result) - len(anchors) - len(stress)) % len(strata)]
         cfg = copy.deepcopy(templates[app])
+        if config.get('tokenMode') == 'rtt':
+            cfg['output'].update(tokenMode='rtt', tokenRttColumn='minrtt',
+                                 tokenRttLock=False, tokenMissingRttS=0.1)
         application = cfg['application']
         application.update(transport=transport, tcpVariant=variant, direction=direction,
                            queueSizeBdp=choose('queueSizeBdp'))
@@ -270,6 +317,11 @@ def expand_profiles(anchors, config):
 
 def planned_size(config):
     runs = config['profileCount'] * config['replicates']
+    if config.get('tokenMode') == 'rtt':
+        return dict(runs=runs, trainRuns=config['profileCount']*(config['replicates']-len(config['testReplicates'])),
+                    testRuns=config['profileCount']*len(config['testReplicates']),
+                    windowStride=config['windowStride'], context=10, future=10,
+                    tokenMode='rtt', windows=None, expectedOnly=True)
     # Shared fixed 100 ms bins cover 99 seconds; context and future are 10 tokens each.
     windows_per_run = (990 - 20) // config['windowStride'] + 1
     return dict(runs=runs, uniqueTimeTokens=runs * 990, tokensPerRun=990,

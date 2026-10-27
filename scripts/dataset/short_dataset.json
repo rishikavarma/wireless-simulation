@@ -1,5 +1,7 @@
 {
   "profileCount": 180,
+  "tcpOnly": true,
+  "tokenMode": "rtt",
   "includeStressProfiles": false,
   "replicates": 2,
   "rngStart": 20001,
@@ -24,7 +26,7 @@
     "bandwidthMHz": [10, 20],
     "serviceExcessLossDb": [0, 0.75, 1.5, 3],
     "feederExcessLossDb": [0, 6, 12, 18, 24],
-    "backgroundCount": [0, 1],
+    "backgroundCount": [0],
     "backgroundRateKbps": [2, 10, 32],
     "backgroundDistanceM": [500, 5000, 50000],
     "backgroundRelay": [0, 1],

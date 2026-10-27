@@ -210,7 +210,8 @@ With `--stream`, the runner fits shared boundaries from `--calibration-runs`
 training runs spread across the planned profiles, then processes at most
 `--batch-runs` runs at a time. Each part's transport and radio archives are
 saved before its raw simulator files are deleted. After every part finishes,
-the archives are assigned to the held-out RNG replicate split. This mode uses
+the archives are assigned by RNG run: every profile that shares an RNG number
+stays in one split. This mode uses
 the calibration part for quantiles instead of the uniform sample described
 above, and cannot generate the raw-data plots and report. Progress and source
 hashes remain in the campaign directory so the command can be resumed.
@@ -289,9 +290,18 @@ protocol events, interval KPIs and per-UE paths. TCP is sampled every 5 ms;
 SRTT is expressed in units of 100 ms in the CSV. Dedicated PHY files retain
 reports separately from held values on transport samples.
 
-The full run folds transport samples into fixed 100 ms tokens for both TCP
-and UDP. The transport dataset has 77 features (73 legacy plus four causal TCP progress heads); TCP-only fields remain NaN for
-UDP. Separate radio arrays contain 28 continuous features over 99 one-second
+The default full run folds transport samples into fixed 100 ms tokens for both TCP
+and UDP. New collections have 84 transport features (73 legacy, four causal TCP
+progress heads, and seven explicit TCP measurements) and 177 radio/KPI token
+features when physical traces are enabled. TCP-only fields remain NaN for UDP.
+The short TCP-only design instead uses measured minimum-RTT token windows.
+Radio event and transport-block features summarize records within each token's
+half-open time interval. KPI values come from the last completed one-second
+interval; `kpi_age_s` records how old that interval is. Path samples are held
+from the latest timestamp no later than token end, with `path_age_s`.
+Only the primary UE's RNTIs (including reconnect history) enter these features.
+Identifiers and raw payload bytes are not treated as numeric model features.
+Separate radio arrays contain 28 continuous features over 99 one-second
 measurement intervals, with shape `[runs, 99, 28]`. Idle rates/counts are zero;
 unobserved delay, SINR, MCS and BSR values are NaN.
 

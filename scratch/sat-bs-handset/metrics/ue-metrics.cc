@@ -169,6 +169,8 @@ UeMetrics::Start(Ptr<Socket> socket)
     m_progressOrigin = Simulator::Now();
     m_rttvarUs = 0.0;
     m_minRttUs = 0.0;
+    m_lastRttSampleUs = 0.0;
+    m_rttUpdatesSincePoll = 0;
     m_haveVar = false;
     m_cwndBytes = 0;
     m_prevCwndBytes = 0;
@@ -218,7 +220,15 @@ UeMetrics::OpenTcpTrace(const std::string& path)
 {
     m_tcpTrace.open(path);
     NS_ABORT_MSG_IF(!m_tcpTrace, "cannot open TCP trace " << path);
+    const std::string suffix = "-tcp.csv";
+    NS_ABORT_MSG_IF(path.size() < suffix.size() ||
+                        path.compare(path.size() - suffix.size(), suffix.size(), suffix) != 0,
+                    "TCP trace path must end in " << suffix);
+    const std::string rttPath = path.substr(0, path.size() - suffix.size()) + "-rtt-samples.csv";
+    m_rttSamplesTrace.open(rttPath);
+    NS_ABORT_MSG_IF(!m_rttSamplesTrace, "cannot open RTT sample trace " << rttPath);
     m_tcpTrace << std::setprecision(8);
+    m_rttSamplesTrace << std::setprecision(12) << "time_s,rtt_us\n";
     m_tcpTrace << "# One row per TCP sample. Samples are taken every 5 ms, including intervals "
                   "with no send, acknowledgment, or loss.\n";
     m_tcpTrace << "# sinr_dl_db and sinr_ul_db are the latest PHY report at or before this "
@@ -238,7 +248,9 @@ UeMetrics::OpenTcpTrace(const std::string& path)
     AppendWindowHeader(m_tcpTrace, "lost");
     m_tcpTrace << ",time_delta,rtt_rate,loss_db,acked_rate,dr_ratio,bdp_cwnd,dr,"
                   "cwnd_unacked_rate,dr_max,dr_max_ratio,pre_act,sinr_dl_db,sinr_ul_db,"
-                  "tcp_pending_bytes,tcp_ack_age_s,tcp_no_progress_s,tcp_rtt_update_age_s\n";
+                  "tcp_pending_bytes,tcp_ack_age_s,tcp_no_progress_s,tcp_rtt_update_age_s,"
+                  "minrtt,last_rtt_sample,rtt_update_count,cwnd_bytes,sent_bytes,acked_bytes,"
+                  "lost_bytes\n";
 }
 
 /** Store the shared PHY collector used to append the latest available SINR to each TCP row.
@@ -273,7 +285,7 @@ UeMetrics::Recording(Time now) const
  * for unobserved/outage directions.
  */
 void
-UeMetrics::WriteTcpRow(Time now)
+UeMetrics::WriteTcpRow(Time now, uint32_t sent, uint32_t delivered, uint64_t lostBytes)
 {
     if (!m_tcpTrace.is_open() || !Recording(now))
     {
@@ -308,6 +320,14 @@ UeMetrics::WriteTcpRow(Time now)
     m_tcpTrace << ',' << (m_progressPending ? (now-m_progressOrigin).GetSeconds() : 0.0) << ',';
     if (m_haveRttUpdate) m_tcpTrace << (now-m_lastRttUpdate).GetSeconds();
     else m_tcpTrace << "nan";
+    m_tcpTrace << ',';
+    if (m_minRttUs > 0.0) m_tcpTrace << m_minRttUs / kRttUnitUs;
+    else m_tcpTrace << "nan";
+    m_tcpTrace << ',';
+    if (m_rttUpdatesSincePoll > 0) m_tcpTrace << m_lastRttSampleUs / kRttUnitUs;
+    else m_tcpTrace << "nan";
+    m_tcpTrace << ',' << m_rttUpdatesSincePoll << ',' << m_cwndBytes << ',' << sent << ','
+               << delivered << ',' << lostBytes;
     m_tcpTrace << '\n';
 }
 
@@ -339,6 +359,10 @@ UeMetrics::Stop()
     {
         m_tcpTrace.flush();
     }
+    if (m_rttSamplesTrace.is_open())
+    {
+        m_rttSamplesTrace.flush();
+    }
 }
 
 /** Retain the latest smoothed RTT supplied by the socket RTT trace.
@@ -365,6 +389,12 @@ UeMetrics::OnLastRtt(Time /*oldRtt*/, Time newRtt)
     if (!(m_minRttUs > 0.0) || sampleUs < m_minRttUs)
     {
         m_minRttUs = sampleUs;
+    }
+    m_lastRttSampleUs = sampleUs;
+    ++m_rttUpdatesSincePoll;
+    if (m_rttSamplesTrace.is_open() && Recording(Simulator::Now()))
+    {
+        m_rttSamplesTrace << Simulator::Now().GetSeconds() << ',' << sampleUs << '\n';
     }
     const double srttUs = m_srtt.IsZero() ? sampleUs : m_srtt.GetMicroSeconds();
     const double err = std::abs(sampleUs - srttUs);
@@ -425,7 +455,7 @@ UeMetrics::Poll()
             if (held.haveDl) m_tcpTrace << held.dlDb; else m_tcpTrace << "nan";
             m_tcpTrace << ',';
             if (held.haveUl) m_tcpTrace << held.ulDb; else m_tcpTrace << "nan";
-            m_tcpTrace << ",nan,nan,nan,nan\n";
+            m_tcpTrace << ",nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n";
         }
     }
     else Commit();
@@ -569,7 +599,8 @@ UeMetrics::Commit()
     {
         m_prevCwndBytes = m_cwndBytes;
     }
-    WriteTcpRow(now);
+    WriteTcpRow(now, sent, delivered, lostBytes);
+    m_rttUpdatesSincePoll = 0;
 }
 
 /** Count one generated application body and add its bytes to cumulative UE transmit totals.

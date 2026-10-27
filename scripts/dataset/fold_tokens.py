@@ -11,7 +11,8 @@ Min-RTT aggregation (default):
   2. Accumulate fine-grained samples until wall time >= that window RTT.
   3. Collapse the buffer with a **time-weighted mean**
      ``sum(feature * dt) / sum(dt)`` (``lost`` = delta, ``ca_state`` = mode).
-  4. Emit one token; derived ``base_rtt`` is ``rtt_rate * srtt`` on the token.
+  4. Emit one token; ``base_rtt`` is a model-facing alias for the measured
+     ``minrtt`` used to size that token. It is not a second RTT measurement.
 
 Set ``output.tokenRttLock`` true to freeze min RTT from the first sample
 (UNUM CC runtime). Set ``tokenRttColumn`` to ``srtt`` to size windows on
@@ -24,6 +25,7 @@ import csv
 
 from metric_io import read_commented_csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -84,7 +86,7 @@ def mean(values):
     """Average the observed values, excluding None entries; return None when the window contains
     no observations.
     """
-    present = [value for value in values if value is not None]
+    present = [value for value in values if value is not None and math.isfinite(float(value))]
     if not present:
         return None
     return sum(present) / len(present)
@@ -99,7 +101,7 @@ def weighted_mean(values, weights):
     present = 0
     fallback = []
     for value, weight in zip(values, weights):
-        if value is None:
+        if value is None or not math.isfinite(float(value)):
             continue
         fallback.append(value)
         present += 1
@@ -152,6 +154,11 @@ def window_rtt_units(row, rtt_column):
     (minimum RTT). Any other name is read as a plain column on the row.
     """
     if rtt_column in MINRTT_ALIASES:
+        direct = row.get('minrtt')
+        if direct is not None and math.isfinite(float(direct)) and float(direct) > 0:
+            return float(direct)
+        if 'minrtt' in row:
+            return 0.0
         srtt = row.get("srtt")
         rtt_rate = row.get("rtt_rate")
         if srtt is None or rtt_rate is None:
@@ -197,7 +204,17 @@ def collapse_group(group, dts, feature_keys, aggregate, locked_base_rtt_units):
         token["base_rtt"] = locked_base_rtt_units
     for key in feature_keys:
         series = [row[key] for row in group]
-        if key == "ca_state":
+        if key == "minrtt":
+            token[key] = next((value for value in series if value is not None and
+                               math.isfinite(float(value)) and float(value) > 0), None)
+        elif key == "last_rtt_sample":
+            token[key] = next((value for value in reversed(series) if value is not None and
+                               math.isfinite(float(value))), None)
+        elif key in ("rtt_update_count", "sent_bytes", "acked_bytes", "lost_bytes"):
+            observed = [float(value) for value in series if value is not None and
+                        math.isfinite(float(value))]
+            token[key] = sum(observed) if observed else None
+        elif key == "ca_state":
             token[key] = most_frequent(series)
         elif key == "lost":
             token[key] = difference(series)
@@ -217,6 +234,7 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
     mode = cfg_get(cfg, "output.tokenMode", "rtt")
     fixed_s = float(cfg_get(cfg, "output.tokenFixedS", 0.1))
     min_s = float(cfg_get(cfg, "output.tokenMinS", 0.005))
+    missing_rtt_s = float(cfg_get(cfg, "output.tokenMissingRttS", min_s))
     aggregate = cfg_get(cfg, "output.tokenAggregate", "weighted")
     rtt_column = cfg_get(cfg, "output.tokenRttColumn", "minrtt")
     seconds_per_unit = float(cfg_get(cfg, "output.tokenRttSecondsPerUnit", 0.1))
@@ -272,7 +290,7 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
             start_us = end_us
         return tokens
 
-    # RTT mode — UNUM: accumulate until locked (or per-window) base RTT.
+    # RTT mode: accumulate until the measured min RTT for this window.
     locked_units = None
     locked_window_s = None
     buffer = []
@@ -284,14 +302,14 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
         dt = dts[index]
         if locked_units is None or not lock_rtt:
             units = window_rtt_units(row, rtt_column)
-            window_s = max(min_s, units * seconds_per_unit) if units > 0 else min_s
+            window_s = max(min_s, units * seconds_per_unit) if units > 0 else missing_rtt_s
             if lock_rtt:
-                locked_units = units if units > 0 else (min_s / seconds_per_unit)
+                locked_units = units if units > 0 else None
                 locked_window_s = window_s
             else:
                 # Re-size every token from the first sample of the new buffer.
                 if not buffer:
-                    locked_units = units if units > 0 else (min_s / seconds_per_unit)
+                    locked_units = units if units > 0 else None
                     locked_window_s = window_s
         target_s = locked_window_s if locked_window_s is not None else min_s
 
@@ -302,7 +320,7 @@ def fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg):
 
         if accumulated_s + 1e-15 >= target_s:
             end_us = microseconds(buffer[-1]["time_s"])
-            # When unlocked, still record this window's minrtt as base_rtt.
+            # Keep this window's measured min RTT in UNUM's base_rtt input slot.
             token_base = locked_units if locked_units is not None else None
             token = collapse_group(
                 buffer, buffer_dts, feature_keys, aggregate, token_base
