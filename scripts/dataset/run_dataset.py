@@ -91,8 +91,9 @@ def plan(out,stem,settings=None):
  (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  print('planned',len(runs),'runs',flush=True)
 
-def run(out,jobs,records=None,verify_sources=True):
- manifest=json.loads((out/'manifest.json').read_text());(out/'logs').mkdir(exist_ok=True)
+def run(out,jobs,records=None,verify_sources=True,manifest=None):
+ if manifest is None:manifest=json.loads((out/'manifest.json').read_text())
+ (out/'logs').mkdir(exist_ok=True)
  if verify_sources:
   sources={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'scratch/sat-bs-handset').rglob('*') if p.is_file() and p.suffix in ('.cc','.h')}
   sources['binary']=hashlib.sha256(BIN.read_bytes()).hexdigest()
@@ -273,7 +274,7 @@ def main():
   if manifest.get('preset')!='full':p.error('--stream requires the full preset')
   from dataset_storage import stream_campaign
   stream_campaign(ROOT,out,manifest,a.batch_runs,a.calibration_runs,
-                  lambda records,verify:run(out,a.jobs,records,verify),prepare_features)
+                  lambda records,verify:run(out,a.jobs,records,verify,manifest),prepare_features)
  elif a.run:run(out,a.jobs)
  if a.post:post(out,a.jobs)
  if a.analyze:
