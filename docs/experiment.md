@@ -209,12 +209,13 @@ a single `dataset-train.npz` file.
 With `--stream`, the runner fits shared boundaries from `--calibration-runs`
 training runs spread across the planned profiles, then processes at most
 `--batch-runs` runs at a time. Each part's transport and radio archives are
-saved before its raw simulator files are deleted. After every part finishes,
-the archives are assigned by RNG run: every profile that shares an RNG number
-stays in one split. This mode uses
-the calibration part for quantiles instead of the uniform sample described
-above, and cannot generate the raw-data plots and report. Progress and source
-hashes remain in the campaign directory so the command can be resumed.
+saved before its raw simulator files are deleted. The campaign retains an
+RNG-held-out diagnostic split and builds a profile-held-out default dataset
+from the saved continuous tokens. Its quantile boundaries use training
+profiles only. The diagnostic split uses the calibration part for quantiles
+instead of the uniform sample described above. Streaming cannot generate
+the raw-data plots and report. Progress and source hashes remain in the
+campaign directory so the command can be resumed.
 
 ## Metric coverage
 

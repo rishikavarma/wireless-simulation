@@ -27,11 +27,12 @@ Requires Ubuntu 22.04 / WSL, Python 3.10+, a C++ toolchain, CMake 3.25+, Ninja,
 Git and Eigen3. From the repository root:
 
 ```bash
-python3 -m pip install -r requirements.txt
 bash scripts/setup.sh
 ```
 
-Setup pins ns-3.48 and NR v5.1, applies the versioned
+Setup first installs the Python requirements, including PyTorch, Transformers,
+and Chronos. Without a GPU it uses the CPU PyTorch wheel and downloads the
+`amazon/chronos-t5-tiny` weights. It then pins ns-3.48 and NR v5.1, applies the versioned
 [`patches/`](patches/), links the scenario into ns-3, builds it and runs a smoke
 check. Use `--skip-deps` to skip package installation or `--skip-verify` to skip
 the smoke run. `NS3_DIR` selects another upstream checkout for setup.
@@ -163,17 +164,19 @@ For one run, `np.load("token-runs/<run-id>.npz")["tokens"]` has shape
 `(number_of_RTT_tokens, number_of_features)`. The archive also has the original
 continuous feature values and timing for every token.
 
-Train and test stay separated by ns-3 RNG run. Every profile that shares an
-RNG number goes to the same set, and quantile boundaries are fit only on
-training RNG runs. The short design uses RNG 20001 for training and RNG 20002
-for test. The full design holds out the last 20% of RNG runs (10017–10020 when
-the start is 10001). Windows never cross from one run into another.
+The default streaming training dataset holds out whole profiles: every RNG seed of a
+profile stays in the same train or test set. Bucket boundaries are fit only
+from training profiles, and windows never cross run boundaries. The streamed
+RNG split remains at the campaign root for measuring generalization to a new
+seed of a profile already seen in training.
 
 Token output for the short TCP design. This creates a 180-profile campaign
 with RNG 20001 and RNG 20002. Repeating the command resumes an incomplete
 campaign. It writes `token-runs/` and, after the last part, the default
-10-history/10-future windows in `dataset-train/` and `dataset-test/`.
-RNG 20001 is training; RNG 20002 is test.
+10-history/10-future profile-held-out dataset in
+`windows-profile-c10-p10-s20/`. The campaign's `default-dataset.json` points
+to it. Both RNG 20001 and RNG 20002 occur in each split, with both seeds of
+each profile kept together.
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset full --stream \
@@ -182,10 +185,10 @@ python3 scripts/dataset/run_dataset.py --preset full --stream \
   --jobs 20 --batch-runs 20 --calibration-runs 20
 ```
 
-Dataset generation from those saved tokens. This does not rerun ns-3 or refit
-bucket boundaries. Omit `--stride` for non-overlapping windows. The same RNG
-split is applied: every run with RNG 20001 goes to `dataset-train/`, and every
-run with RNG 20002 goes to `dataset-test/`.
+The following command regenerates the default profile-held-out dataset from
+saved continuous tokens. It does not rerun ns-3. It uses an 80/20 profile
+split, refits bucket boundaries from training profiles only, and puts the
+radio shards in the same split. Omit `--stride` for non-overlapping windows.
 
 ```bash
 python3 scripts/dataset/materialize_windows.py \
@@ -193,13 +196,24 @@ python3 scripts/dataset/materialize_windows.py \
   --context 10 --prediction 10 --stride 20
 ```
 
+To evaluate another seed on profiles already present in training, request the
+RNG-held-out split explicitly. This uses the saved stream bucket boundaries:
+
+```bash
+python3 scripts/dataset/materialize_windows.py \
+  --dataset-dir results/short-stream-tcp-rtt \
+  --split-unit rng --context 10 --prediction 10 --stride 20
+```
+
+Its output is `results/short-stream-tcp-rtt/windows-c10-p10-s20/`.
+
 The short plan is 360 runs. Tokens aggregate TCP measurements over the current
 measured minimum RTT, so the number of windows depends on the run. All primary
 and background UDP traffic is excluded. Keep the design file unchanged after
 planning.
 
-A smaller full-preset pilot uses the same two stages. With four replicates the
-last RNG run is held out:
+A smaller full-preset pilot uses the same two stages. Its default profile
+split keeps all four replicates of a profile together:
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset full --stream \

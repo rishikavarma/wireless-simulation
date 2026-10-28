@@ -1,3 +1,13 @@
 # Dataset planning, processing, validation, and scientific figures.
 numpy>=1.24
 matplotlib>=3.5
+
+# Training. scripts/setup.sh installs a CPU PyTorch wheel first when no GPU
+# is present, then this file. A plain pip install of this file may select the
+# default PyTorch wheel instead.
+torch>=2.2,<3
+transformers>=4.41,<6
+chronos-forecasting>=2.2,<3
+accelerate>=1.1,<2
+einops>=0.7,<1
+pandas>=2,<4

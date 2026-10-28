@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # One-shot setup for the satellite (sat-bs-handset) ns-3 scenario: install
-# build dependencies, clone ns-3-dev + 5G-LENA nr, symlink the scenario,
-# configure, build, and smoke-test.
+# PyTorch, Transformers, and Chronos, then build dependencies, clone ns-3-dev
+# + 5G-LENA nr, symlink the scenario, configure, build, and smoke-test.
 #
 # Usage:
 #   ./scripts/setup.sh                 # full setup
@@ -99,6 +99,30 @@ else
     sudo apt-get update
     sudo apt-get install -y g++ python3 python3-pip git ninja-build pkg-config libeigen3-dev
 fi
+
+echo "==> Installing PyTorch, Transformers, and Chronos"
+# Do this before the ns-3 build. The CPU wheel avoids the large CUDA package
+# on machines without a GPU; an existing matching torch is left in place.
+if python3 -c 'import torch' >/dev/null 2>&1; then
+    echo "    torch already importable ($(python3 -c 'import torch; print(torch.__version__)'))"
+else
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        python3 -m pip install --user 'torch>=2.2,<3'
+    else
+        python3 -m pip install --user torch --index-url https://download.pytorch.org/whl/cpu
+    fi
+fi
+python3 -m pip install --user -r "$ROOT_DIR/requirements.txt"
+python3 - <<'PY'
+from huggingface_hub import snapshot_download
+import torch
+import transformers
+import chronos
+
+path = snapshot_download("amazon/chronos-t5-tiny")
+print(f"    torch {torch.__version__}; transformers {transformers.__version__}")
+print(f"    chronos {chronos.__name__}; weights {path}")
+PY
 
 echo "==> Ensuring CMake >= 3.25"
 if cmake_version_ok 3.25; then
