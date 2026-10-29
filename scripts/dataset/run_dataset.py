@@ -78,11 +78,14 @@ def plan(out,stem,settings=None):
                 'receiverMobility':cfg['topology']['receiverMobility'],
                 'ueSpeedMps':cfg['topology']['ueSpeedMps'] if cfg['topology']['receiverMobility'] else 0,
                 'backgroundCount':cfg.get('background',{}).get('count',0)}})
+ time_cfg=selected[0][2]['time']
+ record_start=time_cfg['warmUp']+time_cfg['measureStart']
+ record_end=time_cfg['simTime']-time_cfg['appDrain']-time_cfg['measureEnd']
  manifest={'design':f"{len(selected)} profiles x {settings['replicates']} matched RNG replicates; {settings['anchorProfileCount']} controlled anchors, {settings.get('stressProfileCount',0)} stress profiles, plus sampled cross-factor profiles",
            'preset':settings['preset'],'settings':settings,'plannedSize':dataset_presets.planned_size(settings),
            'rejectedProfileCandidates':rejected,
            'candidateRejectionPolicy':'duplicates only in full preset; network service warnings retained',
-           'simTimeS':130,'recordWindowS':[20,119],'metricSchema':'minRTT TCP/SINR/radio-event tokens with last-completed one-second KPIs and path samples',
+           'simTimeS':time_cfg['simTime'],'recordWindowS':[record_start,record_end],'metricSchema':'minRTT TCP/SINR/radio-event tokens with last-completed one-second KPIs and path samples',
            'progressFeatures':{'tcp_pending_bytes':'TCP bytes queued or awaiting ACK',
               'tcp_ack_age_s':'seconds since forward TCP transmit-buffer head progress; missing before first observation',
               'tcp_no_progress_s':'seconds continuously backlogged without forward ACK progress; zero when idle',
@@ -113,7 +116,8 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None):
   raw_dir=ROOT/'results'/prefix
   required=[raw_dir/(prefix+'-'+suffix) for suffix in ('tcp.csv','summary.txt','app.txt')]
   if status.exists() and all(path.exists() for path in required):
-   return json.loads(status.read_text())
+   previous=json.loads(status.read_text())
+   if previous.get('exit') in (0,1):return previous
   before=time.monotonic()
   with (out/'logs'/(prefix+'.log')).open('w') as log:
    cfg=json.loads(Path(rec['config']).read_text())
@@ -128,6 +132,23 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None):
  if any(r['exit'] not in (0,1) for r in executed):raise SystemExit('simulation crashes present; inspect run-outcomes.json')
  print('completed',len(executed),'runs; application criteria passed',sum(r['exit']==0 for r in executed),flush=True)
  return executed
+
+def collected_raw(out,records,verify=False):
+ """Read worker outcomes while tokenizing retrieved raw traces locally."""
+ if verify and not (out/'source-hashes.json').exists():
+  raise ValueError('retrieved source hashes are missing')
+ result=[]
+ for rec in records:
+  prefix=rec['prefix'];path=out/'logs'/(prefix+'.json')
+  saved=json.loads(path.read_text())
+  if saved['prefix']!=prefix or saved['exit'] not in (0,1):
+   raise ValueError('invalid retrieved outcome for '+prefix)
+  raw=ROOT/'results'/prefix
+  for suffix in ('tcp.csv','summary.txt','app.txt'):
+   if not (raw/(prefix+'-'+suffix)).is_file():
+    raise ValueError('retrieved raw trace missing for '+prefix)
+  result.append({**rec,'exit':saved['exit'],'wallS':saved.get('wallS')})
+ return result
 
 def normalize_reports(rec):
  """Mask legacy text bookkeeping for UDP and label native applications from their config."""
@@ -212,6 +233,7 @@ def main():
  p.add_argument('--replicates',type=int,help='matched RNG repeats per profile; comparison defaults to 4, full to 20')
  p.add_argument('--design-seed',type=int,help='seed for sampling the full-preset configurations')
  p.add_argument('--target-windows',type=int,help='increase the full-preset profile count to reach this many 20-token windows')
+ p.add_argument('--observation-seconds',type=int,help='full preset: measured interval length, excluding warm-up and drain')
  p.add_argument('--describe',action='store_true',help='print settings and planned size without creating files or running simulations')
  p.add_argument('--run-prefix',default='full',help='unique result prefix for a fresh collection')
  p.add_argument('--plan',action='store_true',help='only plan configurations, unless other stages are selected')
@@ -221,16 +243,29 @@ def main():
  p.add_argument('--report',action='store_true',help='write the results summary')
  p.add_argument('--jobs',type=int,default=8)
  p.add_argument('--stream',action='store_true',help='full preset: run, tokenize and remove raw files in bounded parts; split saved parts at the end')
+ p.add_argument('--raw-parts',action='store_true',help='run only assigned numbered parts and preserve all raw metric traces')
+ p.add_argument('--stream-from-raw',action='store_true',help='tokenize already retrieved raw parts locally without simulating')
  p.add_argument('--batch-runs',type=int,default=4,help='runs per streaming part after calibration (default: 4)')
  p.add_argument('--calibration-runs',type=int,default=12,help='spread-out training runs used to fit shared token boundaries (default: 12)')
+ p.add_argument('--part-start',type=int,help='first streaming part to run (zero based, inclusive)')
+ p.add_argument('--part-stop',type=int,help='last streaming part to run (zero based, exclusive)')
+ p.add_argument('--finalize-only',action='store_true',help='build indexes from all collected streaming parts without running simulations')
+ p.add_argument('--max-hours',type=float,help='stop starting new parts after this many hours; current part completes')
  p.epilog='Without stage flags, creates a plan if missing and runs all stages. --stream instead processes bounded parts and writes indexed train/test shards. Existing plans resume; --clean restarts in the same directory.'
  a=p.parse_args()
  if a.jobs<1:p.error('--jobs must be positive')
  if a.batch_runs<1 or a.calibration_runs<1:p.error('--batch-runs and --calibration-runs must be positive')
+ if a.max_hours is not None and a.max_hours<=0:p.error('--max-hours must be positive')
+ if (a.part_start is None)!=(a.part_stop is None):p.error('--part-start and --part-stop must be given together')
+ if (a.part_start is not None or a.finalize_only) and not (a.stream or a.raw_parts):p.error('part selection requires --stream or --raw-parts')
+ if a.stream_from_raw and not a.stream:p.error('--stream-from-raw requires --stream')
+ if a.raw_parts and (a.stream or a.post or a.analyze or a.report):p.error('--raw-parts only runs simulations')
+ if a.raw_parts and a.part_start is None:p.error('--raw-parts requires a part range')
+ if a.finalize_only and (a.part_start is not None or a.clean):p.error('--finalize-only cannot select parts or clean')
  if a.stream and (a.post or a.analyze or a.report):p.error('--stream includes tokenization; --post, --analyze and --report require retained raw files')
  if a.describe:
   if a.clean or any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with --clean or execution stages')
-  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file)
+  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds)
   except ValueError as e:p.error(str(e))
   print(json.dumps({'settings':configuration,'plannedSize':dataset_presets.planned_size(configuration)},indent=2));return
  if a.out_dir is None:p.error('--out-dir is required unless --describe is used')
@@ -248,7 +283,7 @@ def main():
   a.plan=True
  if a.plan:
   if not a.run_prefix or any(not (c.isalnum() or c in '-_') for c in a.run_prefix):p.error('invalid --run-prefix')
-  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file)
+  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds)
   except ValueError as e:p.error(str(e))
   if a.clean:
    try:clean_experiment(out,ROOT/'results','dataset')
@@ -261,7 +296,8 @@ def main():
    if digest!=previous.get('settings',{}).get('designFileSha256'):
     p.error('--design-file differs from the saved campaign settings')
   overrides={'profileCount':a.profile_count,'replicates':a.replicates,
-             'designSeed':a.design_seed,'targetWindows':a.target_windows}
+             'designSeed':a.design_seed,'targetWindows':a.target_windows,
+             'observationSeconds':a.observation_seconds}
   if any(value is not None for value in overrides.values()):
    if not a.stream:p.error('design overrides require the planning stage')
    saved=previous.get('settings',{})
@@ -274,7 +310,17 @@ def main():
   if manifest.get('preset')!='full':p.error('--stream requires the full preset')
   from dataset_storage import stream_campaign
   stream_campaign(ROOT,out,manifest,a.batch_runs,a.calibration_runs,
-                  lambda records,verify:run(out,a.jobs,records,verify,manifest),prepare_features)
+                  (lambda records,verify:collected_raw(out,records,verify)) if a.stream_from_raw else
+                  (lambda records,verify:run(out,a.jobs,records,verify,manifest)),prepare_features,
+                  a.part_start,a.part_stop,a.finalize_only,a.max_hours)
+ elif a.raw_parts and a.run:
+  from stream_parts import planned_parts
+  manifest=json.loads((out/'manifest.json').read_text())
+  parts,_=planned_parts(manifest,a.batch_runs,a.calibration_runs)
+  if not (0<=a.part_start<a.part_stop<=len(parts)):
+   p.error(f'part range must satisfy 0 <= start < stop <= {len(parts)}')
+  selected=[rec for group in parts[a.part_start:a.part_stop] for rec in group]
+  run(out,a.jobs,selected,True,manifest)
  elif a.run:run(out,a.jobs)
  if a.post:post(out,a.jobs)
  if a.analyze:

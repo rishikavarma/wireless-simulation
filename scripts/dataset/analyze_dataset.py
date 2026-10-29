@@ -40,7 +40,7 @@ def rnti_ids(rows):
  """Resolve stable UE identity across RRC reconnects; support historical logs."""
  return {identity for r in rows for identity in r.get('rnti_history',r['rnti']).split('|') if identity and int(identity)>0}
 
-def application_summary(directory):
+def application_summary(directory, record_start=20, record_end=119):
  """Measure native source/sink payload bytes, independently of PDCP overhead."""
  result={key:math.nan for key in ('application_goodput_kbps','application_source_kbps',
          'application_delivery_shortfall_pct','application_tx_bytes','application_rx_bytes')}
@@ -57,9 +57,9 @@ def application_summary(directory):
  samples=records(path)
  # Cumulative counters at the two exact boundaries avoid counting warm-up traffic.
  boundaries={float(r['time_s']):r for r in samples}
- first,last=boundaries[20.0],boundaries[119.0]
+ first,last=boundaries[float(record_start)],boundaries[float(record_end)]
  for column,key in [('rx_bytes','application_goodput_kbps'),('tx_bytes','application_source_kbps')]:
-  result[key]=(int(last[column])-int(first[column]))*8/99/1000
+  result[key]=(int(last[column])-int(first[column]))*8/(record_end-record_start)/1000
  final=samples[-1];tx=int(final['tx_bytes']);rx=int(final['rx_bytes'])
  assert 0<=rx<=tx,(str(path),'invalid application byte counters')
  result.update(application_tx_bytes=tx,application_rx_bytes=rx,
@@ -76,11 +76,14 @@ def checked_summary(rec):
 
 def summarize(rec):
  p=rec['prefix'];d=ROOT/'results'/p;cfg=json.loads(Path(rec['config']).read_text())
- k=records(d/(p+'-kpis.csv'));primary=[r for r in k if r['ue_index']=='0' and 20<float(r['time_s'])<=119]
- assert len(primary)==99,(p,'incomplete KPI interval coverage',len(primary))
+ time_cfg=cfg['time'];record_start=int(time_cfg['warmUp']+time_cfg['measureStart'])
+ record_end=int(time_cfg['simTime']-time_cfg['appDrain']-time_cfg['measureEnd'])
+ bins=record_end-record_start
+ k=records(d/(p+'-kpis.csv'));primary=[r for r in k if r['ue_index']=='0' and record_start<float(r['time_s'])<=record_end]
+ assert len(primary)==bins,(p,'incomplete KPI interval coverage',len(primary))
  primary_ids=rnti_ids(primary)
  tb=records(d/(p+'-transport-blocks.csv'));ev=records(d/(p+'-radio-events.csv'))
- paths=records(d/'ue-paths.csv');assert len(paths)>=130*(1+cfg.get('background',{}).get('count',0)),p
+ paths=records(d/'ue-paths.csv');assert len(paths)>=time_cfg['simTime']*(1+cfg.get('background',{}).get('count',0)),p
  # Reconcile cumulative SDU bytes and actual scheduled PRB counts for every UE.
  for ue in {r['ue_index'] for r in k}:
   ue_rows=[r for r in k if r['ue_index']==ue]
@@ -103,7 +106,7 @@ def summarize(rec):
  result['exit']=rec['exit'];result.update(workload=cfg['application']['workload'],transport=cfg['application'].get('transport','tcp'),tcp=cfg['application']['tcpVariant'],direction=cfg['application'].get('direction','ul'))
  result['socket-enlargement']=cfg['application'].get('socket-enlargement','default')
  result['tcpSocketBufferBytes']=cfg['application'].get('tcpSocketBufferBytes')
- result.update(application_summary(d))
+ result.update(application_summary(d,record_start,record_end))
  result['application_zero_delivery']=result['application_rx_bytes']==0
  result['application_no_source_bytes']=result['application_tx_bytes']==0
  result['radio_link_failure_events']=sum(r['event']=='RadioLinkFailure' for r in ev)
@@ -113,10 +116,10 @@ def summarize(rec):
   result[direction.lower()+'_pdcp_throughput_kbps']=finite_mean([float(r['DRB.UEThp'+direction+'_Mbps'])*1000 for r in primary])
  delay_n=sum(int(r['dl_delay_samples']) for r in primary)
  result['dl_sdu_delay_ms']=sum(float(r['DRB.RlcSduDelayDl_us'])*int(r['dl_delay_samples']) for r in primary if int(r['dl_delay_samples']))/delay_n/1000 if delay_n else math.nan
- result['background_pdcp_throughput_kbps']=sum(float(r['DRB.UEThpUl_Mbps'])*1000 for r in k if r['ue_index']!='0' and 20<float(r['time_s'])<=119)/99
+ result['background_pdcp_throughput_kbps']=sum(float(r['DRB.UEThpUl_Mbps'])*1000 for r in k if r['ue_index']!='0' and record_start<float(r['time_s'])<=record_end)/bins
  for direction in ('DL','UL'):
-  received=[r for r in tb if r['event']=='RX' and r['direction']==direction and r['rnti'] in primary_ids and 20<=float(r['time_s'])<119]
-  sent=[r for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti'] in primary_ids and 20<=float(r['time_s'])<119]
+  received=[r for r in tb if r['event']=='RX' and r['direction']==direction and r['rnti'] in primary_ids and record_start<=float(r['time_s'])<record_end]
+  sent=[r for r in tb if r['event']=='TX' and r['direction']==direction and r['rnti'] in primary_ids and record_start<=float(r['time_s'])<record_end]
   result[direction.lower()+'_sinr_db']=finite_mean([float(r['sinr_db']) for r in received])
   result[direction.lower()+'_tb_fail_pct']=finite_mean([100*(1-float(r['crc_pass_model'])) for r in received])
   result[direction.lower()+'_mcs']=finite_mean([float(r['mcs']) for r in sent])
@@ -128,7 +131,7 @@ def summarize(rec):
   assert all(math.isnan(float(v)) for row in rows for key,v in row.items() if key not in ('time_s','sinr_dl_db','sinr_ul_db')),(p,'UDP has fabricated TCP observations')
  srtt=np.array([float(r['srtt'])*100 for r in rows]);times=np.array([float(r['time_s']) for r in rows]);srtt[srtt<=0]=np.nan
  result['srtt_ms']=finite_mean(srtt);result['srtt_p90_ms']=percentile(srtt,90)
- primary_paths=[r for r in paths if r['ue_index']=='0' and 20<=float(r['time_s'])<=119]
+ primary_paths=[r for r in paths if r['ue_index']=='0' and record_start<=float(r['time_s'])<=record_end]
  result['path_visible_fraction']=finite_mean([float(r['visible']) for r in primary_paths])
  for direction in ('dl','ul'):
   for unit in ('pdus','bytes'):
@@ -145,19 +148,19 @@ def summarize(rec):
  result['background_zero_delivery_ues']=sum(n==0 for n in bg_delivered)
  result['background_bytes_delivered']=sum(bg_delivered)
  # An independent 1 s tensor exposes new numeric radio/KPI data without changing legacy heads.
- radio=np.full((99,len(RADIO_FEATURES)),np.nan)
+ radio=np.full((bins,len(RADIO_FEATURES)),np.nan)
  kpi_columns=['DRB.PdcpSduVolumeDL_kB','DRB.PdcpSduVolumeUL_kB','DRB.RlcSduDelayDl_us',
               'RRU.PrbTotDl','RRU.PrbTotUl','DRB.UEThpDl_Mbps','DRB.UEThpUl_Mbps']
  for i,r in enumerate(primary):radio[i,:7]=[float(r[x]) for x in kpi_columns]
- tb_bins=[[] for _ in range(99)];event_bins=[[] for _ in range(99)]
+ tb_bins=[[] for _ in range(bins)];event_bins=[[] for _ in range(bins)]
  for r in tb:
-  b=int(float(r['time_s']))-20
-  if r['rnti'] in primary_ids and 0<=b<99:tb_bins[b].append(r)
+  b=int(float(r['time_s']))-record_start
+  if r['rnti'] in primary_ids and 0<=b<bins:tb_bins[b].append(r)
  for r in ev:
-  b=int(float(r['time_s']))-20
-  if r['rnti'] in primary_ids and 0<=b<99:event_bins[b].append(r)
- for b in range(99):
-  start=20+b
+  b=int(float(r['time_s']))-record_start
+  if r['rnti'] in primary_ids and 0<=b<bins:event_bins[b].append(r)
+ for b in range(bins):
+  start=record_start+b
   for j,direction in enumerate(('DL','UL')):
    rx=[r for r in tb_bins[b] if r['event']=='RX' and r['direction']==direction and start<=float(r['time_s'])<start+1]
    tx=[r for r in tb_bins[b] if r['event']=='TX' and r['direction']==direction and start<=float(r['time_s'])<start+1]
@@ -177,7 +180,7 @@ def summarize(rec):
   radio[b,27]=float(path['visible'])
  with (d/'radio-kpi-features.csv').open('w') as f:
   w=csv.writer(f);w.writerow(['start_s','end_s']+RADIO_FEATURES)
-  for i,values_ in enumerate(radio):w.writerow([20+i,21+i]+list(values_))
+  for i,values_ in enumerate(radio):w.writerow([record_start+i,record_start+i+1]+list(values_))
  log=(Path(rec['config']).parent.parent/'logs'/(p+'.log')).read_text()
  switches=re.findall(r'handover complete timeS=([0-9.]+)',log);result['switches']=len(switches)
  result['switch_count_matches_control']=len(switches)==int(cfg['handover']['enabled'])

@@ -69,7 +69,7 @@ def socket_buffer_arguments(cfg, fallback=None):
 
 
 def settings(preset='comparison', profile_count=None, replicates=None, design_seed=None, target_windows=None,
-             design_file=None):
+             design_file=None, observation_seconds=None):
     if preset == 'full':
         source = Path(design_file) if design_file is not None else FULL_SETTINGS
         contents = source.read_bytes()
@@ -85,6 +85,10 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
     else:
         raise ValueError(f'unknown preset: {preset}')
     result['preset'] = preset
+    if observation_seconds is not None:
+        if preset != 'full' or observation_seconds < 1 or int(observation_seconds) != observation_seconds:
+            raise ValueError('--observation-seconds requires the full preset and a positive integer')
+        result['observationSeconds'] = int(observation_seconds)
     for key, value in [('profileCount', profile_count), ('replicates', replicates),
                        ('designSeed', design_seed)]:
         if value is not None:
@@ -116,7 +120,8 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
             raise ValueError('--target-windows requires the full preset and a positive target')
         if result.get('tokenMode') == 'rtt':
             raise ValueError('--target-windows cannot be planned from variable RTT-sized tokens')
-        windows_per_run = (990 - 20) // result['windowStride'] + 1
+        tokens_per_run = result.get('observationSeconds', 99) * 10
+        windows_per_run = (tokens_per_run - 20) // result['windowStride'] + 1
         result['profileCount'] = max(result['profileCount'], math.ceil(target_windows / (windows_per_run * result['replicates'])))
         result['targetWindows'] = target_windows
     return result
@@ -214,6 +219,11 @@ def expand_profiles(anchors, config):
     signatures = set()
     for name, group, original in anchors:
         cfg = copy.deepcopy(original)
+        if 'observationSeconds' in config:
+            time_cfg = cfg['time']
+            time_cfg['simTime'] = (time_cfg['warmUp'] + time_cfg['measureStart'] +
+                                   config['observationSeconds'] + time_cfg['measureEnd'] +
+                                   time_cfg['appDrain'])
         if config.get('tcpOnly') and (cfg['application'].get('transport', 'tcp') != 'tcp' or
                                      cfg.get('background', {}).get('count', 0)):
             continue
@@ -323,8 +333,9 @@ def planned_size(config):
                     windowStride=config['windowStride'], context=10, future=10,
                     tokenMode='rtt', windows=None, expectedOnly=True)
     # Shared fixed 100 ms bins cover 99 seconds; context and future are 10 tokens each.
-    windows_per_run = (990 - 20) // config['windowStride'] + 1
-    return dict(runs=runs, uniqueTimeTokens=runs * 990, tokensPerRun=990,
+    tokens_per_run = config.get('observationSeconds', 99) * 10
+    windows_per_run = (tokens_per_run - 20) // config['windowStride'] + 1
+    return dict(runs=runs, uniqueTimeTokens=runs * tokens_per_run, tokensPerRun=tokens_per_run,
                 windowsPerRun=windows_per_run, windows=runs * windows_per_run,
                 trainRuns=config['profileCount']*(config['replicates']-len(config['testReplicates'])),
                 testRuns=config['profileCount']*len(config['testReplicates']),

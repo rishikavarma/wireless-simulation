@@ -1,0 +1,14 @@
+# One gcloud compute ssh command per VM. Add the other VM commands below.
+# The 20,000-run short campaign is planned for 10 similar VMs (9 more needed).
+# The full 40,000-run campaign is planned for 20 similar VMs.
+gcloud compute ssh --zone "us-central1-c" "instance-20261029-190248" --project "cmps-infraai"
+
+# 2: gcloud compute ssh --zone "ZONE" "INSTANCE_2" --project "cmps-infraai"
+# 3: gcloud compute ssh --zone "ZONE" "INSTANCE_3" --project "cmps-infraai"
+# 4: gcloud compute ssh --zone "ZONE" "INSTANCE_4" --project "cmps-infraai"
+# 5: gcloud compute ssh --zone "ZONE" "INSTANCE_5" --project "cmps-infraai"
+# 6: gcloud compute ssh --zone "ZONE" "INSTANCE_6" --project "cmps-infraai"
+# 7: gcloud compute ssh --zone "ZONE" "INSTANCE_7" --project "cmps-infraai"
+# 8: gcloud compute ssh --zone "ZONE" "INSTANCE_8" --project "cmps-infraai"
+# 9: gcloud compute ssh --zone "ZONE" "INSTANCE_9" --project "cmps-infraai"
+# 10: gcloud compute ssh --zone "ZONE" "INSTANCE_10" --project "cmps-infraai"

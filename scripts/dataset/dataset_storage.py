@@ -6,10 +6,12 @@ import zipfile
 import csv
 import gzip
 import concurrent.futures as cf
+import time
 
 import numpy as np
 
 from dataset_presets import is_test_run, rng_of, split_rng_runs, test_replicates
+from stream_parts import planned_parts
 
 
 def atomic_json(path, value):
@@ -70,28 +72,20 @@ def window_token_runs(paths, seq_len, stride, expected_columns, expected_run_ids
 
 
 def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
-                    run_batch, prepare_features):
+                    run_batch, prepare_features, part_start=None, part_stop=None,
+                    finalize_only=False, max_hours=None):
     """Run, tokenize and discard each part; assign saved parts to splits at the end."""
     from make_datasets import load_run_windows, fit_boundaries_on_train
     from analyze_dataset import RADIO_FEATURES, summarize
 
     runs = manifest['runs']
+    record_start, record_end = map(int, manifest.get('recordWindowS', [20, 119]))
+    radio_bins = record_end-record_start
     train_rng, test_rng = split_rng_runs(manifest)
     held_out = test_replicates(manifest)
-    train_replicates = sorted({r['replicate'] for r in runs if not is_test_run(r, test_rng)})
-    if not train_replicates:
-        raise ValueError('no training replicate available for calibration')
-    candidates = [r for r in runs if r['replicate'] == train_replicates[0]]
-    count = min(calibration_runs, len(candidates))
-    chosen = [candidates[i] for i in np.linspace(0, len(candidates)-1, count, dtype=int)]
+    parts, chosen = planned_parts(manifest, batch_runs, calibration_runs)
+    count = len(chosen)
     calibration_ids = {r['prefix'] for r in chosen}
-    parts = [chosen]
-    for replicate in sorted({r['replicate'] for r in runs}):
-        remaining = [r for r in runs if r['replicate'] == replicate and r['prefix'] not in calibration_ids]
-        parts.extend(batches(remaining, batch_runs))
-    for group in parts:
-        if len({rng_of(rec) for rec in group}) != 1:
-            raise ValueError('a stream part mixes RNG runs')
 
     progress_path = out/'stream-progress.json'
     expected = dict(format='stream-parts-v1', batchRuns=batch_runs,
@@ -103,13 +97,24 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         if progress[key] != expected[key]:
             raise ValueError('stream settings changed; resume with the original batch and calibration sizes')
     completed = progress['parts']
-    if [p['number'] for p in completed] != list(range(len(completed))):
-        raise ValueError('stream progress has incomplete part numbering')
+    numbers = [p['number'] for p in completed]
+    if len(numbers) != len(set(numbers)) or numbers != sorted(numbers):
+        raise ValueError('stream progress has duplicate or unordered part numbers')
     if len(completed) > len(parts):
         raise ValueError('stream progress exceeds the planned run count')
+    completed_by_number = {p['number']: p for p in completed}
     for number, group in enumerate(parts):
-        if number < len(completed) and completed[number]['runs'] != [r['prefix'] for r in group]:
+        if number in completed_by_number and completed_by_number[number]['runs'] != [r['prefix'] for r in group]:
             raise ValueError('saved stream parts disagree with the manifest')
+    if part_start is not None:
+        if not (0 <= part_start < part_stop <= len(parts)):
+            raise ValueError(f'part range must satisfy 0 <= start < stop <= {len(parts)}')
+        selected_numbers = set(range(part_start, part_stop)) | {0}
+    else:
+        selected_numbers = set(range(len(parts)))
+    if finalize_only:
+        selected_numbers = set()
+    print(f'stream plan: {len(parts)} parts; selected {len(selected_numbers)}', flush=True)
 
     def raw_path(rec):
         prefix = rec['prefix']
@@ -163,10 +168,17 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         with cf.ThreadPoolExecutor(max_workers=min(8, len(group))) as pool:
             list(pool.map(prepare_features, group))
 
-    # Source integrity is checked on every invocation, including a completed resume.
-    run_batch([], True)
+    # A collector has a binary; a merge-only coordinator may have only archives.
+    if not finalize_only:
+        run_batch([], True)
+    deadline = time.monotonic() + max_hours * 3600 if max_hours else None
     for number, group in enumerate(parts):
-        if number < len(completed):
+        if number not in selected_numbers:
+            continue
+        if deadline is not None and number != 0 and time.monotonic() >= deadline:
+            print('time budget reached; remaining selected parts can be resumed', flush=True)
+            break
+        if number in completed_by_number:
             missing = [rec for rec in group if not token_path(rec).exists()]
             if missing:
                 # Older stream parts kept only fixed 20-token windows. Re-run
@@ -190,6 +202,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                 atomic_json(progress_path, progress)
             discard(group)
             continue
+        part_started = time.monotonic()
         outcomes = run_batch(group, False)
         if any(r['exit'] not in (0, 1) for r in outcomes):
             raise ValueError('simulation crash in part '+str(number))
@@ -230,12 +243,12 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         atomic_npz(out/'radio-parts'/f'{number:05d}.npz', values=np.stack(radios),
                    run_ids=np.asarray([r['prefix'] for r in group]),
                    feature_names=np.asarray(RADIO_FEATURES),
-                   start_s=np.arange(20,119), end_s=np.arange(21,120))
+                   start_s=np.arange(record_start,record_end), end_s=np.arange(record_start+1,record_end+1))
         with np.load(target) as saved:
             if saved['sequences'].shape != (len(ids), 20, len(names)) or set(saved['run_ids']) != set(ids):
                 raise ValueError('token archive failed verification for part '+str(number))
         with np.load(out/'radio-parts'/f'{number:05d}.npz') as saved:
-            if saved['values'].shape != (len(group), 99, len(RADIO_FEATURES)) or set(saved['run_ids']) != set(r['prefix'] for r in group):
+            if saved['values'].shape != (len(group), radio_bins, len(RADIO_FEATURES)) or set(saved['run_ids']) != set(r['prefix'] for r in group):
                 raise ValueError('radio archive failed verification for part '+str(number))
         if manifest['settings'].get('tcpOnly'):
             measurement_dir = out/'tcp-measurements'
@@ -263,12 +276,19 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                 with rtt_source.open('rb') as inp, gzip.open(rtt_temporary, 'wb') as dest:
                     shutil.copyfileobj(inp, dest)
                 os.replace(rtt_temporary, rtt_target)
-        completed.append(dict(number=number, runs=[r['prefix'] for r in group],
+        part_record = dict(number=number, runs=[r['prefix'] for r in group],
                               replicate=group[0]['replicate'], rngRun=rng_of(group[0]),
-                              windows=len(ids)))
+                              windows=len(ids), wallS=round(time.monotonic()-part_started, 2))
+        completed.append(part_record)
+        completed.sort(key=lambda part: part['number'])
+        completed_by_number[number] = part_record
         atomic_json(progress_path, progress)
         discard(group)
         print('stream part', number+1, '/', len(parts), 'saved and raw files removed', flush=True)
+
+    if [part['number'] for part in completed] != list(range(len(parts))):
+        print(f'saved {len(completed)}/{len(parts)} parts; collect remaining parts before finalization', flush=True)
+        return
 
     index = dict(format='sharded-npz-v1', context=10, future=10,
                  splitUnit='matched RNG run', testReplicates=sorted(held_out),
@@ -491,6 +511,7 @@ class RadioWriter:
     """Write the existing radio tensor as one archive per split or bounded shards."""
     def __init__(self, out, manifest, features):
         self.out, self.features = out, features
+        self.record_start, self.record_end = map(int, manifest.get('recordWindowS', [20, 119]))
         self.limit = manifest.get('settings', {}).get('shardRuns', 0)
         self.by_prefix = {rec['prefix']: rec for rec in manifest['runs']}
         _, self.test_rng = split_rng_runs(manifest)
@@ -512,7 +533,8 @@ class RadioWriter:
         path.parent.mkdir(exist_ok=True)
         np.savez_compressed(path, values=np.stack([v for _, v in pending]),
             run_ids=np.array([p for p, _ in pending]), feature_names=np.array(self.features),
-            start_s=np.arange(20,119), end_s=np.arange(21,120))
+            start_s=np.arange(self.record_start,self.record_end),
+            end_s=np.arange(self.record_start+1,self.record_end+1))
         self.index[split].append(dict(path=filename, runs=[p for p, _ in pending]))
         self.buffers[split] = []
 

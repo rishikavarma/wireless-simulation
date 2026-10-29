@@ -163,6 +163,169 @@ A stopped token command resumes from `stream-progress.json`; keep the same batch
 and calibration sizes. Streaming does not produce the raw-data comparison plots
 or report.
 
+### Run streaming parts on several VMs
+
+This streaming mode removes extracted raw metric directories after tokenization.
+The distributed raw workflow below retains compressed copies of every trace.
+
+Use the same repository revision, design settings, campaign name, run prefix,
+`--batch-runs`, and `--calibration-runs` on every VM and on the collection host.
+Each VM plans its own copy of the campaign. Parts are numbered from zero; range
+ends are exclusive. Part zero calibrates the shared token boundaries and is
+automatically generated on every worker, even if its assigned range starts later.
+The merger keeps one copy of part zero. Set `--batch-runs` near `--jobs` so a
+part fills the available cores. The following example uses 64 concurrent runs
+on a 90-core, 354 GiB VM:
+
+```bash
+python3 scripts/dataset/run_dataset.py --preset full --stream \
+  --out-dir results/full-distributed --run-prefix full-distributed --plan
+python3 scripts/dataset/run_dataset.py --stream --run \
+  --out-dir results/full-distributed --jobs 64 \
+  --batch-runs 64 --calibration-runs 64 --part-start 0 --part-stop 1
+python3 scripts/dataset/schedule_stream_parts.py \
+  --campaign results/full-distributed --start 1 --jobs 64 \
+  --batch-runs 64 --calibration-runs 64 --hours 2.4
+```
+
+The scheduler prints an estimated `partStop` using the calibration's 90th
+percentile run time, the job count, and headroom for slower parts. Assign its
+`partStart` through `partStop` to the first VM. For later VMs, start at the
+previous VM's `partStop`; each VM needs its own calibration run. The run command
+for an assigned range is:
+
+```bash
+python3 scripts/dataset/run_dataset.py --stream --run \
+  --out-dir results/full-distributed --jobs 64 \
+  --batch-runs 64 --calibration-runs 64 \
+  --part-start 1 --part-stop STOP --max-hours 2.4
+```
+
+`--max-hours` stops starting new parts at the deadline and lets the current
+part finish. Resume the same range to continue. Check `stream-progress.json`
+for the exact completed part numbers before assigning another VM. Limit `--jobs`
+if memory cannot support one simulation per core.
+
+Retrieve each worker's campaign directory into a separate local directory.
+For example, from a host with the Google Cloud CLI:
+
+```bash
+gcloud compute scp --recurse --zone us-central1-c --project cmps-infraai \
+  instance-20261029-190248:~/wireless-simulation/results/full-distributed \
+  /tmp/worker-1
+```
+
+Plan the same campaign locally, then merge each retrieved worker directory:
+
+```bash
+python3 scripts/dataset/merge_stream_parts.py \
+  --destination results/full-distributed --source /tmp/worker-1
+python3 scripts/dataset/run_dataset.py --stream --run --finalize-only \
+  --out-dir results/full-distributed --batch-runs 64 --calibration-runs 64
+```
+
+Merge all workers before finalizing. The merger rejects differing manifests,
+configuration or source hashes, calibration boundaries, and conflicting part
+files. The finalizer requires every part, then builds train/test indexes and the
+profile-held-out dataset. It runs without ns-3 on the collection host.
+
+### Distributed raw metric collection and local tokenization
+
+Use `scripts/dataset/distributed_raw.sh` when every original simulation trace
+must be retained. Its distributed plan measures **300 seconds per simulation**
+over **20–320 s**, with 15 s warmup, 5 s measurement offset, 1 s traffic margin,
+and 10 s drain. Total simulated time is 331 s. Put one `gcloud compute ssh` command per line in a machine
+file, with an instance, zone, and project. The script assigns all 640 parts of
+the default 40,000-run full preset evenly across those instances. It packages
+the local source and compiled simulator so every worker uses identical bytes.
+With 20 machines, each receives one 2,000-run RNG replicate (32 parts).
+For a 10-hour collection target, start with 20 VMs comparable to the measured
+90-core instance (19 more than the first VM). This is a capacity estimate based
+on local pilot timings, not a deadline guarantee; use `status` to watch actual
+part completion and add machines before deployment if more margin is needed.
+Each worker runs its assigned simulations, keeps their metric CSVs, and writes
+one compressed archive per completed 64-run part. A 60-second heartbeat checks
+for worker failures and restarts the unfinished part, with three retries per part.
+The collection host retrieves archives as parts finish, verifies source and
+configuration hashes, extracts one part at a time, and tokenizes it locally.
+Raw metric CSVs remain in the compressed archives;
+the extracted copies are removed after successful tokenization.
+
+For the macOS collector with **729 GiB available** and a **500 GB peak use
+limit**, use `--short`. It plans 1,000 profiles × 20 RNG replicates =
+**20,000 simulations**, with **60 million measured 100 ms tokens** and
+**3 million nonoverlapping 10-context + 10-future windows**. Plan for **10 VMs
+comparable to the 90-core first instance**, so acquire nine more. This is a
+10-hour capacity estimate, not a guaranteed finish time. The script requires
+400 GiB free on the collector and 70 GiB free on each VM, and stops downloads
+before measured collector use reaches 500 GB. Because trace size varies, the
+20,000-run plan may still need to be reduced if the observed average is high.
+Short and full campaigns have separate output and state directories.
+The short `prepare` step requires at least 10 VM commands so this assignment
+cannot accidentally put all 20,000 simulations on the first VM.
+
+Edit `scripts/dataset/vm-commands.txt`. It already contains the first VM and
+commented space for the remaining SSH commands:
+
+```text
+gcloud compute ssh --zone "us-central1-c" "instance-20261029-190248" --project "cmps-infraai"
+```
+
+On the macOS collector, run the short workflow:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install 'numpy>=1.24' 'matplotlib>=3.5'
+bash scripts/dataset/distributed_raw.sh --short prepare
+bash scripts/dataset/distributed_raw.sh --short check-vms
+bash scripts/dataset/distributed_raw.sh --short deploy
+bash scripts/dataset/distributed_raw.sh --short collect
+```
+
+`all` combines these steps. Deployment runs `check-vms` again and stops before
+launching any worker if an SSH check fails. The completed token dataset is
+compressed as `results/short-distributed-300-20k.tar.gz`; raw metric traces
+remain in the already-compressed
+`results/short-distributed-300-20k-raw-archives/`. Workers delete uncompressed
+raw directories after packing each part. After checksum-verified retrieval,
+the collector acknowledges the part and removes the VM's compressed copy.
+These cleanup steps keep each 100 GB VM from retaining its entire assignment.
+The collector uses Python for command timeouts and a directory lock, so GNU
+`timeout` and `flock` are not required on macOS.
+The repository includes `artifacts/linux-simulator-ns3.48.tar.gz` (about
+21 MiB); `prepare` extracts its Linux binary and libraries on a macOS
+collector when needed, then builds the VM deployment bundle from the current
+source. The VM checks still verify the Linux libraries before simulations.
+
+On the collection host, set `DATASET_STORE_DIR` to a mounted directory with at
+least **2 TiB free**. The current repository filesystem is smaller than that.
+The raw archive directory defaults to
+`DATASET_STORE_DIR/full-distributed-raw-archives`; set
+`RAW_ARCHIVE_DIR` separately if it has at least 1.5 TiB free. Each VM should
+have at least **350 GiB free** for its raw traces and archives.
+Then run:
+
+```bash
+DATASET_STORE_DIR=/mnt/dataset \
+  bash scripts/dataset/distributed_raw.sh all vm-commands.txt
+```
+
+`all` prepares the local plan, deploys and starts the workers, collects completed
+parts continuously, and produces `DATASET_STORE_DIR/full-distributed/default-dataset.json`.
+It also compresses the finished token dataset into
+`DATASET_STORE_DIR/full-distributed.tar.gz`. The original metric CSVs remain
+inside `RAW_ARCHIVE_DIR/worker-*/part-*.tar.gz`.
+Use `prepare`, `deploy`, `status`, and `collect` separately to inspect or resume
+each stage. A disconnected collection shell does not stop a launched worker;
+run `collect` again to continue retrieval and local tokenization. The worker
+bundle includes a prebuilt x86_64 simulator; the VMs must be compatible with
+its system libraries.
+
+Check available storage before deployment with `df -h /mnt/dataset` on the
+collection host and `df -h ~` on each VM. `df` shows available capacity; `du -sh
+/mnt/dataset` shows space already used by the dataset directory.
+
 For one run, `np.load("token-runs/<run-id>.npz")["tokens"]` has shape
 `(number_of_RTT_tokens, number_of_features)`. The archive also has the original
 continuous feature values and timing for every token.
