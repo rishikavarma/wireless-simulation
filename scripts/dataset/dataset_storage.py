@@ -203,7 +203,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
             progress['calibrationTokens'] = len(sample)
             progress['sourceFeatureNames'] = names
             progress['featureNames'] = [
-                name if name == 'base_rtt' else name+'_bucket' for name in names]
+                name if name in ('base_rtt', 'is_udp') else name+'_bucket' for name in names]
             atomic_json(out/'dataset-boundaries.json', edges)
             del sample
         else:
@@ -383,8 +383,9 @@ def vector_tokenize(values, names, edges):
     columns = []
     for j, name in enumerate(names):
         plane = values[:, :, j]
-        columns.append(name if name == 'base_rtt' else name + '_bucket')
-        tokens[:, :, j] = plane if name == 'base_rtt' else np.searchsorted(edges[name], plane, side='right')
+        direct = name in ('base_rtt', 'is_udp')
+        columns.append(name if direct else name + '_bucket')
+        tokens[:, :, j] = plane if direct else np.searchsorted(edges[name], plane, side='right')
         tokens[:, :, j][np.isnan(plane)] = np.nan
     return tokens, columns
 

@@ -7,7 +7,7 @@ Pipeline:
   3. Fit Quantile-N edges on every other metric column (including SINR).
   4. Emit continuous feature CSV + multi-head bucketized CSV + boundaries.
 
-Meta columns (token timing) and base_rtt stay continuous. Other feature
+Meta columns (token timing), base_rtt, and is_udp stay direct values. Other feature
 columns get a ``*_bucket`` index via np.searchsorted(..., side='right'),
 matching UNUM's offline ``bucket_tokenize.py`` (training path).
 TCP loss features reserve class zero for zero loss; their remaining classes
@@ -34,8 +34,8 @@ META_KEYS = ("token", "t_start_s", "t_end_s", "window_s", "n_samples")
 
 
 def is_bucket_feature(name: str) -> bool:
-    """UNUM keeps measured minimum RTT continuous under the base_rtt name."""
-    return name != "base_rtt"
+    """Keep minimum RTT and the binary transport indicator as direct values."""
+    return name not in ("base_rtt", "is_udp")
 
 
 def quantile_boundaries(arr: np.ndarray, num_buckets: int) -> list[float]:
@@ -175,6 +175,11 @@ def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg
     _, dl = read_csv(sinr_dl) if sinr_dl and sinr_dl.exists() else ([], [])
     _, ul = read_csv(sinr_ul) if sinr_ul and sinr_ul.exists() else ([], [])
     tokens = fold(tcp_rows, sage_keys, dl, ul, cfg)
+    transport = cfg.get('application', {}).get('transport', 'tcp')
+    if transport not in ('tcp', 'udp'):
+        raise ValueError(f'unsupported application transport: {transport}')
+    for token in tokens:
+        token['is_udp'] = int(transport == 'udp')
     prefix = tcp_path.name.removesuffix('-tcp.csv')
     kpi_path = tcp_path.parent / f'{prefix}-kpis.csv'
     if cfg.get('metrics', {}).get('physical') is True and not kpi_path.exists():
@@ -229,7 +234,7 @@ def fit_boundaries(
 def apply_boundaries(
     rows: list[dict], feature_keys: list[str], boundaries: dict[str, list[float]]
 ) -> list[dict]:
-    """Copy continuous features and append bucket IDs for all but base_rtt.
+    """Copy direct features and append bucket IDs for quantized features.
     """
     out = []
     for row in rows:
@@ -282,7 +287,7 @@ def write_boundaries(
     with open(path.with_suffix(".json"), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
-    # Preserve positions in the full feature vector; base_rtt has no edges.
+    # Preserve positions in the full feature vector; direct features have no edges.
     pickle_payload = {
         "by_name": {
             name: boundaries.get(name, [])
@@ -434,7 +439,7 @@ def main() -> int:
         bucketed,
         bucket_fields,
         f"# Multi-head quantile-{args.num_buckets} bucketization of collected "
-        "features; base_rtt remains continuous.\n",
+        "features; base_rtt and is_udp remain direct values.\n",
     )
 
     # Compact UNUM-6 view kept for convenience / paper alignment.

@@ -87,6 +87,9 @@ merges the formerly separate baseline and switch profile. Source/load rates,
 queue budgets, movement, bandwidth and attenuation vary together. Orbit altitude
 stays fixed at **800 km**, with 53° inclination and 8° relay spacing; automatic
 relay selection stays enabled in every full-preset configuration.
+Exported token features include `is_udp`: **0 for TCP, 1 for UDP**. This
+run-level input stays binary in continuous features and token windows; it is
+not quantile bucketized.
 
 Expected size is **39.6 million distinct 100 ms time bins** and **1.96 million
 non-overlapping 20-token windows** (10 history + 10 future). These are planned

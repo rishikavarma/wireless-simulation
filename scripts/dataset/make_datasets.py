@@ -103,7 +103,7 @@ def fit_boundaries_on_train(
     """
     boundaries: dict[str, list[float]] = {}
     for j, name in enumerate(feature_names):
-        if name == "base_rtt":
+        if name in ("base_rtt", "is_udp"):
             boundaries[name] = []
             continue
         vals = train_cont[:, :, j].reshape(-1)
@@ -128,8 +128,8 @@ def tokenize_multi(
     cols = []
     for j, name in enumerate(feature_names):
         plane = continuous[:, :, j]
-        if name == "base_rtt":
-            out_names.append("base_rtt")
+        if name in ("base_rtt", "is_udp"):
+            out_names.append(name)
             cols.append(plane.astype(np.float64))
             continue
         out_names.append(f"{name}_bucket")
@@ -522,7 +522,7 @@ def main() -> int:
     )
     for name in feature_names:
         edges = boundaries.get(name, [])
-        if name == "base_rtt":
+        if name in ("base_rtt", "is_udp"):
             print(f"  {name}: continuous (not bucketized)")
         else:
             print(f"  {name}: n_edges={len(edges)} n_buckets={len(edges) + 1}")

@@ -9,7 +9,7 @@ overlapping or non-overlapping windows of length ``context + prediction``
   sequence[:, context:]   — subsequent tokens to predict
 
 Default vector layout is UNUM multi-head style for **all** collected features:
-``base_rtt`` stays continuous; every other feature contributes its bucket index.
+``base_rtt`` and ``is_udp`` stay direct values; other features contribute bucket indices.
 """
 
 from __future__ import annotations
@@ -60,29 +60,29 @@ def build_matrix(
 
     if mode == "buckets":
         bucket_names = [name for name in feature_names if name != "base_rtt"]
-        cols = [f"{name}_bucket" for name in bucket_names]
+        cols = [name if name == "is_udp" else f"{name}_bucket" for name in bucket_names]
         data = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
         for i, row in enumerate(rows):
             for j, name in enumerate(bucket_names):
-                val = row.get(f"{name}_bucket")
-                if val is None:
+                val = row.get(name if name == "is_udp" else f"{name}_bucket")
+                if val is None and name != "is_udp":
                     val = row.get(name)
                 if val is not None:
                     data[i, j] = float(val)
         return data, cols
 
-    # multi: base_rtt continuous, all other features as bucket indices (UNUM).
+    # multi: base_rtt and is_udp direct, other features as bucket indices.
     cols: list[str] = []
     for name in feature_names:
-        if name == "base_rtt":
-            cols.append("base_rtt")
+        if name in ("base_rtt", "is_udp"):
+            cols.append(name)
         else:
             cols.append(f"{name}_bucket")
     data = np.full((len(rows), len(cols)), np.nan, dtype=np.float64)
     for i, row in enumerate(rows):
         for j, name in enumerate(feature_names):
-            if name == "base_rtt":
-                val = row.get("base_rtt")
+            if name in ("base_rtt", "is_udp"):
+                val = row.get(name)
             else:
                 val = row.get(f"{name}_bucket")
                 if val is None:
