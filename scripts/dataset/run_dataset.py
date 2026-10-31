@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Collect the comparison dataset or the broader full dataset, with matched RNG replicates."""
-import argparse,concurrent.futures as cf,copy,hashlib,json,random,re,subprocess,sys,time
+import shutil,argparse,concurrent.futures as cf,copy,hashlib,json,random,re,subprocess,sys,time
 from pathlib import Path
 import campaign_config
 import dataset_presets
@@ -94,7 +94,8 @@ def plan(out,stem,settings=None):
  (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  print('planned',len(runs),'runs',flush=True)
 
-def run(out,jobs,records=None,verify_sources=True,manifest=None):
+def run(out,jobs,records=None,verify_sources=True,manifest=None,allow_failures=False):
+ if jobs < 1:raise ValueError('jobs must be positive')
  if manifest is None:manifest=json.loads((out/'manifest.json').read_text())
  (out/'logs').mkdir(exist_ok=True)
  if verify_sources:
@@ -106,7 +107,8 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None):
   sources['configs']={r['prefix']:hashlib.sha256(Path(r['config']).read_bytes()).hexdigest() for r in manifest['runs']}
   stamp=out/'source-hashes.json'
   if stamp.exists() and json.loads(stamp.read_text())!=sources:raise SystemExit('source changed since run started; use --clean to restart this campaign or select a fresh directory')
-  stamp.write_text(json.dumps(sources,indent=2)+'\n')
+  temporary=stamp.with_suffix('.json.tmp')
+  temporary.write_text(json.dumps(sources,indent=2)+'\n');temporary.replace(stamp)
   for name in sources:
    if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
    snapshot=out/'source-snapshot'/name;snapshot.parent.mkdir(parents=True,exist_ok=True)
@@ -114,22 +116,30 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None):
  def one(rec):
   prefix=rec['prefix'];status=out/'logs'/(prefix+'.json')
   raw_dir=ROOT/'results'/prefix
-  required=[raw_dir/(prefix+'-'+suffix) for suffix in ('tcp.csv','summary.txt','app.txt')]
-  if status.exists() and all(path.exists() for path in required):
-   previous=json.loads(status.read_text())
-   if previous.get('exit') in (0,1):return previous
+  from run_completion import completed_run
+  if completed_run(ROOT,out,rec):return json.loads(status.read_text())
+  # Never let a previous success marker certify a newly interrupted attempt.
+  status.unlink(missing_ok=True)
+  if allow_failures and raw_dir.exists():
+   if raw_dir.is_symlink():raise ValueError('refusing symlinked raw output')
+   shutil.rmtree(raw_dir)
   before=time.monotonic()
   with (out/'logs'/(prefix+'.log')).open('w') as log:
    cfg=json.loads(Path(rec['config']).read_text())
    command=[str(BIN),'--config='+rec['config'],'--RngRun='+str(rec['rngRun'])]+dataset_presets.socket_buffer_arguments(cfg)
-   completed=subprocess.run(command,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+   execution=command
+   if allow_failures:
+    from worker_memory import simulation_limit
+    execution=[sys.executable,str(ROOT/'scripts/dataset/memory_limited_run.py'),str(simulation_limit(jobs))]+command
+   completed=subprocess.run(execution,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
   row={**rec,'exit':completed.returncode,'wallS':round(time.monotonic()-before,2),'command':command}
-  status.write_text(json.dumps(row,indent=2)+'\n')
+  temporary=status.with_suffix('.json.tmp')
+  temporary.write_text(json.dumps(row,indent=2)+'\n');temporary.replace(status)
   print(prefix,'exit',completed.returncode,'seconds',row['wallS'],flush=True)
   return row
  with cf.ThreadPoolExecutor(max_workers=jobs) as pool:executed=list(pool.map(one,records if records is not None else manifest['runs']))
  if records is None:(out/'run-outcomes.json').write_text(json.dumps({'runs':executed},indent=2)+'\n')
- if any(r['exit'] not in (0,1) for r in executed):raise SystemExit('simulation crashes present; inspect run-outcomes.json')
+ if not allow_failures and any(r['exit'] not in (0,1) for r in executed):raise SystemExit('simulation crashes present; inspect run-outcomes.json')
  print('completed',len(executed),'runs; application criteria passed',sum(r['exit']==0 for r in executed),flush=True)
  return executed
 
@@ -182,7 +192,7 @@ def prepare_features(rec):
  if marker.exists() and feature.exists():
   previous=json.loads(marker.read_text())
   if previous.get('signature')==signature and previous.get('featureHash')==hashlib.sha256(feature.read_bytes()).hexdigest():return
- args=['python3',str(ROOT/'scripts/dataset/bucketize_metrics.py'),'--config',rec['config'],'--tcp',str(d/(p+'-tcp.csv')),
+ args=[sys.executable,str(ROOT/'scripts/dataset/bucketize_metrics.py'),'--config',rec['config'],'--tcp',str(d/(p+'-tcp.csv')),
        '--sinr-dl',str(d/(p+'-sinr-dl.csv')),'--sinr-ul',str(d/(p+'-sinr-ul.csv')),'--num-buckets','50']
  out=Path(rec['config']).parent.parent
  with (out/'logs'/(p+'-post.log')).open('w') as log:subprocess.run(args,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,check=True)
@@ -320,7 +330,12 @@ def main():
   if not (0<=a.part_start<a.part_stop<=len(parts)):
    p.error(f'part range must satisfy 0 <= start < stop <= {len(parts)}')
   selected=[rec for group in parts[a.part_start:a.part_stop] for rec in group]
-  run(out,a.jobs,selected,True,manifest)
+  run(out,a.jobs,selected,True,manifest,allow_failures=True)
+  from run_completion import completed_run
+  for retry in range(2):
+   failed=[rec for rec in selected if not completed_run(ROOT,out,rec)]
+   if not failed:break
+   run(out,max(1,a.jobs//(2**(retry+1))),failed,True,manifest,allow_failures=True)
  elif a.run:run(out,a.jobs)
  if a.post:post(out,a.jobs)
  if a.analyze:

@@ -251,37 +251,142 @@ configuration hashes, extracts one part at a time, and tokenizes it locally.
 Raw metric CSVs remain in the compressed archives;
 the extracted copies are removed after successful tokenization.
 
-For the macOS collector with **729 GiB available** and a **500 GB peak use
-limit**, use `--short`. It plans 1,000 profiles × 20 RNG replicates =
-**20,000 simulations**, with **60 million measured 100 ms tokens** and
-**3 million nonoverlapping 10-context + 10-future windows**. Plan for **10 VMs
-comparable to the 90-core first instance**, so acquire nine more. This is a
-10-hour capacity estimate, not a guaranteed finish time. The script requires
-400 GiB free on the collector and 70 GiB free on each VM, and stops downloads
-before measured collector use reaches 500 GB. Because trace size varies, the
-20,000-run plan may still need to be reduced if the observed average is high.
-Short and full campaigns have separate output and state directories.
-The short `prepare` step requires at least 10 VM commands so this assignment
-cannot accidentally put all 20,000 simulations on the first VM.
+The current short campaign runs entirely in GCP: **20,000 simulations**,
+**60 million measured 100 ms tokens**, and **3 million nonoverlapping
+10-context + 10-future windows**. Twenty `n2-standard-48` workers in
+`us-central1-a` each have 48 vCPUs and a 100 GB boot disk. Each receives 16 of
+320 parts and runs at most 48 simulations concurrently.
 
-Edit `scripts/dataset/vm-commands.txt`. It already contains the first VM and
-commented space for the remaining SSH commands:
+The dedicated `dataset-collector` is `n2-highmem-32` (32 vCPUs, 256 GiB RAM),
+with a separate 4 TB balanced persistent disk mounted at `/srv/dataset`.
+Its repository and all raw archives, extracted traces, tokens, temporary files
+and final packaging live at `/srv/dataset/wireless-simulation`. Raw archives
+stay in GCP. A 3.5 TB collection guard and 40 GiB reserve stop retrieval before
+the disk fills. The coordinator's systemd service has a 200 GiB memory-high
+threshold and a 230 GiB memory limit, leaving memory for the OS. An interrupted
+collector can resume; workers retain archives and wait when their disks are low.
+The data disk is retained when the collector VM is deleted.
 
-```text
-gcloud compute ssh --zone "us-central1-c" "instance-20261029-190248" --project "cmps-infraai"
-```
+All nodes share the `default` VPC. Collector-to-worker traffic uses private IPs,
+a dedicated SSH key, a local `dataset` account on each worker, and pinned host
+keys. `dataset-collector-to-workers` permits private SSH between tagged nodes.
+Existing project firewall rules also remain in effect. No user gcloud credentials
+are copied to the collector. Local administration uses IAP.
 
-On the macOS collector, run the short workflow:
+The SSH inventories (`scripts/dataset/vm-commands.txt` and
+`scripts/dataset/vm-commands-private.txt`), private host keys, and resource ID
+manifest (`scripts/dataset/cloud-resources.json`) describe this particular
+fleet. Keep them locally; they are excluded from this change. Save a private
+copy of the resource manifest before replacing this computer, since cleanup
+requires its original VM, disk, and firewall IDs.
+
+To rerun on this **existing staged fleet**, use the commands below from the
+repository root. Install and authenticate `gcloud`, select access to project
+`cmps-infraai`, and keep the local SSH and resource manifest files available.
+The collector already has the Linux simulator bundle, Python environment,
+private SSH configuration, production plan, and worker staging. For a fresh
+fleet, provision and bootstrap machines of the stated sizes, generate both
+inventories and a new resource ID manifest from the new resources, install the
+shutdown helper, then run `prepare`, `stage`, and the readiness check on the
+collector. Old resource IDs must never be reused for cleanup of a new fleet.
+
+On the **collector**, stage and inspect without starting production simulations:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install 'numpy>=1.24' 'matplotlib>=3.5'
-bash scripts/dataset/distributed_raw.sh --short prepare
-bash scripts/dataset/distributed_raw.sh --short check-vms
-bash scripts/dataset/distributed_raw.sh --short deploy
-bash scripts/dataset/distributed_raw.sh --short collect
+cd /srv/dataset/wireless-simulation
+bash scripts/dataset/cloud_dataset.sh prepare
+bash scripts/dataset/cloud_dataset.sh stage
+bash scripts/dataset/cloud_dataset.sh check-vms
 ```
+
+From this local machine, use the short-lived controller commands:
+
+```bash
+python3 scripts/dataset/cloud_control.py start
+python3 scripts/dataset/cloud_control.py status
+python3 scripts/dataset/cloud_control.py status --workers
+python3 scripts/dataset/cloud_control.py status --wake
+python3 scripts/dataset/cloud_control.py fetch
+```
+
+`start` returns after systemd accepts the remote job; no long-lived local
+connection is required. Workers also run detached under `nohup`. Closing this
+terminal, sleeping this computer, or losing its network does not stop remote
+computation or collection. If the launch connection drops before acknowledgement,
+check status or repeat `start`; the service name and worker PID checks prevent
+duplicate jobs. No production run is launched by `status`.
+
+`status` reads VM states, collector service state, collected/tokenized part and
+run counts, free disk space and recent journal messages. `--workers` adds live
+worker health, heartbeat and assigned ranges. If the collector has stopped,
+plain status does not wake it; `status --wake` briefly starts it, reads the saved
+completion record, then stops it again. `fetch` downloads only the finalized
+archive and leaves the collector stopped.
+
+Alternatively, explicitly start the campaign on the collector:
+
+```bash
+bash scripts/dataset/cloud_dataset.sh start
+journalctl -u wireless-dataset -f
+```
+
+`stage` installs the identical simulator and source bundle on every worker and
+checks shared libraries. `start` launches workers and cloud collection under
+systemd. The four-run smoke check exercises private transfers, raw checksum
+verification, tokenization, profile splitting and packaging entirely on the
+VMs, separately from production output. Before starting a new campaign, inspect
+`status` and verify there is no active or already completed campaign. A completed
+campaign needs its own output directory or new fleet; `start` will not overwrite it.
+
+Successful cloud finalization publishes the archive checksum and
+`results/cloud-complete.json`, then schedules shutdown of the twenty workers
+and finally the collector with a **30-minute grace period**. The grace starts
+only after final packaging, checksum verification and the completion receipt.
+Change it when launching with `cloud_control.py start --shutdown-grace-minutes 60`.
+Status includes the grace period and scheduled shutdown time. Each guest flushes its disks before shutdown; the
+persistent disks and final dataset are retained. A failure before finalization
+leaves the fleet running for recovery. Email notifications are disabled. Push notifications use ntfy without email
+credentials or GCP Monitoring permissions. Run `cloud_control.py notifications`
+locally to get the subscription URL, install the ntfy phone app, and subscribe to
+that topic on `https://ntfy.sh`. Topic names are shared secrets; the setup command
+generates a long random name and keeps it in the collector's private config.
+After subscribing, run `cloud_control.py notification-test` to publish a clearly
+labeled test message. The collector publishes a completion notification after
+packaging/checksum verification and before scheduling its shutdown grace period.
+It reports completed counts, whether output is partial, and compressed size;
+no dataset contents are sent. Your laptop can be offline. Notification failure
+does not delete the dataset or prevent scheduled shutdown. `stop_cloud_fleet.py --dry-run` verifies
+the exact sudo permissions without scheduling shutdown. The helper grants the
+worker account only the fixed check, schedule, and cancel operations.
+
+Only after cloud finalization, run this command on this computer:
+
+```bash
+python3 scripts/dataset/fetch_cloud_dataset.py
+```
+
+It restarts the stopped collector when needed and stops it again after a
+verified download. It downloads only `short-distributed-300-20k.tar.gz` to `local/final-dataset/`,
+verifies its SHA-256 and renames the temporary download. It refuses an archive
+larger than 490 GB and requires another 10 GB free locally. After verification, `fetch` saves a `.verified.json` receipt beside the archive.
+To preview permanent cleanup from this machine, then execute it after download:
+
+```bash
+python3 scripts/dataset/delete_cloud_fleet.py
+python3 scripts/dataset/delete_cloud_fleet.py --execute
+```
+
+For a custom directory, pass `--archive /path/to/short-distributed-300-20k.tar.gz`.
+Execute rehashes the local archive and requires its verified-download receipt.
+It deletes exactly the 21 dataset VMs, their 22 pinned persistent disks
+(including the retained collector disk and all raw archives), and the dedicated
+collector-to-workers firewall rule. It preserves the shared VPC and unrelated
+resources. Resource IDs in the local `cloud-resources.json` prevent deleting replacements
+with reused names. Cleanup is separate from fetch, never automatic, and can be
+resumed after partial deletion. The local archive and cleanup report remain.
+
+Nothing continuously collects on this computer. The former optional macOS
+collector disk image is not used by this cloud workflow.
 
 `all` combines these steps. Deployment runs `check-vms` again and stops before
 launching any worker if an SSH check fails. The completed token dataset is
@@ -316,6 +421,31 @@ parts continuously, and produces `DATASET_STORE_DIR/full-distributed/default-dat
 It also compresses the finished token dataset into
 `DATASET_STORE_DIR/full-distributed.tar.gz`. The original metric CSVs remain
 inside `RAW_ARCHIVE_DIR/worker-*/part-*.tar.gz`.
+
+Workers isolate each simulation with a Linux address-space limit: 70% of
+currently available RAM (also respecting cgroup headroom), divided by the active
+concurrency. Core dumps are disabled. A simulation exits if its coordinator dies.
+Each completed run gets an atomic status file. Interrupted runs are retried twice
+at lower concurrency; persistent failures are excluded as whole runs, without
+padding or treating truncated time series as complete observations.
+
+Every raw part is sealed with its completed and omitted run IDs, including empty
+parts. Surviving runs are archived and checksummed before raw cleanup. If the
+worker itself repeatedly dies, the collector lowers its concurrency and then
+launches a sealing pass over its remaining assignment. A failure to access or
+seal a worker still stops collection rather than silently claiming its data was
+recovered.
+
+Finalization consolidates surviving whole runs and writes
+`completion-summary.json` with the planned count, retained count and omitted
+IDs. The original manifest stays intact; dataset indexes and `default-dataset.json`
+mark partial output explicitly. Profile splits permit unequal replicate coverage
+for partial datasets and refit boundaries using training profiles only. If fewer
+than two profiles survive, the RNG layout is retained as the default. If no
+training calibration run survives, the result is explicitly marked raw-only;
+completed raw archives remain available, and no training dataset is fabricated.
+The same bounded collector filesystem applies during recovery and consolidation.
+
 Use `prepare`, `deploy`, `status`, and `collect` separately to inspect or resume
 each stage. A disconnected collection shell does not stop a launched worker;
 run `collect` again to continue retrieval and local tokenization. The worker

@@ -12,6 +12,7 @@ import numpy as np
 
 from dataset_presets import is_test_run, rng_of, split_rng_runs, test_replicates
 from stream_parts import planned_parts
+from run_completion import sealed_parts
 
 
 def atomic_json(path, value):
@@ -84,6 +85,20 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
     train_rng, test_rng = split_rng_runs(manifest)
     held_out = test_replicates(manifest)
     parts, chosen = planned_parts(manifest, batch_runs, calibration_runs)
+    parts = sealed_parts(out, parts)
+    # If all parts are sealed but no training run survived, preserve raw archives
+    # and report the outcome without inventing calibration or a training dataset.
+    if (all((out/'sealed-parts'/f'{i:05d}.json').exists() for i in range(len(parts)))
+            and not any(not is_test_run(rec, test_rng) for group in parts for rec in group)):
+        retained = {rec['prefix'] for group in parts for rec in group}
+        atomic_json(out/'completion-summary.json', dict(partial=True,
+            plannedRuns=len(runs), completedRuns=len(retained),
+            completedRunIds=[rec['prefix'] for rec in runs if rec['prefix'] in retained],
+            omittedRunIds=[rec['prefix'] for rec in runs if rec['prefix'] not in retained],
+            policy='completed raw runs retained; no training calibration survived'))
+        atomic_json(out/'default-dataset.json', dict(status='raw-only-no-training-calibration',
+            partial=True, completion='completion-summary.json'))
+        return
     count = len(chosen)
     calibration_ids = {r['prefix'] for r in chosen}
 
@@ -93,6 +108,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                     parts=[])
     progress = json.loads(progress_path.read_text()) if progress_path.exists() else expected
     progress.setdefault('tokenRuns', {})
+    progress.setdefault('emptyParts', [])
     for key in ('format', 'batchRuns', 'calibrationRuns', 'calibrationIds'):
         if progress[key] != expected[key]:
             raise ValueError('stream settings changed; resume with the original batch and calibration sizes')
@@ -202,17 +218,28 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                 atomic_json(progress_path, progress)
             discard(group)
             continue
+        if not group:
+            if number not in progress['emptyParts']:
+                progress['emptyParts'].append(number)
+                progress['emptyParts'].sort()
+                atomic_json(progress_path, progress)
+            continue
         part_started = time.monotonic()
         outcomes = run_batch(group, False)
         if any(r['exit'] not in (0, 1) for r in outcomes):
             raise ValueError('simulation crash in part '+str(number))
         prepare_group(group)
         paths = [raw_path(r)/(r['prefix']+'-features.csv') for r in group]
-        if number == 0:
+        if not (out/'dataset-boundaries.json').exists():
+            if any(is_test_run(rec, test_rng) for rec in group):
+                # A later training part may provide calibration; revisit this part
+                # after all archives arrive rather than fitting on held-out data.
+                continue
             sample, names, ids, _ = load_run_windows(paths, seq_len=1, stride=1)
-            if set(ids) != calibration_ids:
+            if set(ids) != {rec['prefix'] for rec in group}:
                 raise ValueError('calibration run has no feature tokens')
             edges = fit_boundaries_on_train(sample, names, 50)
+            progress['usedCalibrationIds'] = [rec['prefix'] for rec in group]
             progress['calibrationTokens'] = len(sample)
             progress['sourceFeatureNames'] = names
             progress['featureNames'] = [
@@ -286,8 +313,22 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         discard(group)
         print('stream part', number+1, '/', len(parts), 'saved and raw files removed', flush=True)
 
-    if [part['number'] for part in completed] != list(range(len(parts))):
+    if sorted([part['number'] for part in completed] + progress['emptyParts']) != list(range(len(parts))):
         print(f'saved {len(completed)}/{len(parts)} parts; collect remaining parts before finalization', flush=True)
+        return
+
+    retained_ids = {prefix for part in completed for prefix in part['runs']}
+    planned_runs = runs
+    runs = [rec for rec in runs if rec['prefix'] in retained_ids]
+    completion = dict(partial=len(runs) != len(planned_runs),
+                      plannedRuns=len(planned_runs), completedRuns=len(runs),
+                      completedRunIds=[rec['prefix'] for rec in runs],
+                      omittedRunIds=[rec['prefix'] for rec in planned_runs if rec['prefix'] not in retained_ids],
+                      policy='retain completed whole runs only; exclude interrupted trajectories')
+    atomic_json(out/'completion-summary.json', completion)
+    if not runs:
+        atomic_json(out/'default-dataset.json', dict(status='no-completed-runs',
+                    completion='completion-summary.json', partial=True))
         return
 
     index = dict(format='sharded-npz-v1', context=10, future=10,
@@ -297,7 +338,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                  source_feature_names=progress['sourceFeatureNames'],
                  feature_names=progress['featureNames'],
                  quantileFit=dict(method='stratified calibration runs from training replicate',
-                                  runIds=progress['calibrationIds'],
+                                  runIds=progress.get('usedCalibrationIds', progress['calibrationIds']),
                                   seenTrainTokens=progress['calibrationTokens']), splits={})
     radio_index = dict(format='sharded-radio-npz-v1', feature_names=RADIO_FEATURES, splits={})
     for split, is_test in [('train', False), ('test', True)]:
@@ -327,6 +368,8 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                 raise ValueError('missing radio archive for part '+str(number))
             radio_index['splits'][split].append(dict(path=radio_file, runs=part['runs']))
         index['splits'][split] = entry
+    index['partial'] = completion['partial']
+    index['completion'] = 'completion-summary.json'
     atomic_json(out/'dataset-index.json', index)
     atomic_json(out/'token-runs-index.json', dict(
         format='per-run-rtt-tokens-v1', features=progress['featureNames'],
@@ -356,6 +399,11 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         testWindows=index['splits']['test']['windows']))
     # Preserve the streamed RNG split for seed-generalization diagnostics, but
     # expose a profile-held-out dataset as the default training artifact.
+    if len({rec['case'] for rec in runs}) < 2:
+        atomic_json(out/'default-dataset.json', dict(index='dataset-index.json',
+                    splitUnit='matched RNG run', partial=completion['partial'],
+                    completion='completion-summary.json'))
+        return
     from materialize_windows import materialize_by_profile
     profile_out = out/'windows-profile-c10-p10-s20'
     profile_index = profile_out/'dataset-index.json'
@@ -374,7 +422,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
     atomic_json(out/'default-dataset.json', dict(
         path='windows-profile-c10-p10-s20',
         index='windows-profile-c10-p10-s20/dataset-index.json',
-        splitUnit='profile'))
+        splitUnit='profile', partial=completion['partial'], completion='completion-summary.json'))
     print('streamed', len(runs), 'runs into train/test indexed shards', flush=True)
 
 

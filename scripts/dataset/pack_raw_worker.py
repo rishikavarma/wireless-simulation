@@ -8,12 +8,14 @@ import tarfile
 from pathlib import Path
 
 from stream_parts import planned_parts
+from run_completion import completed_run
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--allow-partial', action='store_true', help='seal completed runs and record omissions')
     parser.add_argument('--campaign', type=Path, required=True)
     parser.add_argument('--part-start', type=int, required=True)
     parser.add_argument('--part-stop', type=int, required=True)
@@ -46,7 +48,8 @@ def main():
     (out/'worker-assignment.json').write_text(json.dumps(worker, indent=2)+'\n')
     total = 0
     for number in range(args.part_start, args.part_stop):
-        group = parts[number]
+        planned = parts[number]
+        group = [rec for rec in planned if completed_run(ROOT, campaign, rec)] if args.allow_partial else planned
         for rec in group:
             prefix = rec['prefix']
             if not prefix or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.'
@@ -62,7 +65,9 @@ def main():
             if any(path.is_symlink() for path in raw.rglob('*')):
                 raise ValueError('symlink found in raw output: '+prefix)
         assignment = {**worker, 'partStart': number, 'partStop': number+1,
-                      'runs': [rec['prefix'] for rec in group]}
+                      'runs': [rec['prefix'] for rec in group],
+                      'omittedRuns': [rec['prefix'] for rec in planned if rec not in group],
+                      'omissionReason': 'simulation interrupted, memory-limited, or not completed after bounded retries'}
         assignment_path = out/f'raw-assignment-{number}-{number+1}.json'
         assignment_path.write_text(json.dumps(assignment, indent=2)+'\n')
         archive = out/f'part-{number:05d}.tar.gz'

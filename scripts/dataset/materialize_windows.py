@@ -24,6 +24,13 @@ def materialize(dataset_dir, out_dir, context, prediction, stride):
     manifest = json.loads((dataset_dir/'manifest.json').read_text())
     token_index = json.loads((dataset_dir/'token-runs-index.json').read_text())
     runs = manifest['runs']
+    completion_path = dataset_dir/'completion-summary.json'
+    partial = False
+    if completion_path.exists():
+        completion = json.loads(completion_path.read_text())
+        partial = completion['partial']
+        retained = set(completion['completedRunIds'])
+        runs = [run for run in runs if run['prefix'] in retained]
     available = token_index['runs']
     if set(available) != {run['prefix'] for run in runs}:
         raise ValueError('per-run token archive is incomplete')
@@ -87,6 +94,13 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     manifest = json.loads((dataset_dir/'manifest.json').read_text())
     token_index = json.loads((dataset_dir/'token-runs-index.json').read_text())
     runs = manifest['runs']
+    completion_path = dataset_dir/'completion-summary.json'
+    partial = False
+    if completion_path.exists():
+        completion = json.loads(completion_path.read_text())
+        partial = completion['partial']
+        retained = set(completion['completedRunIds'])
+        runs = [run for run in runs if run['prefix'] in retained]
     available = token_index['runs']
     if set(available) != {run['prefix'] for run in runs}:
         raise ValueError('per-run token archive is incomplete')
@@ -96,7 +110,7 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     if len(by_case) < 2:
         raise ValueError('profile split needs at least two configurations')
     expected_rng = {rng_of(run) for run in runs}
-    if any({rng_of(run) for run in group} != expected_rng for group in by_case.values()):
+    if not partial and any({rng_of(run) for run in group} != expected_rng for group in by_case.values()):
         raise ValueError('each profile must have the same RNG replicate set')
     seed = manifest['settings'].get('designSeed', 0) if seed is None else seed
     previous_path = out_dir/'dataset-index.json'
@@ -157,6 +171,7 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     index = dict(format='sharded-npz-v1', sourceDataset=str(dataset_dir.resolve()),
                  context=context, future=prediction, windowStride=stride,
                  splitUnit='profile', splitSeed=seed, testFraction=test_fraction,
+                 partial=partial,
                  trainCases=sorted(set(by_case)-test_cases), testCases=sorted(test_cases),
                  source_feature_names=source_names, feature_names=columns,
                  quantileFit=dict(method='uniform random-priority sample of training profile tokens',

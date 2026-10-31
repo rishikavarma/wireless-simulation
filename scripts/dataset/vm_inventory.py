@@ -19,6 +19,7 @@ def parse(path):
             raise ValueError(f'line {number}: expected a gcloud compute ssh command')
         values = {}
         positionals = []
+        transport = "direct"
         tail = args[3:]
         i = 0
         while i < len(tail):
@@ -32,6 +33,11 @@ def parse(path):
                 values['--zone'] = token.split('=', 1)[1]
             elif token.startswith('--project='):
                 values['--project'] = token.split('=', 1)[1]
+            elif token in ('--tunnel-through-iap', '--internal-ip'):
+                selected = 'iap' if token == '--tunnel-through-iap' else 'internal'
+                if transport != 'direct' and transport != selected:
+                    raise ValueError(f'line {number}: conflicting SSH transports')
+                transport = selected
             elif token.startswith('-'):
                 raise ValueError(f'line {number}: unsupported flag {token}')
             else:
@@ -48,7 +54,7 @@ def parse(path):
             raise ValueError(f'line {number}: invalid project')
         if any(item[0] == instance for item in machines):
             raise ValueError(f'line {number}: duplicate instance')
-        machines.append((instance, zone, project))
+        machines.append((instance, zone, project, transport))
     if not machines:
         raise ValueError('inventory is empty')
     return machines
@@ -66,10 +72,10 @@ def main():
     machines = parse(args.commands)
     if len(machines) > len(parts):
         parser.error('more machines than stream parts')
-    for index, (instance, zone, project) in enumerate(machines):
+    for index, (instance, zone, project, transport) in enumerate(machines):
         start = index*len(parts)//len(machines)
         stop = (index+1)*len(parts)//len(machines)
-        print('\t'.join(map(str, (instance, zone, project, start, stop))))
+        print('\t'.join(map(str, (instance, zone, project, start, stop, transport))))
 
 
 if __name__ == '__main__':

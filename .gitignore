@@ -8,6 +8,10 @@ ns-3-dev/
 /data/
 /datasets/
 /local/
+/scripts/dataset/cloud-resources.json
+/scripts/dataset/collector-commands.txt
+/scripts/dataset/vm-commands-private.txt
+/codex-session-*.md
 
 # Optional downstream model training is outside the dataset collection workflow.
 /embedding/

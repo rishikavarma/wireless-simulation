@@ -8,6 +8,7 @@ import tarfile
 from pathlib import Path, PurePosixPath
 
 from stream_parts import planned_parts
+from run_completion import validate_membership
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,9 +56,10 @@ def unpack(campaign, archive, source_hashes_path):
         start, stop = assignment['partStart'], assignment['partStop']
         if not 0 <= start < stop <= len(parts):
             raise ValueError('invalid assigned part range')
-        run_ids = [rec['prefix'] for group in parts[start:stop] for rec in group]
-        if assignment['runs'] != run_ids:
-            raise ValueError('archive run list differs from local plan')
+        group = [rec for group in parts[start:stop] for rec in group]
+        validate_membership(group, assignment)
+        if stop != start+1:raise ValueError('expected a single sealed part')
+        run_ids = assignment['runs']
         hashes = json.loads(source_hashes_path.read_text())
         source_target = campaign/'source-hashes.json'
         if source_target.exists():
@@ -110,6 +112,13 @@ def unpack(campaign, archive, source_hashes_path):
                 incoming.unlink()
             else:
                 incoming.replace(target)
+    sealed = campaign/'sealed-parts'/f'{start:05d}.json'
+    sealed.parent.mkdir(exist_ok=True)
+    if sealed.exists() and json.loads(sealed.read_text()) != assignment:
+        raise ValueError('sealed part membership changed')
+    temporary = sealed.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(assignment, indent=2)+'\n')
+    temporary.replace(sealed)
     print(f'unpacked {len(run_ids)} raw runs from parts [{start}, {stop})')
     return assignment
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: distributed_raw.sh [--short] {all|prepare|check-vms|deploy|collect|status} [VM_COMMANDS_FILE]" >&2
+    echo "usage: distributed_raw.sh [--short] {all|prepare|check-vms|stage|start|deploy|collect|status} [VM_COMMANDS_FILE]" >&2
     exit 2
 }
 mode=full
@@ -26,6 +26,26 @@ else
     replicates=20
     min_free_gib=2048
     archive_min_free_gib=1536
+fi
+collector_location=${DATASET_COLLECTOR:-cloud}
+collector_cap_gb=500
+if [[ $collector_location == cloud ]]; then
+    [[ $(uname -s) == Linux ]] || { echo "run this on the Linux collector using cloud_dataset.sh" >&2; exit 2; }
+    collector_cap_gb=${COLLECTOR_MAX_GB:-3500}
+    min_free_gib=2048
+    archive_min_free_gib=2048
+fi
+if [[ $mode == short && $collector_location == local ]]; then
+    # Keep archives, extraction, tokens, temporary files and final package on one
+    # fixed-capacity filesystem. ENOSPC prevents crossing the local storage cap.
+    [[ ${DATASET_STORE_DIR:-$root/results} == "$root/results" &&
+       ${RAW_ARCHIVE_DIR:-$root/results/$campaign-raw-archives} == "$root/results/$campaign-raw-archives" ]] || {
+        echo "short mode requires its bounded results filesystem; external store overrides are unsupported" >&2
+        exit 2
+    }
+    python3 scripts/dataset/short_storage.py
+    export TMPDIR="$root/results/tmp"
+    mkdir -p "$TMPDIR"
 fi
 store_root=${DATASET_STORE_DIR:-$root/results}
 campaign_dir="$store_root/$campaign"
@@ -52,19 +72,19 @@ collector_usage_kib() {
 }
 
 check_collector_cap() {
-    if [[ $mode == short ]]; then
+    if [[ $mode == short || $collector_location == cloud ]]; then
         local used_kib
         used_kib=$(collector_usage_kib)
-        if (( used_kib >= 488281250 - 40 * 1024 * 1024 )); then
-            echo "collector is within 40 GiB of its 500 GB peak cap; stopping downloads" >&2
+        if (( used_kib >= collector_cap_gb * 1000000000 / 1024 - 40 * 1024 * 1024 )); then
+            echo "collector is within 40 GiB of its ${collector_cap_gb} GB peak cap; stopping downloads" >&2
             return 1
         fi
     fi
 }
 
 retrieved_count() {
-    local count=0 instance zone project start stop part marker archive worker_dir
-    while IFS=$'\t' read -r instance zone project start stop; do
+    local count=0 instance zone project start stop transport part marker archive worker_dir
+    while IFS=$'\t' read -r instance zone project start stop transport; do
         worker_dir="$archive_dir/worker-$start-$stop"
         for (( part=start; part<stop; part++ )); do
             marker=$(printf '%s/part-%05d.done' "$worker_dir" "$part")
@@ -136,24 +156,42 @@ PY
     cat "$ranges"
 }
 
+# The sixth inventory column selects transport; older five-column plans use direct SSH.
+vm_gcloud() {
+    local seconds=$1 operation=$2
+    shift 2
+    case ${transport:-direct} in
+        iap) run_limited "$seconds" gcloud compute "$operation" --tunnel-through-iap "$@" ;;
+        internal) run_limited "$seconds" python3 scripts/dataset/private_transport.py "$operation" "$@" ;;
+        direct) run_limited "$seconds" gcloud compute "$operation" "$@" ;;
+        *) echo "unknown VM transport: $transport; run prepare again" >&2; return 2 ;;
+    esac
+}
+
 check_ready() {
     [[ -s "$ranges" && -s "$bundle" ]] || {
         echo "run prepare first" >&2
         exit 2
     }
+    if ! awk -F "\t" '$6 != "internal" {exit 1}' "$ranges"; then
     command -v gcloud >/dev/null || {
         echo "gcloud is not installed in this shell" >&2
         exit 2
     }
+    fi
 }
 
 check_vms() {
     check_ready
-    local instance zone project start stop failures=0 remote cores free_kib remote_min_gib
-    if [[ $mode == short ]]; then remote_min_gib=70; else remote_min_gib=300; fi
-    while IFS=$'\t' read -r instance zone project start stop; do
+    local instance zone project start stop transport failures=0 remote cores free_kib remote_min_gib remote_min_cpus
+    if [[ $mode == short ]]; then
+        remote_min_gib=70; remote_min_cpus=32
+    else
+        remote_min_gib=300; remote_min_cpus=64
+    fi
+    while IFS=$'\t' read -r instance zone project start stop transport; do
         echo "checking SSH: $instance ($zone, $project)"
-        if ! remote=$(run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
+        if ! remote=$(vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
             --command='printf "cores="; nproc; printf "free_kib="; df -Pk ~ | awk "NR==2 {print \$4}"'); then
             echo "SSH check failed: $instance" >&2
             failures=$((failures+1))
@@ -163,8 +201,8 @@ check_vms() {
         cores=$(printf '%s\n' "$remote" | sed -n 's/^cores=//p' | tail -n 1)
         free_kib=$(printf '%s\n' "$remote" | sed -n 's/^free_kib=//p' | tail -n 1)
         if [[ ! $cores =~ ^[0-9]+$ || ! $free_kib =~ ^[0-9]+$ ]] ||
-           (( cores < 64 || free_kib < remote_min_gib * 1024 * 1024 )); then
-            echo "VM $instance needs at least 64 cores and $remote_min_gib GiB free" >&2
+           (( cores < remote_min_cpus || free_kib < remote_min_gib * 1024 * 1024 )); then
+            echo "VM $instance needs at least $remote_min_cpus vCPUs and $remote_min_gib GiB free" >&2
             failures=$((failures+1))
         fi
     done < "$ranges"
@@ -172,23 +210,35 @@ check_vms() {
     echo "all VMs are accessible"
 }
 
-deploy_one() {
-    local instance=$1 zone=$2 project=$3 start=$4 stop=$5
+stage_one() {
+    local instance=$1 zone=$2 project=$3 start=$4 stop=$5 transport=${6:-direct}
     local remote_bundle="${instance}:~/wireless-simulation-worker-bundle.tar.gz"
-    run_limited 1800 gcloud compute scp --zone "$zone" --project "$project" \
+    vm_gcloud 1800 scp --zone "$zone" --project "$project" \
         "$bundle" "$remote_bundle"
-    run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
+    vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
         --command="mkdir -p ~/wireless-simulation-worker && tar -xzf ~/wireless-simulation-worker-bundle.tar.gz -C ~/wireless-simulation-worker"
-    run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
-        --command="bash ~/wireless-simulation-worker/scripts/dataset/launch_worker.sh $start $stop 64 $campaign $mode"
-    echo "launched $instance parts [$start, $stop)"
+    vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
+        --command="cd ~/wireless-simulation-worker && export LD_LIBRARY_PATH=\"\$PWD/ns-3-dev/build/lib\" && test -x ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized && ldd ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized > /tmp/dataset-libraries.txt && ! grep 'not found' /tmp/dataset-libraries.txt"
+    local plan_args=""
+    if [[ $mode == short ]]; then plan_args="--profile-count 1000 --replicates 20"; fi
+    vm_gcloud 300 ssh --zone "$zone" --project "$project" "$instance" \
+        --command="cd ~/wireless-simulation-worker && (test -f results/$campaign/manifest.json || python3 scripts/dataset/run_dataset.py --preset full --stream --observation-seconds 300 --out-dir results/$campaign --run-prefix $campaign --plan $plan_args)"
+    echo "staged $instance parts [$start, $stop); no simulations started"
 }
 
-deploy() {
+start_workers() {
+    check_vms
+    while IFS=$'\t' read -r instance zone project start stop transport; do
+        vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
+            --command="bash ~/wireless-simulation-worker/scripts/dataset/launch_worker.sh $start $stop 64 $campaign $mode"
+    done < "$ranges"
+}
+
+stage() {
     check_vms
     local pids=()
-    while IFS=$'\t' read -r instance zone project start stop; do
-        deploy_one "$instance" "$zone" "$project" "$start" "$stop" \
+    while IFS=$'\t' read -r instance zone project start stop transport; do
+        stage_one "$instance" "$zone" "$project" "$start" "$stop" "${transport:-direct}" \
             > "$state_dir/deploy-$start-$stop.log" 2>&1 &
         pids+=("$!")
         if (( ${#pids[@]} >= 4 )); then
@@ -197,7 +247,7 @@ deploy() {
         fi
     done < "$ranges"
     for pid in "${pids[@]}"; do wait "$pid"; done
-    echo "all workers launched; use status or collect to follow their jobs"
+    echo "all workers staged; use start to launch simulations"
 }
 
 status() {
@@ -214,9 +264,9 @@ PY
         echo "local raw archives: $(retrieved_count) parts retrieved"
         df -h "$archive_dir"
     fi
-    while IFS=$'\t' read -r instance zone project start stop; do
+    while IFS=$'\t' read -r instance zone project start stop transport; do
         echo "=== $instance parts [$start, $stop) ==="
-        run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
+        vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
             --command="bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh $start $stop $campaign" || true
     done < "$ranges"
 }
@@ -273,10 +323,10 @@ PY
             wait "$tokenizer_pid"
             break
         fi
-        while IFS=$'\t' read -r instance zone project start stop; do
+        while IFS=$'\t' read -r instance zone project start stop transport; do
             worker_dir="$archive_dir/worker-$start-$stop"
             mkdir -p "$worker_dir"
-            if ! remote=$(run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
+            if ! remote=$(vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
                 --command="bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh $start $stop $campaign" \
                 2>> "$state_dir/heartbeat-errors.log"); then
                 echo "heartbeat connection failed for $instance; retrying" >&2
@@ -301,7 +351,7 @@ PY
                         marker=$(printf '%s/part-%05d.done' "$worker_dir" "$part")
                         if [[ ! -s "$archive" || ! -f "$marker" ]]; then
                             if [[ ! -s "$worker_dir/source-hashes.json" ]]; then
-                                if ! run_limited 1800 gcloud compute scp --zone "$zone" --project "$project" \
+                                if ! vm_gcloud 1800 scp --zone "$zone" --project "$project" \
                                     "${instance}:~/wireless-simulation-worker/results/$campaign/worker-$start-$stop/source-hashes.json" \
                                     "$worker_dir/source-hashes.json.incoming"; then
                                     echo "source-hash transfer failed for $instance; retrying" >&2
@@ -310,13 +360,13 @@ PY
                                 mv "$worker_dir/source-hashes.json.incoming" "$worker_dir/source-hashes.json"
                             fi
                             check_collector_cap
-                            if ! run_limited 120 gcloud compute scp --zone "$zone" --project "$project" \
+                            if ! vm_gcloud 120 scp --zone "$zone" --project "$project" \
                                 "${instance}:~/wireless-simulation-worker/results/$campaign/worker-$start-$stop/part-$(printf '%05d' "$part").done" \
                                 "$marker.incoming"; then
                                 echo "part $part marker transfer failed from $instance; retrying" >&2
                                 continue
                             fi
-                            if ! run_limited 1800 gcloud compute scp --zone "$zone" --project "$project" \
+                            if ! vm_gcloud 1800 scp --zone "$zone" --project "$project" \
                                 "${instance}:~/wireless-simulation-worker/results/$campaign/worker-$start-$stop/part-$(printf '%05d' "$part").tar.gz" \
                                 "$archive.incoming"; then
                                 echo "part $part transfer failed from $instance; retrying" >&2
@@ -332,7 +382,7 @@ PY
                         fi
                         if [[ -s "$archive" && -f "$marker" ]]; then
                             remote_part="~/wireless-simulation-worker/results/$campaign/worker-$start-$stop/part-$(printf '%05d' "$part")"
-                            if ! run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
+                            if ! vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
                                 --command="touch ${remote_part}.ack && rm -f ${remote_part}.tar.gz ${remote_part}.done"; then
                                 echo "remote cleanup failed for part $part on $instance; retrying" >&2
                             fi
@@ -345,14 +395,21 @@ PY
                 retries_file="$state_dir/retries-$start-$stop-$current"
                 retries=$(cat "$retries_file" 2>/dev/null || echo 0)
                 if (( retries >= 3 )); then
-                    echo "worker $instance failed after three restarts; inspect its log" >&2
-                    touch "$state_dir/monitor.failed"
-                    exit 1
+                    echo "worker $instance repeatedly interrupted; sealing completed runs" >&2
+                    if (( retries >= 4 )); then
+                        echo "worker could not seal its results; inspect its log" >&2
+                        touch "$state_dir/monitor.failed"
+                        exit 1
+                    fi
+                    echo 4 > "$retries_file"
+                    vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
+                        --command="bash ~/wireless-simulation-worker/scripts/dataset/launch_worker.sh $start $stop 1 $campaign $mode seal"
+                    continue
                 fi
                 echo "$((retries+1))" > "$retries_file"
                 echo "restarting $instance at unfinished part; attempt $((retries+1))"
-                run_limited 120 gcloud compute ssh --zone "$zone" --project "$project" "$instance" \
-                    --command="bash ~/wireless-simulation-worker/scripts/dataset/launch_worker.sh $start $stop 64 $campaign $mode"
+                vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
+                    --command="bash ~/wireless-simulation-worker/scripts/dataset/launch_worker.sh $start $stop $((64 >> (retries+1))) $campaign $mode"
             elif [[ "$alive" == 1 && "$heartbeat" =~ ^[0-9]+$ ]] && \
                  (( $(date +%s) - heartbeat > 180 )); then
                 echo "stale heartbeat on $instance; process is still alive" >&2
@@ -371,11 +428,11 @@ PY
     package="$store_root/$campaign.tar.gz"
     if [[ ! -s "$package" ]]; then
         rm -f "$package.incoming"
-        if [[ $mode == short ]]; then
+        if [[ $mode == short || $collector_location == cloud ]]; then
             used_kib=$(collector_usage_kib)
             campaign_kib=$(du -sk "$campaign_dir" | awk '{print $1}')
-            if (( used_kib + campaign_kib >= 488281250 )); then
-                echo "compressed package would exceed the 500 GB collector cap" >&2
+            if (( used_kib + campaign_kib >= collector_cap_gb * 1000000000 / 1024 )); then
+                echo "compressed package would exceed the ${collector_cap_gb} GB collector cap" >&2
                 exit 1
             fi
         fi
@@ -389,10 +446,12 @@ PY
 }
 
 case "$phase" in
-    all) prepare; deploy; collect ;;
+    all) prepare; stage; start_workers; collect ;;
     prepare) prepare ;;
     check-vms) check_vms ;;
-    deploy) deploy ;;
+    stage) stage ;;
+    start) start_workers ;;
+    deploy) stage; start_workers ;;
     collect) collect ;;
     status) status ;;
     *) usage ;;

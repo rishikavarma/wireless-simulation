@@ -2,15 +2,19 @@
 # Run assigned full-preset simulations and keep every original metric trace.
 set -euo pipefail
 
-if [[ $# -ne 5 ]]; then
-    echo "usage: worker_raw.sh PART_START PART_STOP JOBS CAMPAIGN MODE" >&2
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+    echo "usage: worker_raw.sh PART_START PART_STOP JOBS CAMPAIGN MODE [seal]" >&2
     exit 2
 fi
 start=$1
 stop=$2
 jobs=$3
+available_cpus=$(nproc)
+if (( jobs > available_cpus )); then jobs=$available_cpus; fi
+(( jobs > 0 )) || { echo "jobs must be positive" >&2; exit 2; }
 campaign=$4
 mode=$5
+seal_only=${6:-run}
 [[ $mode == short || $mode == full ]] || { echo "invalid mode: $mode" >&2; exit 2; }
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 heartbeat_file="$root/worker-$start-$stop.heartbeat"
@@ -21,7 +25,7 @@ heartbeat_loop() {
         sleep 60
     done
 }
-heartbeat_loop &
+heartbeat_loop </dev/null >/dev/null 2>&1 &
 heartbeat_pid=$!
 finish() {
     result=$?
@@ -85,11 +89,16 @@ for (( part=start; part<stop; part++ )); do
         sleep 60
     done
     printf '%s\n' "$part" > "$current_file"
-    timeout --signal=TERM --kill-after=60s 3h \
+    if [[ $seal_only != seal ]]; then
+        # Preserve atomic completed outcomes even if timeout/OOM kills the runner.
+        if ! timeout --signal=TERM --kill-after=60s 3h \
         python3 scripts/dataset/run_dataset.py --raw-parts --run \
         --out-dir "$out" --jobs "$jobs" --batch-runs 64 --calibration-runs 64 \
-        --part-start "$part" --part-stop "$((part+1))"
-    python3 scripts/dataset/pack_raw_worker.py --campaign "$out" \
+        --part-start "$part" --part-stop "$((part+1))"; then
+            echo "part $part interrupted; retaining only completed runs"
+        fi
+    fi
+    python3 scripts/dataset/pack_raw_worker.py --allow-partial --campaign "$out" \
         --batch-runs 64 --calibration-runs 64 --out-dir "$archive_dir" \
         --part-start "$part" --part-stop "$((part+1))"
     python3 scripts/dataset/cleanup_raw_worker.py --campaign "$out" \

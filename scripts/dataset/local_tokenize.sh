@@ -17,11 +17,13 @@ progress = Path(sys.argv[1])/'stream-progress.json'
 if progress.exists() and int(sys.argv[2]) in {
         part['number'] for part in json.loads(progress.read_text())['parts']}:
     sys.exit(0)
+if progress.exists() and int(sys.argv[2]) in json.loads(progress.read_text()).get('emptyParts', []):
+    sys.exit(0)
 sys.exit(1)
 PY
 }
 
-while IFS=$'\t' read -r instance zone project start stop; do
+while IFS=$'\t' read -r instance zone project start stop transport; do
     worker_dir="$archive_dir/worker-$start-$stop"
     for (( part=start; part<stop; part++ )); do
         if part_done "$part"; then
@@ -45,6 +47,10 @@ while IFS=$'\t' read -r instance zone project start stop; do
         echo "locally tokenized part $part" | tee -a "$state_dir/tokenize-progress.log"
     done
 done < "$ranges"
+
+# Revisit any held-out parts deferred while waiting for surviving training calibration.
+python3 scripts/dataset/run_dataset.py --stream --stream-from-raw --run \
+    --out-dir "$campaign_dir" --batch-runs 64 --calibration-runs 64 --jobs 8
 
 python3 scripts/dataset/run_dataset.py --stream --stream-from-raw --run \
     --finalize-only --out-dir "$campaign_dir" \
