@@ -59,6 +59,7 @@ def merge(destination, source):
     copy_checked(source/'dataset-boundaries.json', destination/'dataset-boundaries.json')
     progress.setdefault('parts', [])
     progress.setdefault('tokenRuns', {})
+    progress.setdefault('emptyParts', [])
     known = {part['number']: part for part in progress['parts']}
     run_ids = {run['prefix'] for run in target_manifest['runs']}
     for part in incoming['parts']:
@@ -101,6 +102,12 @@ def merge(destination, source):
                                  destination/directory/(run_id+'.csv.gz'))
         known[number] = part
     progress['parts'] = [known[number] for number in sorted(known)]
+    for number in incoming.get('emptyParts', []):
+        if number in known:
+            raise ValueError(f'part {number} is both empty and tokenized')
+        if number not in progress['emptyParts']:
+            progress['emptyParts'].append(number)
+    progress['emptyParts'].sort()
     atomic_json(progress_path, progress)
     print(f'merged {len(incoming["parts"])} source parts; '
           f'{len(progress["parts"])} total parts collected')

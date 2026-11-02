@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $# == 1 && $1 == ssh-ed25519\ * ]] || { echo "expected collector public key" >&2; exit 2; }
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq libgsl27 libgslcblas0 libxml2 libsqlite3-0 python3
+sudo apt-get install -y -qq libgsl27 libgslcblas0 libxml2 libsqlite3-0 python3 python3-numpy python3-matplotlib
 id dataset >/dev/null 2>&1 || sudo useradd -m -s /bin/bash dataset
 sudo install -d -m 700 -o dataset -g dataset /home/dataset/.ssh
 printf '%s\n' "$1" | sudo tee /home/dataset/.ssh/authorized_keys >/dev/null

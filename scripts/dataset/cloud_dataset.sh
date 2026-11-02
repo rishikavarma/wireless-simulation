@@ -5,6 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 source .venv/bin/activate
 export DATASET_COLLECTOR=cloud COLLECTOR_MAX_GB=3500
+export DISTRIBUTED_TOKENIZE=1
 export TMPDIR="$root/results/tmp"
 mkdir -p "$TMPDIR"
 inventory=scripts/dataset/vm-commands-private.txt
@@ -49,7 +50,15 @@ elif [[ $phase == run ]]; then
         sleep 5
     done
     [[ $ready == 1 ]] || { echo "worker startup checks failed" >&2; exit 1; }
-    bash scripts/dataset/distributed_raw.sh --short start "$inventory"
+    # A resumed collection with every raw part already on the collector only
+    # needs tokenization; do not restart finished simulation workers.
+    raw_count=0
+    if [[ -d results/short-distributed-300-20k-raw-archives ]]; then
+        raw_count=$(find results/short-distributed-300-20k-raw-archives -name 'part-*.done' | wc -l)
+    fi
+    if (( raw_count < 320 )); then
+        bash scripts/dataset/distributed_raw.sh --short start "$inventory"
+    fi
     bash scripts/dataset/distributed_raw.sh --short collect "$inventory"
     sha256sum results/short-distributed-300-20k.tar.gz > results/short-distributed-300-20k.tar.gz.sha256.tmp
     mv results/short-distributed-300-20k.tar.gz.sha256.tmp results/short-distributed-300-20k.tar.gz.sha256

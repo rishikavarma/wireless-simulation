@@ -74,7 +74,7 @@ def window_token_runs(paths, seq_len, stride, expected_columns, expected_run_ids
 
 def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                     run_batch, prepare_features, part_start=None, part_stop=None,
-                    finalize_only=False, max_hours=None):
+                    finalize_only=False, max_hours=None, include_calibration=True):
     """Run, tokenize and discard each part; assign saved parts to splits at the end."""
     from make_datasets import load_run_windows, fit_boundaries_on_train
     from analyze_dataset import RADIO_FEATURES, summarize
@@ -125,7 +125,11 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
     if part_start is not None:
         if not (0 <= part_start < part_stop <= len(parts)):
             raise ValueError(f'part range must satisfy 0 <= start < stop <= {len(parts)}')
-        selected_numbers = set(range(part_start, part_stop)) | {0}
+        # A distributed tokenizer receives the collector's fitted boundaries.
+        # It does not need to reprocess calibration part zero for every part.
+        selected_numbers = set(range(part_start, part_stop))
+        if include_calibration and not (out/'dataset-boundaries.json').exists():
+            selected_numbers.add(0)
     else:
         selected_numbers = set(range(len(parts)))
     if finalize_only:

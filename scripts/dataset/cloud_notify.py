@@ -43,10 +43,10 @@ def message(root=ROOT,kind='completion',detail=None):
         return 'Wireless dataset test','Notification setup works. This is a test, not a dataset completion notice.'
     if kind=='started':
         return ('Wireless: started',
-                f'Short 20k campaign launched. Progress updates every {DEFAULT_INTERVAL_MINUTES} minutes, '
+                f'Short 20k coordinator running; unfinished token parts use worker VMs. Progress updates every {DEFAULT_INTERVAL_MINUTES} minutes, '
                 'plus a failure alert if the coordinator exits uncleanly.')
     if kind=='progress':
-        report=campaign_status(root)
+        report=campaign_status(root,include_workers=True)
         planned=max(1,report.get('plannedParts') or 1)
         retrieved=report.get('retrievedParts') or 0
         tokenized=report.get('tokenizedParts') or 0
@@ -54,10 +54,13 @@ def message(root=ROOT,kind='completion',detail=None):
         free_gb=(report.get('diskFreeBytes') or 0)/1e9
         phase=report.get('phase') or 'unknown'
         service=(report.get('service') or {}).get('ActiveState','unknown')
+        workers=report.get('workers') or []
+        active=sum(bool(worker.get('tokenizing')) for worker in workers)
+        worker_text=f' Active tokenizers {active}/{len(workers)}.' if workers else ''
         body=(f'Phase {phase} (service {service}). '
               f'Retrieved {retrieved:,}/{planned:,} raw parts ({100*retrieved/planned:.1f}%). '
               f'Tokenized {tokenized:,} parts / {runs:,} runs. '
-              f'Disk free {free_gb:.1f} GB.')
+              f'Disk free {free_gb:.1f} GB.{worker_text}')
         return 'Wireless: progress',body
     if kind=='failure':
         report=campaign_status(root)

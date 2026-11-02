@@ -53,11 +53,13 @@ def status(root=ROOT, include_workers=False):
             name, zone, project, start, stop, transport = line.split('\t')
             try:
                 proc = subprocess.run(command(['ssh','--zone',zone,'--project',project,name,
-                    '--command='+f'bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh {start} {stop} {CAMPAIGN}']),
+                    '--command='+f'bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh {start} {stop} {CAMPAIGN}; '
+                    'printf "tokenizers="; pgrep -fc "[r]un_dataset.py --stream --stream-from-raw" || true']),
                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
                 values = {key: value for key,value in (row.split('=',1) for row in proc.stdout.splitlines() if '=' in row) if key != 'done'}
                 return dict(name=name, reachable=proc.returncode == 0, parts=[int(start),int(stop)],
-                            state=values, completedParts=sum(row.startswith('done=') for row in proc.stdout.splitlines()), error=proc.stderr[-500:] if proc.returncode else None)
+                            state=values, tokenizing=int(values.get('tokenizers', '0')) > 0,
+                            completedParts=sum(row.startswith('done=') for row in proc.stdout.splitlines()), error=proc.stderr[-500:] if proc.returncode else None)
             except subprocess.TimeoutExpired:
                 return dict(name=name, reachable=False, error='status probe timed out')
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:

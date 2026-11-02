@@ -22,6 +22,7 @@ ns-3-dev/
 !/docs/experiment.md
 !/docs/application-rates.md
 !/docs/rlc-am-retransmission.md
+!/docs/unum-bucket-prediction.md
 
 # Dataset archives generated outside results/.
 *.npz

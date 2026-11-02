@@ -322,7 +322,8 @@ def main():
   stream_campaign(ROOT,out,manifest,a.batch_runs,a.calibration_runs,
                   (lambda records,verify:collected_raw(out,records,verify)) if a.stream_from_raw else
                   (lambda records,verify:run(out,a.jobs,records,verify,manifest)),prepare_features,
-                  a.part_start,a.part_stop,a.finalize_only,a.max_hours)
+                  a.part_start,a.part_stop,a.finalize_only,a.max_hours,
+                  include_calibration=not a.stream_from_raw)
  elif a.raw_parts and a.run:
   from stream_parts import planned_parts
   manifest=json.loads((out/'manifest.json').read_text())

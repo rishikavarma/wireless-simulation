@@ -229,7 +229,7 @@ configuration or source hashes, calibration boundaries, and conflicting part
 files. The finalizer requires every part, then builds train/test indexes and the
 profile-held-out dataset. It runs without ns-3 on the collection host.
 
-### Distributed raw metric collection and local tokenization
+### Distributed raw metric collection and tokenization
 
 Use `scripts/dataset/distributed_raw.sh` when every original simulation trace
 must be retained. Its distributed plan measures **300 seconds per simulation**
@@ -250,6 +250,15 @@ The collection host retrieves archives as parts finish, verifies source and
 configuration hashes, extracts one part at a time, and tokenizes it locally.
 Raw metric CSVs remain in the compressed archives;
 the extracted copies are removed after successful tokenization.
+For the cloud campaign, set `DISTRIBUTED_TOKENIZE=1` (already set by
+`cloud_dataset.sh`). Once raw retrieval finishes, the collector sends unfinished
+parts to available workers for tokenization. It verifies each returned
+part before adding it to `stream-progress.json`. Existing completed parts remain
+the checkpoint; interrupted parts are retried from their raw archives. The
+collector retains the raw archives until final packaging. For an existing fleet,
+run `python3 scripts/dataset/install_token_dependencies.py` from an authenticated
+machine before switching to worker tokenization; fresh workers receive NumPy and
+Matplotlib during bootstrap.
 
 The current short campaign runs entirely in GCP: **20,000 simulations**,
 **60 million measured 100 ms tokens**, and **3 million nonoverlapping
@@ -265,6 +274,10 @@ stay in GCP. A 3.5 TB collection guard and 40 GiB reserve stop retrieval before
 the disk fills. The coordinator's systemd service has a 200 GiB memory-high
 threshold and a 230 GiB memory limit, leaving memory for the OS. An interrupted
 collector can resume; workers retain archives and wait when their disks are low.
+Once every raw archive is collected, restarting the service skips completed
+simulations and token parts. A part is committed only after its complete token
+package has been verified and merged. Incomplete worker output remains local to
+that worker and can be regenerated from the retained raw archive.
 The data disk is retained when the collector VM is deleted.
 
 All nodes share the `default` VPC. Collector-to-worker traffic uses private IPs,
@@ -318,7 +331,7 @@ duplicate jobs. No production run is launched by `status`.
 
 `status` reads VM states, collector service state, collected/tokenized part and
 run counts, free disk space and recent journal messages. `--workers` adds live
-worker health, heartbeat and assigned ranges. If the collector has stopped,
+worker health, active tokenizers, simulation heartbeat and original ranges. If the collector has stopped,
 plain status does not wake it; `status --wake` briefly starts it, reads the saved
 completion record, then stops it again. `fetch` downloads only the finalized
 archive and leaves the collector stopped.
@@ -465,6 +478,9 @@ profile stays in the same train or test set. Bucket boundaries are fit only
 from training profiles, and windows never cross run boundaries. The streamed
 RNG split remains at the campaign root for measuring generalization to a new
 seed of a profile already seen in training.
+The prepared, unrun [UNUM-like bucket prediction experiment](docs/unum-bucket-prediction.md)
+trains a small Transformer and compares it with persistence and context-mean
+baselines using bucket-index MSE and per-feature plots.
 
 Token output for the short TCP design. This creates a 180-profile campaign
 with RNG 20001 and RNG 20002. Repeating the command resumes an incomplete

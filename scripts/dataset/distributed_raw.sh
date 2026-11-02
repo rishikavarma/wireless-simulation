@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy raw-trace runs, retrieve archives, and tokenize locally.
+# Deploy raw-trace runs, retrieve archives, and tokenize on collector or workers.
 set -euo pipefail
 
 usage() {
@@ -306,9 +306,11 @@ collect() {
     trap cleanup_collector EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    bash scripts/dataset/local_tokenize.sh "$campaign_dir" "$archive_dir" "$ranges" "$state_dir" \
-        > "$state_dir/tokenize.log" 2>&1 &
-    tokenizer_pid=$!
+    if [[ ${DISTRIBUTED_TOKENIZE:-0} != 1 ]]; then
+        bash scripts/dataset/local_tokenize.sh "$campaign_dir" "$archive_dir" "$ranges" "$state_dir" \
+            > "$state_dir/tokenize.log" 2>&1 &
+        tokenizer_pid=$!
+    fi
     total_parts=$(python3 - "$campaign_dir" <<'PY'
 import json,sys
 from pathlib import Path
@@ -319,7 +321,7 @@ print(len(planned_parts(manifest,64,64)[0]))
 PY
 )
     while true; do
-        if ! kill -0 "$tokenizer_pid" 2>/dev/null; then
+        if [[ ${DISTRIBUTED_TOKENIZE:-0} != 1 ]] && ! kill -0 "$tokenizer_pid" 2>/dev/null; then
             wait "$tokenizer_pid"
             break
         fi
@@ -418,7 +420,13 @@ PY
         downloaded=$(retrieved_count)
         echo "heartbeat: $downloaded/$total_parts raw parts retrieved"
         if (( downloaded >= total_parts )); then
-            wait "$tokenizer_pid"
+            if [[ ${DISTRIBUTED_TOKENIZE:-0} == 1 ]]; then
+                python3 scripts/dataset/distributed_tokenize.py \
+                    --campaign "$campaign_dir" --archives "$archive_dir" --ranges "$ranges" \
+                    > "$state_dir/tokenize.log" 2>&1
+            else
+                wait "$tokenizer_pid"
+            fi
             break
         fi
         sleep 60
