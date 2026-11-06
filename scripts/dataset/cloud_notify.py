@@ -12,6 +12,7 @@ from datetime import datetime,timezone
 from pathlib import Path
 
 from cloud_config import settings
+from cloud_campaign import selected
 from cloud_status import status as campaign_status
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -42,8 +43,9 @@ def message(root=ROOT,kind='completion',detail=None):
     if kind=='test':
         return 'Wireless dataset test','Notification setup works. This is a test, not a dataset completion notice.'
     if kind=='started':
+        chosen=selected(root)
         return ('Wireless: started',
-                f'Short 20k coordinator running; unfinished token parts use worker VMs. Progress updates every {DEFAULT_INTERVAL_MINUTES} minutes, '
+                f'{chosen["mode"].title()} {chosen["runs"]:,}-run coordinator running; unfinished token and post-processing parts use worker VMs. Progress updates every {DEFAULT_INTERVAL_MINUTES} minutes, '
                 'plus a failure alert if the coordinator exits uncleanly.')
     if kind=='progress':
         report=campaign_status(root,include_workers=True)
@@ -73,13 +75,14 @@ def message(root=ROOT,kind='completion',detail=None):
               f'Retrieved {report.get("retrievedParts",0)}/{report.get("plannedParts",0)} parts. '
               f'Last log: {tail}. Check: python3 scripts/dataset/cloud_control.py status')
         return 'Wireless: FAILED',body
-    receipt=json.loads((root/'results/cloud-complete.json').read_text())
-    summary=json.loads((root/'results/short-distributed-300-20k/completion-summary.json').read_text())
+    chosen=selected(root)
+    receipt=json.loads(chosen['receipt'].read_text())
+    summary=json.loads((root/'results'/chosen['name']/'completion-summary.json').read_text())
     label='PARTIAL dataset ready' if summary['partial'] else 'Dataset ready'
     text=(f"Completed {summary['completedRuns']:,} of {summary['plannedRuns']:,} runs. "
           f"Final compressed archive: {receipt['archiveBytes']/1e9:.2f} GB. "
           f"VM shutdown grace: {settings(root)['shutdownGraceMinutes']} minutes. "
-          'Download with: python3 scripts/dataset/cloud_control.py fetch')
+          f'Archive: results/{chosen["name"]}.tar.gz on the collector.')
     return 'Wireless: '+label,text
 
 

@@ -10,9 +10,9 @@ from pathlib import Path
 
 from private_transport import command
 from cloud_config import settings
+from cloud_campaign import selected
 
 ROOT = Path(__file__).resolve().parents[2]
-CAMPAIGN = 'short-distributed-300-20k'
 
 
 def load(path, default):
@@ -21,15 +21,17 @@ def load(path, default):
 
 
 def status(root=ROOT, include_workers=False):
+    chosen = selected(root)
+    campaign_name = chosen['name']
     results = root/'results'
-    campaign = results/CAMPAIGN
+    campaign = results/campaign_name
     progress = load(campaign/'stream-progress.json', {})
-    completion = load(results/'cloud-complete.json', None)
+    completion = load(chosen['receipt'], None)
     service = subprocess.run(['systemctl','show','wireless-dataset.service',
         '--property=ActiveState,SubState,Result,MemoryCurrent,ExecMainStatus'], capture_output=True, text=True)
     fields = dict(line.split('=',1) for line in service.stdout.splitlines() if '=' in line)
     count = 0
-    for marker in (results/(CAMPAIGN+'-raw-archives')).glob('worker-*/part-*.done'):
+    for marker in (results/(campaign_name+'-raw-archives')).glob('worker-*/part-*.done'):
         count += 1
     logs = subprocess.run(['journalctl','-u','wireless-dataset.service','-n','12','--no-pager','-o','cat'],
                           capture_output=True, text=True)
@@ -39,7 +41,7 @@ def status(root=ROOT, include_workers=False):
         dataset['omittedRuns'] = dataset.get('plannedRuns',0)-dataset.get('completedRuns',0)
     report = dict(service=fields, phase='completed' if completion else
                   ('running' if fields.get('ActiveState') == 'active' else 'not-running'),
-                  plannedRuns=20000, plannedParts=320, retrievedParts=count,
+                  campaign=campaign_name, plannedRuns=chosen['runs'], plannedParts=chosen['parts'], retrievedParts=count,
                   tokenizedParts=len(progress.get('parts',[])), emptyParts=len(progress.get('emptyParts',[])),
                   tokenizedRuns=sum(len(p['runs']) for p in progress.get('parts',[])),
                   diskFreeBytes=shutil.disk_usage(root).free, completion=completion,
@@ -48,12 +50,13 @@ def status(root=ROOT, include_workers=False):
                   notificationsEnabled=bool(settings(root).get('ntfyTopic')),
                   completionNotification=load(results/'completion-notification.json',None), recentLog=logs.stdout.splitlines())
     if include_workers:
-        ranges = (results/(CAMPAIGN+'-control')/'ranges.tsv').read_text().splitlines()
+        range_file = results/(campaign_name+'-control')/'ranges.tsv'
+        ranges = range_file.read_text().splitlines() if range_file.exists() else []
         def worker(line):
             name, zone, project, start, stop, transport = line.split('\t')
             try:
                 proc = subprocess.run(command(['ssh','--zone',zone,'--project',project,name,
-                    '--command='+f'bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh {start} {stop} {CAMPAIGN}; '
+                    '--command='+f'bash ~/wireless-simulation-worker/scripts/dataset/worker_status.sh {start} {stop} {campaign_name}; '
                     'printf "tokenizers="; pgrep -fc "[r]un_dataset.py --stream --stream-from-raw" || true']),
                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
                 values = {key: value for key,value in (row.split('=',1) for row in proc.stdout.splitlines() if '=' in row) if key != 'done'}

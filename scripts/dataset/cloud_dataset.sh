@@ -9,6 +9,14 @@ export DISTRIBUTED_TOKENIZE=1
 export TMPDIR="$root/results/tmp"
 mkdir -p "$TMPDIR"
 inventory=scripts/dataset/vm-commands-private.txt
+mode=$(cat local/cloud-campaign-mode.txt 2>/dev/null || echo short)
+case $mode in
+    short) campaign=short-distributed-300-20k; total_parts=320; mode_args=(--short) ;;
+    full) campaign=full-distributed; total_parts=640; mode_args=() ;;
+    *) echo "unknown cloud campaign mode: $mode" >&2; exit 2 ;;
+esac
+receipt="results/cloud-complete.json"
+if [[ $mode == full ]]; then receipt="results/$campaign-cloud-complete.json"; fi
 phase=${1:-status}
 if [[ $phase == start ]]; then
     if systemctl is-active --quiet wireless-dataset.service; then
@@ -53,23 +61,24 @@ elif [[ $phase == run ]]; then
     # A resumed collection with every raw part already on the collector only
     # needs tokenization; do not restart finished simulation workers.
     raw_count=0
-    if [[ -d results/short-distributed-300-20k-raw-archives ]]; then
-        raw_count=$(find results/short-distributed-300-20k-raw-archives -name 'part-*.done' | wc -l)
+    if [[ -d results/$campaign-raw-archives ]]; then
+        raw_count=$(find "results/$campaign-raw-archives" -name 'part-*.done' | wc -l)
     fi
-    if (( raw_count < 320 )); then
-        bash scripts/dataset/distributed_raw.sh --short start "$inventory"
+    if (( raw_count < total_parts )); then
+        bash scripts/dataset/distributed_raw.sh "${mode_args[@]}" start "$inventory"
     fi
-    bash scripts/dataset/distributed_raw.sh --short collect "$inventory"
-    sha256sum results/short-distributed-300-20k.tar.gz > results/short-distributed-300-20k.tar.gz.sha256.tmp
-    mv results/short-distributed-300-20k.tar.gz.sha256.tmp results/short-distributed-300-20k.tar.gz.sha256
-    python - <<'PYCODE'
+    bash scripts/dataset/distributed_raw.sh "${mode_args[@]}" collect "$inventory"
+    sha256sum "results/$campaign.tar.gz" > "results/$campaign.tar.gz.sha256.tmp"
+    mv "results/$campaign.tar.gz.sha256.tmp" "results/$campaign.tar.gz.sha256"
+    python - "$campaign" "$receipt" <<'PYCODE'
 import json
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
-p=Path('results/short-distributed-300-20k.tar.gz')
+p=Path('results')/(sys.argv[1]+'.tar.gz')
 receipt=dict(archiveBytes=p.stat().st_size, sha256=p.with_name(p.name+'.sha256').read_text().split()[0],
              finalizedAt=datetime.now(timezone.utc).isoformat())
-target=Path('results/cloud-complete.json')
+target=Path(sys.argv[2])
 temporary=target.with_suffix('.json.tmp')
 temporary.write_text(json.dumps(receipt, indent=2)+'\n')
 temporary.replace(target)
@@ -83,5 +92,5 @@ PYCODE
     python scripts/dataset/stop_cloud_fleet.py
 else
     case $phase in prepare|stage|check-vms|status) ;; *) echo "usage: cloud_dataset.sh {prepare|stage|check-vms|start|status}" >&2; exit 2 ;; esac
-    bash scripts/dataset/distributed_raw.sh --short "$phase" "$inventory"
+    bash scripts/dataset/distributed_raw.sh "${mode_args[@]}" "$phase" "$inventory"
 fi

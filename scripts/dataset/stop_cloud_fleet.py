@@ -9,23 +9,24 @@ from pathlib import Path
 
 from private_transport import command
 from cloud_config import settings
+from cloud_campaign import selected
 from vm_inventory import parse
 
 ROOT = Path(__file__).resolve().parents[2]
-NAME = 'short-distributed-300-20k.tar.gz'
 HELPER = '/usr/local/sbin/dataset-poweroff'
 
 
 def finalized(root):
-    package = root/'results'/NAME
-    receipt = root/'results/cloud-complete.json'
+    chosen = selected(root)
+    package = root/'results'/(chosen['name']+'.tar.gz')
+    receipt = chosen['receipt']
     info = json.loads(receipt.read_text())
     sidecar = package.with_name(package.name+'.sha256')
     if (not package.is_file() or package.stat().st_size <= 0
             or info['archiveBytes'] != package.stat().st_size
             or info['sha256'] != sidecar.read_text().split()[0]
             or len(info['sha256']) != 64
-            or not (root/'results/short-distributed-300-20k/default-dataset.json').exists()):
+            or not (root/'results'/chosen['name']/'default-dataset.json').exists()):
         raise ValueError('final dataset and completion receipt are required before shutdown')
     return info
 

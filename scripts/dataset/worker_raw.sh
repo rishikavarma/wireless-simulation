@@ -47,7 +47,7 @@ if [[ ! -f "$out/manifest.json" ]]; then
     python3 scripts/dataset/run_dataset.py --preset full --stream --observation-seconds 300 \
         --out-dir "$out" --run-prefix "$campaign" --plan "${plan_args[@]}"
 fi
-disk_marker="$root/worker-$start-$stop.disk-ok"
+disk_marker="$root/$campaign-worker-$start-$stop.disk-ok"
 if [[ ! -f "$disk_marker" ]]; then
 required_kib=$(python3 - "$out" "$start" "$stop" <<'PY'
 import json, sys
@@ -56,13 +56,11 @@ sys.path.insert(0, 'scripts/dataset')
 from stream_parts import planned_parts
 manifest = json.loads((Path(sys.argv[1])/'manifest.json').read_text())
 parts, _ = planned_parts(manifest, 64, 64)
-count = sum(len(part) for part in parts[int(sys.argv[2]):int(sys.argv[3])])
-print(count * 120 * 1024 + 40 * 1024 * 1024)
+peak = max(len(part) for part in parts[int(sys.argv[2]):int(sys.argv[3])])
+print(peak * 120 * 1024 + 40 * 1024 * 1024)
 PY
 )
-if [[ $mode == short ]]; then
-    required_kib=$((70*1024*1024))
-fi
+required_kib=$((required_kib > 70*1024*1024 ? required_kib : 70*1024*1024))
 available_kib=$(df -Pk "$root" | awk 'NR==2 {print $4}')
 if (( available_kib < required_kib )); then
     echo "insufficient VM disk for raw traces: need about $((required_kib/1024/1024)) GiB free, have $((available_kib/1024/1024)) GiB" >&2

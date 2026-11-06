@@ -91,10 +91,15 @@ Exported token features include `is_udp`: **0 for TCP, 1 for UDP**. This
 run-level input stays binary in continuous features and token windows; it is
 not quantile bucketized.
 
-Expected size is **39.6 million distinct 100 ms time bins** and **1.96 million
-non-overlapping 20-token windows** (10 history + 10 future). These are planned
-counts, not collected data or a claim that every feature vector will be unique.
-The held-out four RNG repeats give an 80/20 split: 32,000/8,000 runs.
+Expected size is 40,000 runs. TCP tokens span the current measured minimum RTT,
+so the window count is known only after collection; the earlier fixed-token plan
+(`--token-mode fixed`) was **39.6 million distinct 100 ms time bins** and **1.96
+million non-overlapping 20-token windows** (10 history + 10 future). These are
+planned counts, not collected data or a claim that every feature vector will be
+unique.
+The default stratified split keeps UNUM’s 20% test share and adds 10%
+validation: **28,000 / 4,000 / 8,000** train / validation / test runs, with every
+profile and RNG seed present in all three sets.
 See [full-preset ranges and comparison with UNUM](docs/experiment.md#full-dataset-preset)
 for the scope and limits of that comparison.
 
@@ -136,11 +141,16 @@ write configurations without simulating. Cleanup never runs by default and does
 not delete unrelated experiments. Source/model changes still require a restart.
 
 `--profile-count`, `--replicates` and `--design-seed` override planning defaults.
-`--target-windows` can instead raise the profile count to meet an explicit
-20-token-window target. For example, `--preset full --target-windows 35000000
---describe` describes **714,300 runs / 35,000,700 windows** without creating or
-executing a plan. This is much larger than the default; a time-token count must
-not be confused with a window count when comparing datasets.
+The full preset aggregates tokens at RTT scale (`tokenMode: "rtt"` in
+`scripts/dataset/full_dataset.json`; `base_rtt` is the model-facing alias of the
+window RTT), so the window count depends on each run and `--describe` reports
+`windows: null`. TCP uses the measured socket minimum RTT; UDP uses twice the
+latest completed one-second mean DL PDCP SDU delay (`pdcp_2xdelay`). To get fixed
+100 ms tokens for every profile, pass a design file with `"tokenMode": "fixed"`
+via `--design-file`. `--target-windows` plans a profile count from fixed-token
+window arithmetic and is therefore rejected under RTT tokens; with a fixed-token
+design file, `--preset full --target-windows 35000000 --describe` describes
+**714,300 runs / 35,000,700 windows**.
 At least 49 full-preset profiles are required for the controlled comparisons.
 Deliberate stress profiles are disabled by `includeStressProfiles: false` in the
 full preset; ordinary candidate ranges and finite buffers remain active. Resuming uses the
@@ -227,7 +237,7 @@ python3 scripts/dataset/run_dataset.py --stream --run --finalize-only \
 Merge all workers before finalizing. The merger rejects differing manifests,
 configuration or source hashes, calibration boundaries, and conflicting part
 files. The finalizer requires every part, then builds train/test indexes and the
-profile-held-out dataset. It runs without ns-3 on the collection host.
+stratified train/validation/test dataset. It runs without ns-3 on the collection host.
 
 ### Distributed raw metric collection and tokenization
 
@@ -260,7 +270,7 @@ run `python3 scripts/dataset/install_token_dependencies.py` from an authenticate
 machine before switching to worker tokenization; fresh workers receive NumPy and
 Matplotlib during bootstrap.
 
-The current short campaign runs entirely in GCP: **20,000 simulations**,
+The current short campaign (planned with `--token-mode fixed`) runs entirely in GCP: **20,000 simulations**,
 **60 million measured 100 ms tokens**, and **3 million nonoverlapping
 10-context + 10-future windows**. Twenty `n2-standard-48` workers in
 `us-central1-a` each have 48 vCPUs and a 100 GB boot disk. Each receives 16 of
@@ -483,12 +493,11 @@ trains a small Transformer and compares it with persistence and context-mean
 baselines using bucket-index MSE and per-feature plots.
 
 Token output for the short TCP design. This creates a 180-profile campaign
-with RNG 20001 and RNG 20002. Repeating the command resumes an incomplete
-campaign. It writes `token-runs/` and, after the last part, the default
-10-history/10-future profile-held-out dataset in
-`windows-profile-c10-p10-s20/`. The campaign's `default-dataset.json` points
-to it. Both RNG 20001 and RNG 20002 occur in each split, with both seeds of
-each profile kept together.
+with four matched RNG seeds starting at 20001. Repeating the command resumes
+an incomplete campaign. It writes `token-runs/` and, after the last part, the
+default 10-history/10-future stratified dataset in
+`windows-stratified-c10-p10-s20/`. The campaign's `default-dataset.json` points
+to it. Every profile and every RNG seed appear in train, validation, and test.
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset full --stream \
@@ -497,10 +506,11 @@ python3 scripts/dataset/run_dataset.py --preset full --stream \
   --jobs 20 --batch-runs 20 --calibration-runs 20
 ```
 
-The following command regenerates the default profile-held-out dataset from
-saved continuous tokens. It does not rerun ns-3. It uses an 80/20 profile
-split, refits bucket boundaries from training profiles only, and puts the
-radio shards in the same split. Omit `--stride` for non-overlapping windows.
+The following command regenerates the default stratified dataset from saved
+continuous tokens. It does not rerun ns-3. It uses a per-profile
+train/validation/test share (default 70/10/20), refits bucket boundaries from
+training runs only, and puts the radio shards in the same split. Omit
+`--stride` for non-overlapping windows.
 
 ```bash
 python3 scripts/dataset/materialize_windows.py \
@@ -812,20 +822,54 @@ measurements use 20–119 s and exclude five seconds on either side of the switc
   It measures service under the current scheduler, errors and RLC recovery;
   the historical 120-byte initial-PDU cap is removed.
 
-Current accepted reference after the connected-access and minimum UL grant corrections:
-[88 completed runs and validation](results/queue-calibration-20261023-recovery/report.md),
-[capacity and RTT plot](results/queue-calibration-20261023-recovery/calibration.png).
+The current [accepted reference](experiments/queue-calibration/reference.json)
+includes the NTN scheduling corrections. The feeder and service elevation masks
+bound K1/K2 (about 44 to 19 one-millisecond slots at 800 km and a 30° mask).
+The UE offers RLC room for the AM header, and the gNB's first grant after an SR
+is 128 B. For handheld NTN the gNB owes 192 B per SR (`UlSrGrantBudget`), issued
+as consecutive-slot grants of at most `UlSrGrantSize` = 128 B (so 128 B, then
+64 B), because the BSR needs a full satellite round trip to return. The grants
+carried before the BSR arrives are deducted from the buffer it reports, so the
+same bytes are not granted twice. The RLC AM transmitter refreshes its exact SDU
+backlog after each new PDU, so the second grant does not strand four bytes
+through MAC's header-inclusive estimate. The generic NR scheduler keeps a single
+128 B grant (`UlSrGrantBudget=0`).
+
+All 88 calibration runs passed, as did all 11 relay-switch timing regression
+cases (maximum UL arrival error 24 ns against the 100 ns limit). The earlier
+63/62 ms reference and probe remain in
+[the prior grant-fix artifact](artifacts/rtt-grant-fix-20261102/calibration.png).
+Service capacity is unchanged to the reported precision; RTT and queue budgets
+changed. [New calibration plot](artifacts/rtt-multigrant-fix-20261103/calibration.png)
+and [relay regression summary](artifacts/rtt-multigrant-fix-20261103/relay-summary.json).
 
 | Bandwidth | Direction | PDCP service capacity | Immediate-ACK path RTT | Directional BDP |
 | --- | --- | ---: | ---: | ---: |
-| 10 MHz | UL | 388.8 kbit/s | 138 ms | 6.55 KiB |
-| 10 MHz | DL | 5240.2 kbit/s | 137 ms | 87.63 KiB |
-| 20 MHz | UL | 410.6 kbit/s | 138 ms | 6.92 KiB |
-| 20 MHz | DL | 10504.2 kbit/s | 137 ms | 175.67 KiB |
+| 10 MHz | UL | 794.2 kbit/s | 44 ms | 4.27 KiB |
+| 10 MHz | DL | 8891.0 kbit/s | 42 ms | 45.58 KiB |
+| 20 MHz | UL | 839.4 kbit/s | 44 ms | 4.51 KiB |
+| 20 MHz | DL | 17822.6 kbit/s | 42 ms | 91.38 KiB |
+
+An instrumented 10 MHz UL probe sends one 182 B PDCP packet per second. An SR
+and grant each cross about 5.5 ms of satellite path, and K2 is 21 slots. The
+packet exceeds one UL transport block at the cell edge. With the prior 128 B
+bootstrap alone, its tail waited for a BSR and another full grant cycle, giving
+63 ms minimum RTT. The follow-up grant sends its two RLC PDUs in adjacent slots:
+for one probe packet, 134 B and 56 B RLC PDUs were transmitted 1 ms apart and
+the 182 B PDCP packet was delivered when the second arrived. All three CloudLab
+seeds reached a 44 ms minimum, matching the earlier fixed 64 B follow-up. The follow-up has a resource cost:
+in the seed-20001 probe the gNB issued 6,179 UL DCIs versus 4,769 with the
+128 B bootstrap alone. Uplink service capacity is unchanged to the reported
+precision (794.2 kbit/s at 10 MHz).
+The earlier timing records are in
+[control-event timestamps](artifacts/rtt-scheduling-fix-20261102/timing-10mhz-ul.csv),
+[radio events](artifacts/rtt-scheduling-fix-20261102/radio-events-10mhz-ul.csv)
+and [transport blocks](artifacts/rtt-scheduling-fix-20261102/transport-blocks-10mhz-ul.csv).
 
 All 88 simulations completed with one relay switch each. The top two loads
-and the larger-buffer controls produce identical delivered rates within each
-seed. The previous delayed-ACK/capped-model reference is preserved in
+agree within 3.8% across cohorts, below the 15% plateau criterion; the
+larger-buffer controls match the highest-load rates. The previous
+delayed-ACK/capped-model reference is preserved in
 [the old reference snapshot](results/queue-calibration-20261023-path-rtt/previous-reference.json).
 The full knob sweep and full dataset have not been rerun against this reference.
 
@@ -833,12 +877,12 @@ Accepted per-buffer budgets, in bytes:
 
 | Bandwidth | 0.5x | 1x | 2x | 4x | 8x | 16x |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 MHz | 44,869 | 89,738 | 179,476 | 358,951 | 717,902 | 1,435,804 |
-| 20 MHz | 89,943 | 179,885 | 359,769 | 719,538 | 1,439,076 | 2,878,152 |
+| 10 MHz | 23,339 | 46,678 | 93,356 | 186,711 | 373,422 | 746,844 |
+| 20 MHz | 46,785 | 93,569 | 187,138 | 374,275 | 748,549 | 1,497,097 |
 
 The 10 KiB floor remains available but does not bind any of these levels.
-The common budget now follows the restored downlink capacity; excluding ACK
-waiting does not imply smaller queues when measured service capacity changes.
+The common budget follows downlink capacity times the measured 42 ms path RTT;
+both directions use that larger product at each bandwidth.
 The main knob sweep retains configured TCP endpoint limits except in the explicit
 `socket-enlargement` sweep. That sweep compares `default` against
 `socket-enlargement`, using a common finite power-of-two send/receive buffer at
@@ -850,14 +894,16 @@ other TCP sweeps; the socket knob still retains its explicit default control.
 Per-run settings and exact limits are saved in the configurations. UDP and
 workload delayed ACKs are unaffected.
 
-For each bandwidth, queue reference BDP is the **larger of the measured UL and
-DL products** `capacity_bits_per_second * unloaded_RTT_seconds / 8` in bytes.
-Both directions and all applications use the same byte budget at that bandwidth.
-Full-preset configurations set `application.queueSizeBytes` to the reference
-multiplied by 0.5, 1, 2, 4, 8 or 16, rounded up, with the existing **10 KiB floor**.
-The manifest records the nominal multiplier and actual bytes. A floor-clamped
-value must not be described as its nominal BDP multiple. This is a per-buffer
-limit applied to the configured RLC/device queues, not one shared memory pool.
+For each bandwidth, calibration records directional BDPs
+`capacity_bits_per_second * unloaded_RTT_seconds / 8` for UL and DL, plus
+`referenceBdpBytes = max(UL, DL)` for shared hops and TCP socket sizing.
+Full-preset configurations set `application.queueSizeBytesUl` from the UL BDP and
+`application.queueSizeBytesDl` from the DL BDP (multiplied by 0.5, 1, 2, 4, 8 or
+16, rounded up, with the existing **10 KiB floor**). After Attach, UE DRB RLC
+uses the UL budget and gNB DRB RLC uses the DL budget; DropTail/AQM on the
+PGW↔BS hop uses `max(UL, DL)`. The manifest records the nominal multiplier and
+actual bytes. A floor-clamped value must not be described as its nominal BDP
+multiple. This is a per-buffer limit, not one shared memory pool.
 
 The full preset loads this measured reference instead of the former arbitrary
 10 Mbit/s sizing rate. Background load and attenuation vary against this fixed
