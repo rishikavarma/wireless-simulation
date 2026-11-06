@@ -48,10 +48,15 @@ void ApplyTcpVariant(const std::string& tcpVariant);
 uint64_t ComputeQueueBytes(double capacityBps, Time baseRtt, double queueSizeBdp);
 
 /**
- * Size DropTail net-device queues and Nr RLC TX buffers. Call before NR devices
- * are created so RLC instances pick up the default.
+ * Size DropTail net-device queues and Nr RLC TX defaults to the larger of the
+ * directional budgets. Call before NR devices are created so RLC instances pick
+ * up a safe default; call ApplyDirectionalRlcBudgets after Attach to set UE
+ * (UL) vs gNB (DL) MaxTxBufferSize separately.
  */
-void ApplyQueueBudgetDefaults(uint64_t queueBytes);
+void ApplyQueueBudgetDefaults(uint64_t queueBytesUl, uint64_t queueBytesDl);
+
+/** After Attach, set UE DRB RLC = UL budget and gNB DRB RLC = DL budget. */
+void ApplyDirectionalRlcBudgets(uint64_t queueBytesUl, uint64_t queueBytesDl);
 
 /**
  * Install the selected AQM (or FIFO for DropTail) on the given devices.
@@ -109,8 +114,15 @@ struct UeWorkloadConfig
     std::string transport{"tcp"};
     std::string tcpVariant{"TcpNewReno"};
     double queueSizeBdp{2.0};
-    /** Explicit per-buffer budget in bytes; zero retains legacy rate/RTT sizing. */
+    /**
+     * Explicit shared/legacy budget; zero retains legacy rate/RTT sizing.
+     * Used for PGW AQM and as fallback when Ul/Dl are unset.
+     */
     uint64_t queueSizeBytes{0};
+    /** UE RLC TX (UL). Zero falls back to queueSizeBytes, then rate/RTT sizing. */
+    uint64_t queueSizeBytesUl{0};
+    /** gNB RLC TX (DL). Zero falls back to queueSizeBytes, then rate/RTT sizing. */
+    uint64_t queueSizeBytesDl{0};
     AqmType aqm{AqmType::DropTail};
     /** Server think time before the reply is enqueued. 0 = immediate. */
     uint64_t computeDelayUs{0};

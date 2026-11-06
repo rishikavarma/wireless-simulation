@@ -69,7 +69,7 @@ def verify(out, manifest):
         raise RuntimeError('Saved queue reference changed')
 
 
-def reference(out, supplied, jobs):
+def reference(out, supplied, jobs, allow_metric_source_drift=False):
     if supplied:
         path = supplied.resolve()
     else:
@@ -85,9 +85,19 @@ def reference(out, supplied, jobs):
     ref = json.loads(path.read_text())
     if not ref['accepted']:
         raise ValueError('Queue calibration must be accepted')
+    drift = []
     for name, checksum in ref['modelHashes'].items():
         if name.startswith(('scratch/', 'patches/')) and digest(ROOT/name) != checksum:
-            raise ValueError('Queue reference is stale: '+name)
+            if allow_metric_source_drift and name in (
+                'scratch/sat-bs-handset/metrics/ue-metrics.cc',
+                'scratch/sat-bs-handset/metrics/ue-metrics.h'):
+                drift.append(name)
+            else:
+                raise ValueError('Queue reference is stale: '+name)
+    if drift:
+        write_json(out/'calibration-source-drift.json', dict(
+            reason='UE metric exporter changed after queue calibration; physical model hashes match',
+            paths=drift))
     return path, ref
 
 
@@ -143,8 +153,11 @@ def plan(out, settings, reference_path, calibration, only=None):
         measurement=dict(startS=20, endS=119, transportWindowMs=settings['windowMs'],
             displayBinS=settings['displayBinS'], statisticalUnit='one simulation per independent RNG seed'))
     write_json(out/'manifest.json', manifest)
-    patch = subprocess.run(['git', 'diff'], cwd=ROOT, text=True, capture_output=True, check=True)
-    (out/'workspace.patch').write_text(patch.stdout)
+    if (ROOT/'.git').exists():
+        patch = subprocess.run(['git', 'diff'], cwd=ROOT, text=True, capture_output=True, check=True)
+        (out/'workspace.patch').write_text(patch.stdout)
+    else:
+        (out/'workspace.patch').write_text('Prebuilt worker bundle without git metadata. See source-snapshot and sourceHashes.\n')
     print(f"Planned {len(groups)} sweeps, {len(configs)} unique configurations, {len(run_rows)} runs", flush=True)
     return manifest
 
@@ -333,6 +346,10 @@ def main():
     parser.add_argument('--reference', type=Path, help='accepted queue reference for the current model; otherwise calibrate automatically')
     parser.add_argument('--reuse', type=Path, nargs='+', help='reuse completed exact config/seed matches with an identical physical model and metric extractor')
     parser.add_argument('--jobs', type=int, default=8)
+    parser.add_argument('--prebuilt', action='store_true',
+                        help='use the existing optimized simulator binary on a deployed worker')
+    parser.add_argument('--allow-metric-source-drift', action='store_true',
+                        help='accept only UE metric-exporter hash drift in an otherwise matching queue reference')
     parser.add_argument('--seeds', type=int, nargs='+', help='override independent RNG runs for a new plan')
     parser.add_argument('--only', nargs='+', help='new plan: select sweep keys (default: all configured sweeps)')
     parser.add_argument('--plan-only', action='store_true')
@@ -360,7 +377,11 @@ def main():
         from plot import analyze
         analyze(out, reextract=args.reextract)
         return
-    subprocess.run(['./ns3', 'build', 'sat-bs-handset', 'queue-calibration', '-j', str(min(args.jobs, 4))], cwd=ROOT/'ns-3-dev', check=True)
+    if args.prebuilt:
+        if not BIN.is_file():
+            parser.error('prebuilt simulator binary is missing')
+    else:
+        subprocess.run(['./ns3', 'build', 'sat-bs-handset', 'queue-calibration', '-j', str(min(args.jobs, 4))], cwd=ROOT/'ns-3-dev', check=True)
     manifest_path = out/'manifest.json'
     if manifest_path.exists():
         if args.seeds or args.only or args.reference or args.tcp_buffer_policy:
@@ -377,7 +398,7 @@ def main():
             settings['rngRuns'] = args.seeds
         if settings['windowMs'] != 50 or settings['displayBinS'] != 1:
             parser.error('this experiment defines 50 ms transport windows and 1 s display/KPI bins')
-        path, calibration = reference(out, args.reference, args.jobs)
+        path, calibration = reference(out, args.reference, args.jobs, args.allow_metric_source_drift)
         manifest = plan(out, settings, path, calibration, args.only)
     if args.reuse:
         for previous in args.reuse:

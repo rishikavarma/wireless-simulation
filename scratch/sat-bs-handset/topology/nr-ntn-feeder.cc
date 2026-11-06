@@ -17,6 +17,7 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/three-gpp-propagation-loss-model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -171,13 +172,25 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     const double oneWayS = feederDelayS + serviceDelayS;
     out.baseRtt = Seconds(2.0 * oneWayS);
     const double capacityBps = app.dataRate.GetBitRate();
-    out.queueBytes = app.queueSizeBytes > 0
-                         ? app.queueSizeBytes
-                         : ComputeQueueBytes(capacityBps, out.baseRtt, app.queueSizeBdp);
-    ApplyQueueBudgetDefaults(out.queueBytes);
+    const auto resolveQueue = [&](uint64_t directionalBytes) {
+        if (directionalBytes > 0)
+        {
+            return directionalBytes;
+        }
+        if (app.queueSizeBytes > 0)
+        {
+            return app.queueSizeBytes;
+        }
+        return ComputeQueueBytes(capacityBps, out.baseRtt, app.queueSizeBdp);
+    };
+    const uint64_t queueBytesUl = resolveQueue(app.queueSizeBytesUl);
+    const uint64_t queueBytesDl = resolveQueue(app.queueSizeBytesDl);
+    out.queueBytes = std::max(queueBytesUl, queueBytesDl);
+    ApplyQueueBudgetDefaults(queueBytesUl, queueBytesDl);
     std::cout << "config application tcpVariant=" << app.tcpVariant
               << " queueSizeBdp=" << app.queueSizeBdp << " aqm=" << AqmTypeToString(app.aqm)
               << " capacityBps=" << capacityBps << " baseRttS=" << out.baseRtt.GetSeconds()
+              << " queueBytesUl=" << queueBytesUl << " queueBytesDl=" << queueBytesDl
               << " queueBytes=" << out.queueBytes << '\n';
 
     // Upstream expires HARQ after only 16 slots, before an NTN grant/feedback
@@ -221,6 +234,11 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
         ulUePhy->GetPowerAllocationType() == NrSpectrumValueHelper::UNIFORM_POWER_ALLOCATION_USED;
     DynamicCast<NrGnbNetDevice>(out.gnbNetDev.Get(0))->GetScheduler(1)->SetAttribute(
         "UlGrantPowerAwareMcs", BooleanValue(grantPowerCorrection));
+    // An SR has no buffer size and its BSR needs a full NTN round trip to come back. Owe the
+    // handset 192 B as consecutive-slot grants (128 B, then 64 B) so a packet tail is sent
+    // meanwhile; the scheduler discounts these bytes when the BSR arrives.
+    DynamicCast<NrGnbNetDevice>(out.gnbNetDev.Get(0))->GetScheduler(1)->SetAttribute(
+        "UlSrGrantBudget", UintegerValue(sim.IsHandheld() ? 192 : 0));
     dlGnbPhy->SetPattern("DL|DL|DL|DL|DL|DL|DL|DL|DL|DL|");
     ulGnbPhy->SetPattern("UL|UL|UL|UL|UL|UL|UL|UL|UL|UL|");
     NrHelper::GetBwpManagerGnb(out.gnbNetDev.Get(0))->SetOutputLink(1, 0);
@@ -265,6 +283,12 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
         routing->SetDefaultRoute(out.epcHelper->GetUeDefaultGatewayAddress(),1);
     }
     out.nrHelper->AttachToClosestGnb(out.ueNrNetDev, out.gnbNetDev);
+    // DRBs are created by the RRC attach events after the simulator starts.
+    // Apply their directional limits after attach and before application traffic.
+    Simulator::Schedule(Seconds(std::max(1.0, sim.warmUp - 1.0)),
+                        &ApplyDirectionalRlcBudgets,
+                        queueBytesUl,
+                        queueBytesDl);
 
     out.visibility = CreateObject<BentPipePropagationLossModel>();
     out.visibility->Configure(gnbMob, ueMob, satMob,
@@ -365,14 +389,25 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     }
     // K1/K2 must leave enough time for a grant or DL transport block to
     // traverse the bent pipe and for the timing-advanced UL response to be
-    // emitted. Use the radio-horizon slant ranges as a pass-wide bound.
+    // emitted. Bound the slant range at each hop's visibility mask rather
+    // than at the radio horizon: invisible paths cannot carry a grant.
     const double satRadius = satMob->GetPosition().GetLength();
     const double gnbRadius = gnbMob->GetPosition().GetLength();
-    const double ueRadius = ueMob->GetPosition().GetLength();
-    const double maxFeederRange =
-        std::sqrt(std::max(0.0, satRadius * satRadius - gnbRadius * gnbRadius));
-    const double maxServiceRange =
-        std::sqrt(std::max(0.0, satRadius * satRadius - ueRadius * ueRadius));
+    const auto maxVisibleRange = [satRadius](double groundRadius, double minElevationDeg) {
+        const double radial = groundRadius * std::sin(minElevationDeg * M_PI / 180.0);
+        return std::sqrt(radial * radial + satRadius * satRadius -
+                         groundRadius * groundRadius) - radial;
+    };
+    const double maxFeederRange = maxVisibleRange(gnbRadius, sim.feederMinElevationDeg);
+    double maxServiceRange =
+        maxVisibleRange(ueMob->GetPosition().GetLength(), sim.serviceMinElevationDeg);
+    for (uint32_t i = 0; i < background.GetN(); ++i)
+    {
+        const double groundRadius =
+            background.Get(i)->GetObject<MobilityModel>()->GetPosition().GetLength();
+        maxServiceRange = std::max(maxServiceRange,
+                                   maxVisibleRange(groundRadius, sim.serviceMinElevationDeg));
+    }
     const double maxRttS = 2.0 * (maxFeederRange + maxServiceRange) / 299792458.0;
     const uint32_t ntnKOffset =
         static_cast<uint32_t>(std::ceil(maxRttS / dlGnbPhy->GetSlotPeriod().GetSeconds()));
@@ -394,8 +429,8 @@ InstallNrNtnBentPipe(Ptr<Node> ue,
     out.phyMetrics->Connect(out.ueNrNetDev.Get(0), out.gnbNetDev.Get(0));
 
     // Apply AQM on the ground PGW↔BS P2P hop (100 Gb/s; usually not the bottleneck). Leave NR devices
-    // on their helper-installed traffic-control defaults; RLC TX buffers already
-    // use the BDP budget via ApplyQueueBudgetDefaults.
+    // on their helper-installed traffic-control defaults; directional RLC TX
+    // buffers are set after Attach via ApplyDirectionalRlcBudgets.
     InstallAqmOnDevices(app.aqm, out.queueBytes, bsPgwDevs);
 
     if (nrTraces)

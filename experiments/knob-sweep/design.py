@@ -39,10 +39,7 @@ def sweeps(settings, calibration):
             setter(cfg, value)
             # Queue size is independent of pacing; every variant uses this run's
             # current clear-link calibration, including bandwidth-dependent budgets.
-            bandwidth = f"{cfg['radio']['ulBandwidthHz']/1e6:g}"
-            bdp = calibration['bandwidthBudgets'][bandwidth]['referenceBdpBytes']
-            cfg['application']['queueSizeBytes'] = max(calibration['minimumQueueBytes'],
-                math.ceil(cfg['application']['queueSizeBdp'] * bdp))
+            dataset_presets.apply_queue_budget(cfg, dict(queueCalibration=calibration))
             policy = cfg['application'].get('socket-enlargement', settings.get('tcpBufferPolicy', 'default'))
             cfg['application']['socket-enlargement'] = policy if cfg['application'].get('transport', 'tcp') == 'tcp' else 'default'
             cfg['application']['tcpSocketBufferBytes'] = (

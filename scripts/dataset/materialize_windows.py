@@ -3,18 +3,23 @@
 
 The token archives remain the source of truth. Re-run this command with new
 --context, --prediction, or --stride values without repeating simulations.
-The default profile split refits bucket boundaries on training profiles only.
+The default stratified split refits bucket boundaries on training runs only.
 Windows never cross run boundaries.
 """
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 
-from dataset_presets import is_test_run, rng_of, split_rng_runs, test_replicates
+from dataset_presets import (
+    assign_stratified_splits,
+    is_test_run,
+    rng_of,
+    split_rng_runs,
+    test_replicates,
+)
 from dataset_storage import atomic_json, atomic_npz, batches, window_token_runs
 
 
@@ -81,15 +86,23 @@ def materialize(dataset_dir, out_dir, context, prediction, stride):
 
 
 def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
-                           test_fraction=0.2, seed=None):
-    """Hold out whole configurations, refitting buckets from training profiles only."""
+                           test_fraction=0.2, validation_fraction=0.1, seed=None):
+    """Build a stratified train/validation/test window dataset.
+
+    Every profile and every RNG seed contribute to all three sets (rotated
+    within each profile), matching UNUM's diverse 80/20 coverage rather than
+    holding out whole configurations or whole seeds. Bucket boundaries are fit
+    on training runs only.
+    """
     from dataset_storage import vector_tokenize
     from make_datasets import fit_boundaries_on_train
 
     if context < 1 or prediction < 1 or stride < 1:
         raise ValueError('context, prediction, and stride must be positive')
-    if not 0 < test_fraction < 1:
-        raise ValueError('test fraction must be between zero and one')
+    if not 0 < test_fraction < 1 or not 0 < validation_fraction < 1:
+        raise ValueError('test and validation fractions must be between zero and one')
+    if test_fraction + validation_fraction >= 1:
+        raise ValueError('test and validation fractions must leave a training share')
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((dataset_dir/'manifest.json').read_text())
     token_index = json.loads((dataset_dir/'token-runs-index.json').read_text())
@@ -107,29 +120,47 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     by_case = {}
     for run in runs:
         by_case.setdefault(run['case'], []).append(run)
-    if len(by_case) < 2:
-        raise ValueError('profile split needs at least two configurations')
+    if len(by_case) < 1:
+        raise ValueError('stratified split needs at least one configuration')
     expected_rng = {rng_of(run) for run in runs}
     if not partial and any({rng_of(run) for run in group} != expected_rng for group in by_case.values()):
         raise ValueError('each profile must have the same RNG replicate set')
-    seed = manifest['settings'].get('designSeed', 0) if seed is None else seed
+    settings = manifest.get('settings', {})
+    seed = settings.get('designSeed', 0) if seed is None else seed
+    test_fraction = float(settings.get('testFraction', test_fraction))
+    validation_fraction = float(settings.get('validationFraction', validation_fraction))
     previous_path = out_dir/'dataset-index.json'
     if previous_path.exists():
         previous = json.loads(previous_path.read_text())
-        if any((previous.get('splitUnit') != 'profile',
+        if any((previous.get('splitUnit') != 'stratified-run',
                 previous.get('sourceDataset') != str(dataset_dir.resolve()),
                 previous.get('context') != context,
                 previous.get('future') != prediction,
                 previous.get('windowStride') != stride,
                 previous.get('testFraction') != test_fraction,
+                previous.get('validationFraction') != validation_fraction,
                 previous.get('splitSeed') != seed)):
             raise ValueError('output contains a different dataset; choose a fresh --out-dir')
-    ordered_cases = sorted(by_case)
-    np.random.default_rng(seed).shuffle(ordered_cases)
-    n_test = min(len(ordered_cases)-1, max(1, math.ceil(len(ordered_cases)*test_fraction)))
-    test_cases = set(ordered_cases[:n_test])
-    selected = {split: [run for run in runs if (run['case'] in test_cases) == is_test]
-                for split, is_test in (('train', False), ('test', True))}
+    assignment = assign_stratified_splits(
+        runs, test_fraction=test_fraction, validation_fraction=validation_fraction, seed=seed)
+    selected = {split: [run for run in runs if assignment[run['prefix']] == split]
+                for split in ('train', 'validation', 'test')}
+    if any(not selected[split] for split in selected):
+        raise ValueError('stratified split left an empty train/validation/test set')
+    # Every profile always touches all three sets. With at least as many profiles
+    # as replicates, rotation also puts every RNG seed into all three sets.
+    if not partial:
+        for case, group in by_case.items():
+            labels = {assignment[run['prefix']] for run in group}
+            if labels != {'train', 'validation', 'test'}:
+                raise ValueError(f'profile {case} is missing a split: {sorted(labels)}')
+        if len(by_case) >= len(expected_rng):
+            by_rng = {}
+            for run in runs:
+                by_rng.setdefault(rng_of(run), set()).add(assignment[run['prefix']])
+            for rng_run, labels in by_rng.items():
+                if labels != {'train', 'validation', 'test'}:
+                    raise ValueError(f'RNG {rng_run} is missing a split: {sorted(labels)}')
     source_names = token_index['sourceFeatures']
     columns = token_index['features']
 
@@ -144,9 +175,7 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
                 raise ValueError('token feature schema mismatch in '+str(path))
             return saved['continuous']
 
-    # The stream campaign's original boundaries saw every profile. A profile
-    # holdout must instead fit its own boundaries from training profiles alone.
-    limit = manifest['settings'].get('quantileSampleTokens', 200000)
+    limit = settings.get('quantileSampleTokens', 200000)
     if limit < 1:
         raise ValueError('quantile sample size must be positive')
     rng = np.random.default_rng(seed)
@@ -167,14 +196,17 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     atomic_json(out_dir/'dataset-boundaries.json', edges)
 
     seq_len = context + prediction
-    shard_runs = manifest['settings'].get('shardRuns') or 20
+    shard_runs = settings.get('shardRuns') or 20
     index = dict(format='sharded-npz-v1', sourceDataset=str(dataset_dir.resolve()),
                  context=context, future=prediction, windowStride=stride,
-                 splitUnit='profile', splitSeed=seed, testFraction=test_fraction,
+                 splitUnit='stratified-run', splitSeed=seed,
+                 testFraction=test_fraction, validationFraction=validation_fraction,
                  partial=partial,
-                 trainCases=sorted(set(by_case)-test_cases), testCases=sorted(test_cases),
+                 trainCases=sorted({run['case'] for run in selected['train']}),
+                 validationCases=sorted({run['case'] for run in selected['validation']}),
+                 testCases=sorted({run['case'] for run in selected['test']}),
                  source_feature_names=source_names, feature_names=columns,
-                 quantileFit=dict(method='uniform random-priority sample of training profile tokens',
+                 quantileFit=dict(method='uniform random-priority sample of training-run tokens',
                                   sampleTokens=min(limit, seen), seenTrainTokens=seen, seed=seed),
                  splits={})
     for split, group_runs in selected.items():
@@ -192,7 +224,7 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
                     ids.append(run['prefix'])
                     starts.append(start)
             if set(ids) != {run['prefix'] for run in group}:
-                raise ValueError('a profile run has no complete window')
+                raise ValueError('a stratified-run has no complete window')
             sequences = np.stack(sequences)
             filename = f'dataset-{split}/{number:05d}.npz'
             atomic_npz(out_dir/filename, sequences=sequences,
@@ -210,12 +242,13 @@ def materialize_by_profile(dataset_dir, out_dir, context, prediction, stride,
     atomic_json(out_dir/'post-complete.json', dict(
         runs=len(runs), context=context, prediction=prediction, stride=stride,
         trainWindows=index['splits']['train']['windows'],
+        validationWindows=index['splits']['validation']['windows'],
         testWindows=index['splits']['test']['windows']))
     return index
 
 
 def materialize_profile_radio(dataset_dir, out_dir, selected, shard_runs):
-    """Assign the saved one-second radio tensors to the same profile split."""
+    """Assign the saved one-second radio tensors to the same stratified split."""
     source = dataset_dir/'radio-index.json'
     if not source.exists():
         return
@@ -238,8 +271,8 @@ def materialize_profile_radio(dataset_dir, out_dir, selected, shard_runs):
                 values_by_run.update(zip(ids, saved['values'].copy()))
     expected = {run['prefix'] for group in selected.values() for run in group}
     if set(values_by_run) != expected:
-        raise ValueError('source radio index does not cover every profile run')
-    index = dict(format='sharded-radio-npz-v1', splitUnit='profile',
+        raise ValueError('source radio index does not cover every stratified run')
+    index = dict(format='sharded-radio-npz-v1', splitUnit='stratified-run',
                  feature_names=features, splits={})
     for split, group_runs in selected.items():
         index['splits'][split] = []
@@ -262,27 +295,33 @@ def main():
     parser.add_argument('--prediction', type=int, default=10)
     parser.add_argument('--stride', type=int, default=0,
                         help='tokens between starts; default context + prediction')
-    parser.add_argument('--split-unit', choices=('rng', 'profile'), default='profile',
-                        help='hold out whole simulation profiles (default) or RNG runs')
+    parser.add_argument('--split-unit', choices=('rng', 'stratified'), default='stratified',
+                        help='stratified train/validation/test (default) or RNG-held-out diagnostic')
     parser.add_argument('--test-fraction', type=float, default=0.2,
-                        help='fraction of profiles held out with --split-unit profile')
+                        help='per-profile test share for --split-unit stratified')
+    parser.add_argument('--validation-fraction', type=float, default=0.1,
+                        help='per-profile validation share for --split-unit stratified')
     parser.add_argument('--split-seed', type=int,
-                        help='profile split seed; default is the saved design seed')
+                        help='split rotation seed; default is the saved design seed')
     args = parser.parse_args()
     stride = args.stride or args.context + args.prediction
-    suffix = ('windows-profile' if args.split_unit == 'profile' else 'windows')
+    suffix = ('windows-stratified' if args.split_unit == 'stratified' else 'windows')
     out = args.out_dir or args.dataset_dir/f'{suffix}-c{args.context}-p{args.prediction}-s{stride}'
     if out.resolve() == args.dataset_dir.resolve():
         parser.error('--out-dir must differ from --dataset-dir')
-    if args.split_unit == 'profile':
+    if args.split_unit == 'stratified':
         index = materialize_by_profile(args.dataset_dir, out, args.context,
                                        args.prediction, stride, args.test_fraction,
-                                       args.split_seed)
+                                       args.validation_fraction, args.split_seed)
+        print(f"context={args.context} prediction={args.prediction} stride={stride} "
+              f"train={index['splits']['train']['windows']} "
+              f"validation={index['splits']['validation']['windows']} "
+              f"test={index['splits']['test']['windows']} out={out}")
     else:
         index = materialize(args.dataset_dir, out, args.context, args.prediction, stride)
-    print(f"context={args.context} prediction={args.prediction} stride={stride} "
-          f"train={index['splits']['train']['windows']} "
-          f"test={index['splits']['test']['windows']} out={out}")
+        print(f"context={args.context} prediction={args.prediction} stride={stride} "
+              f"train={index['splits']['train']['windows']} "
+              f"test={index['splits']['test']['windows']} out={out}")
 
 
 if __name__ == '__main__':

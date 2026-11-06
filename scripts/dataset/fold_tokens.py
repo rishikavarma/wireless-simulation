@@ -5,7 +5,7 @@ The ns-3 run keeps writing one TCP row every 5 ms. This script reads those
 rows (and optional SINR traces) and writes one token per window. The window
 comes from output.token* in config.json.
 
-Min-RTT aggregation (default):
+Min-RTT aggregation (default for TCP):
   1. Size each window from the **current** min RTT (``rtt_rate * srtt``) at
      the first sample of the buffer (not locked for the whole flow).
   2. Accumulate fine-grained samples until wall time >= that window RTT.
@@ -14,6 +14,11 @@ Min-RTT aggregation (default):
   4. Emit one token; ``base_rtt`` is a model-facing alias for the measured
      ``minrtt`` used to size that token. It is not a second RTT measurement.
 
+UDP RTT aggregation uses ``tokenRttColumn=pdcp_2xdelay``: twice the latest
+completed one-second mean DL PDCP SDU delay (``DRB.RlcSduDelayDl_us``), held
+across 5 ms samples until the next KPI bin. Missing delay bins fall back to
+``tokenMissingRttS``.
+
 Set ``output.tokenRttLock`` true to freeze min RTT from the first sample
 (UNUM CC runtime). Set ``tokenRttColumn`` to ``srtt`` to size windows on
 smoothed RTT. ``tokenAggregate`` may be ``weighted`` (default), ``mean``, or
@@ -21,6 +26,7 @@ smoothed RTT. ``tokenAggregate`` may be ``weighted`` (default), ``mean``, or
 """
 
 import argparse
+import bisect
 import csv
 
 from metric_io import read_commented_csv
@@ -31,6 +37,8 @@ from pathlib import Path
 
 
 MINRTT_ALIASES = ("minrtt", "min_rtt", "base_rtt")
+PDCP_2XDELAY_COLUMN = "pdcp_2xdelay"
+PDCP_DELAY_KPI_COLUMN = "DRB.RlcSduDelayDl_us"
 
 
 def load_config(path):
@@ -147,11 +155,72 @@ def difference(values):
     return present[-1] - present[0]
 
 
+def _finite_positive(value):
+    """Parse a numeric cell and return it only when it is finite and positive."""
+    if value is None or value == '':
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def annotate_pdcp_2xdelay(tcp_rows, kpi_rows, seconds_per_unit=0.1):
+    """Stamp each sample with 2× the latest completed 1 s DL PDCP delay average.
+
+    ``DRB.RlcSduDelayDl_us`` is one-way PDCP→PDCP completion delay for the
+    primary UE. Twice that delay, converted into Sage RTT units
+    (``seconds_per_unit``, default 0.1 s), is written as ``pdcp_2xdelay``.
+    Samples before the first finite KPI delay leave the column unset so fold
+    can fall back to ``tokenMissingRttS``.
+    """
+    if seconds_per_unit <= 0:
+        raise ValueError('tokenRttSecondsPerUnit must be positive')
+    series = []
+    for row in kpi_rows:
+        ue = row.get('ue_index')
+        if ue is not None and str(ue).strip() not in ('0', '0.0'):
+            continue
+        delay_us = _finite_positive(row.get(PDCP_DELAY_KPI_COLUMN))
+        try:
+            time_s = float(row.get('time_s'))
+        except (TypeError, ValueError):
+            continue
+        if delay_us is None or not math.isfinite(time_s):
+            continue
+        series.append((time_s, delay_us))
+    series.sort(key=lambda item: item[0])
+    times = [item[0] for item in series]
+    for row in tcp_rows:
+        try:
+            sample_t = float(row.get('time_s'))
+        except (TypeError, ValueError):
+            row[PDCP_2XDELAY_COLUMN] = None
+            continue
+        if not math.isfinite(sample_t):
+            row[PDCP_2XDELAY_COLUMN] = None
+            continue
+        index = bisect.bisect_right(times, sample_t) - 1
+        if index < 0:
+            row[PDCP_2XDELAY_COLUMN] = None
+            continue
+        rtt_s = 2.0 * series[index][1] * 1e-6
+        row[PDCP_2XDELAY_COLUMN] = rtt_s / seconds_per_unit
+
+
+def load_kpi_rows(path):
+    """Read primary-UE KPI rows as strings (ue_index must stay discrete)."""
+    with Path(path).open(newline='', encoding='utf-8') as handle:
+        return list(csv.DictReader(handle))
+
+
 def window_rtt_units(row, rtt_column):
     """RTT used to size tokens, in the same Sage units as ``srtt``.
 
     ``minrtt`` / ``min_rtt`` / ``base_rtt`` resolve to ``rtt_rate * srtt``
-    (minimum RTT). Any other name is read as a plain column on the row.
+    (minimum RTT). ``pdcp_2xdelay`` and any other name are read as plain
+    columns on the row (non-finite / non-positive → 0).
     """
     if rtt_column in MINRTT_ALIASES:
         direct = row.get('minrtt')
@@ -164,8 +233,8 @@ def window_rtt_units(row, rtt_column):
         if srtt is None or rtt_rate is None:
             return 0.0
         return float(rtt_rate) * float(srtt)
-    value = row.get(rtt_column)
-    return 0.0 if value is None else float(value)
+    value = _finite_positive(row.get(rtt_column))
+    return 0.0 if value is None else value
 
 
 def sample_dts_s(times_us):
@@ -369,6 +438,7 @@ def write_tokens(path, tokens, feature_keys, cfg):
             f"# One token per window. mode={mode} aggregate={aggregate} "
             f"rtt_column={rtt_column} lock_rtt={bool(lock_rtt)}. "
             "minrtt windows use current rtt_rate*srtt unless lock_rtt; "
+            "pdcp_2xdelay windows use 2x the latest 1 s DL PDCP delay average; "
             "time-weighted mean (lost=delta, ca_state=mode). "
             "SINR is hold-last at the last sample in the window.\n"
         )
@@ -402,6 +472,18 @@ def main():
     cfg = load_config(args.config)
     tcp_fields, tcp_rows = read_csv(args.tcp)
     feature_keys = [key for key in tcp_fields if key != "time_s"]
+    mode = cfg_get(cfg, "output.tokenMode", "rtt")
+    rtt_column = cfg_get(cfg, "output.tokenRttColumn", "minrtt")
+    if mode == "rtt" and rtt_column == PDCP_2XDELAY_COLUMN:
+        tcp_path = Path(args.tcp)
+        kpi_path = tcp_path.parent / (tcp_path.name.removesuffix("-tcp.csv") + "-kpis.csv")
+        if not kpi_path.exists():
+            raise SystemExit(f"pdcp_2xdelay token sizing requires {kpi_path}")
+        annotate_pdcp_2xdelay(
+            tcp_rows,
+            load_kpi_rows(kpi_path),
+            float(cfg_get(cfg, "output.tokenRttSecondsPerUnit", 0.1)),
+        )
     _, sinr_dl = read_csv(args.sinr_dl) if args.sinr_dl else ([], [])
     _, sinr_ul = read_csv(args.sinr_ul) if args.sinr_ul else ([], [])
     tokens = fold(tcp_rows, feature_keys, sinr_dl, sinr_ul, cfg)

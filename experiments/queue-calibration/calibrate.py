@@ -316,10 +316,20 @@ def analyze(out, reference=None):
                 plateauChecksBySeed=seed_checks, largerBufferChecksBySeed=buffer_checks)
     budgets = {}
     for bandwidth in s['bandwidthMHz']:
-        bdp = max(c['bdpBytes'] for c in cohorts.values() if c['bandwidthMHz']==bandwidth)
-        budgets[str(bandwidth)] = dict(referenceBdpBytes=bdp,
-            bytesByMultiplier={str(m): max(s['minimumQueueBytes'], math.ceil(m*bdp))
-                               for m in s['queueMultipliers']})
+        by_dir = {c['direction']: c['bdpBytes']
+                  for c in cohorts.values() if c['bandwidthMHz']==bandwidth}
+        ul_bdp = by_dir['ul']
+        dl_bdp = by_dir['dl']
+        bdp = max(ul_bdp, dl_bdp)
+        multipliers = lambda value: {str(m): max(s['minimumQueueBytes'], math.ceil(m*value))
+                                     for m in s['queueMultipliers']}
+        budgets[str(bandwidth)] = dict(
+            referenceBdpBytes=bdp,
+            ulBdpBytes=ul_bdp,
+            dlBdpBytes=dl_bdp,
+            bytesByMultiplier=multipliers(bdp),
+            bytesByMultiplierUl=multipliers(ul_bdp),
+            bytesByMultiplierDl=multipliers(dl_bdp))
     result = dict(schemaVersion=2,
         method='median per-seed unloaded data RTT with immediate ACKs and saturated PDCP SDU service rate',
         rttAckPolicy='immediate (DelAckCount=1); workload sweeps keep default delayed ACKs',
@@ -327,7 +337,7 @@ def analyze(out, reference=None):
         experiment=str(out.relative_to(ROOT)), modelHashes=manifest['modelHashes'],
         binarySha256=(out/'binary-hash.txt').read_text().strip(),
         settings=s, cohorts=cohorts, bandwidthBudgets=budgets,
-        budgetPolicy='maximum UL/DL BDP for each bandwidth; common per-buffer byte budget',
+        budgetPolicy='directional UL/DL BDP: UE RLC uses UL BDP, gNB RLC uses DL BDP; DropTail/shared hops use max(UL,DL)',
         minimumQueueBytes=s['minimumQueueBytes'], accepted=not issues and not manifest['pilot'],
         issues=issues, runs=rows, planRevisions=manifest.get('planRevisions', []))
     (out/'summary.json').write_text(json.dumps(result, indent=2)+'\n')

@@ -1,10 +1,12 @@
 {
   "profileCount": 2000,
+  "tokenMode": "rtt",
   "includeStressProfiles": false,
   "replicates": 20,
   "rngStart": 10001,
   "designSeed": 20261020,
   "testFraction": 0.2,
+  "validationFraction": 0.1,
   "windowStride": 20,
   "shardRuns": 100,
   "quantileSampleTokens": 200000,

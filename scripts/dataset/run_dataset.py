@@ -12,7 +12,7 @@ def profiles():
  base=campaign_config.draw(base,random.Random(11),'probe',False,False,'clear',0)
  base['topology']['bsEastOffsetKm']=0;base['application']['dataRate']='10kbps'
  base['metrics']={'physical':True,'payload':False,'intervalS':1}
- # Shared wall-clock windows are necessary for UDP, which has no TCP RTT.
+ # Comparison anchors start fixed; the full preset overrides per transport.
  base['output'].update(tokenMode='fixed',tokenFixedS=0.1,tokenRttLock=False)
  result=[]
  def add(name,group,update):
@@ -70,6 +70,8 @@ def plan(out,stem,settings=None):
                 'tcpVariant':cfg['application']['tcpVariant'],'direction':cfg['application'].get('direction','ul'),
                 'dataRate':cfg['application']['dataRate'],'queueSizeBdp':cfg['application']['queueSizeBdp'],
                 'queueSizeBytes':cfg['application'].get('queueSizeBytes'),
+                'queueSizeBytesUl':cfg['application'].get('queueSizeBytesUl'),
+                'queueSizeBytesDl':cfg['application'].get('queueSizeBytesDl'),
                 'socket-enlargement':cfg['application'].get('socket-enlargement','default'),
                 'tcpSocketBufferBytes':cfg['application'].get('tcpSocketBufferBytes'),
                 'queueBudgetMultiplier':cfg['application']['queueSizeBdp'],
@@ -243,6 +245,7 @@ def main():
  p.add_argument('--replicates',type=int,help='matched RNG repeats per profile; comparison defaults to 4, full to 20')
  p.add_argument('--design-seed',type=int,help='seed for sampling the full-preset configurations')
  p.add_argument('--target-windows',type=int,help='increase the full-preset profile count to reach this many 20-token windows')
+ p.add_argument('--token-mode',choices=('rtt','fixed'),help='full preset: RTT-scale tokens (TCP minrtt / UDP 2x PDCP delay) or fixed 100 ms tokens')
  p.add_argument('--observation-seconds',type=int,help='full preset: measured interval length, excluding warm-up and drain')
  p.add_argument('--describe',action='store_true',help='print settings and planned size without creating files or running simulations')
  p.add_argument('--run-prefix',default='full',help='unique result prefix for a fresh collection')
@@ -275,7 +278,7 @@ def main():
  if a.stream and (a.post or a.analyze or a.report):p.error('--stream includes tokenization; --post, --analyze and --report require retained raw files')
  if a.describe:
   if a.clean or any((a.plan,a.run,a.post,a.analyze,a.report)):p.error('--describe cannot be combined with --clean or execution stages')
-  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds)
+  try:configuration=dataset_presets.settings(a.preset or 'comparison',a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds,a.token_mode)
   except ValueError as e:p.error(str(e))
   print(json.dumps({'settings':configuration,'plannedSize':dataset_presets.planned_size(configuration)},indent=2));return
  if a.out_dir is None:p.error('--out-dir is required unless --describe is used')
@@ -293,7 +296,7 @@ def main():
   a.plan=True
  if a.plan:
   if not a.run_prefix or any(not (c.isalnum() or c in '-_') for c in a.run_prefix):p.error('invalid --run-prefix')
-  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds)
+  try:configuration=dataset_presets.settings(a.preset or previous.get('preset','comparison'),a.profile_count,a.replicates,a.design_seed,a.target_windows,a.design_file,a.observation_seconds,a.token_mode)
   except ValueError as e:p.error(str(e))
   if a.clean:
    try:clean_experiment(out,ROOT/'results','dataset')

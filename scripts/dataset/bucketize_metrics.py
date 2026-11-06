@@ -26,7 +26,16 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fold_tokens import fold, load_config, read_csv, write_tokens  # noqa: E402
+from fold_tokens import (  # noqa: E402
+    PDCP_2XDELAY_COLUMN,
+    annotate_pdcp_2xdelay,
+    cfg_get,
+    fold,
+    load_config,
+    load_kpi_rows,
+    read_csv,
+    write_tokens,
+)
 from radio_tokens import attach_radio_tokens  # noqa: E402
 
 
@@ -172,6 +181,19 @@ def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg
             for key in sage_keys:
                 if key == 'srtt' or key.startswith('rtt'):
                     row[key] = None
+    mode = cfg_get(cfg, 'output.tokenMode', 'rtt')
+    rtt_column = cfg_get(cfg, 'output.tokenRttColumn', 'minrtt')
+    prefix = tcp_path.name.removesuffix('-tcp.csv')
+    kpi_path = tcp_path.parent / f'{prefix}-kpis.csv'
+    if mode == 'rtt' and rtt_column == PDCP_2XDELAY_COLUMN:
+        if not kpi_path.exists():
+            raise FileNotFoundError(
+                f'pdcp_2xdelay token sizing requires {kpi_path}')
+        annotate_pdcp_2xdelay(
+            tcp_rows,
+            load_kpi_rows(kpi_path),
+            float(cfg_get(cfg, 'output.tokenRttSecondsPerUnit', 0.1)),
+        )
     _, dl = read_csv(sinr_dl) if sinr_dl and sinr_dl.exists() else ([], [])
     _, ul = read_csv(sinr_ul) if sinr_ul and sinr_ul.exists() else ([], [])
     tokens = fold(tcp_rows, sage_keys, dl, ul, cfg)
@@ -180,8 +202,6 @@ def build_tokens(tcp_path: Path, sinr_dl: Path | None, sinr_ul: Path | None, cfg
         raise ValueError(f'unsupported application transport: {transport}')
     for token in tokens:
         token['is_udp'] = int(transport == 'udp')
-    prefix = tcp_path.name.removesuffix('-tcp.csv')
-    kpi_path = tcp_path.parent / f'{prefix}-kpis.csv'
     if cfg.get('metrics', {}).get('physical') is True and not kpi_path.exists():
         raise FileNotFoundError(f'physical telemetry is enabled but {kpi_path} is missing')
     if kpi_path.exists():

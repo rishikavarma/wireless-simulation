@@ -402,32 +402,39 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         trainWindows=index['splits']['train']['windows'],
         testWindows=index['splits']['test']['windows']))
     # Preserve the streamed RNG split for seed-generalization diagnostics, but
-    # expose a profile-held-out dataset as the default training artifact.
-    if len({rec['case'] for rec in runs}) < 2:
+    # expose a stratified train/validation/test dataset as the default artifact.
+    if len({rec['case'] for rec in runs}) < 1:
         atomic_json(out/'default-dataset.json', dict(index='dataset-index.json',
                     splitUnit='matched RNG run', partial=completion['partial'],
                     completion='completion-summary.json'))
         return
+    # Cloud workers build the default stratified shards after the collector has
+    # sealed the immutable token and radio indexes.
+    if os.environ.get('DISTRIBUTED_POSTPROCESS') == '1':
+        return
     from materialize_windows import materialize_by_profile
-    profile_out = out/'windows-profile-c10-p10-s20'
+    settings = manifest['settings']
+    profile_out = out/'windows-stratified-c10-p10-s20'
     profile_index = profile_out/'dataset-index.json'
     if (profile_index.exists() and (profile_out/'post-complete.json').exists() and
             (profile_out/'radio-index.json').exists()):
         saved = json.loads(profile_index.read_text())
-        if (saved.get('splitUnit') != 'profile' or saved.get('context') != 10 or
+        if (saved.get('splitUnit') != 'stratified-run' or saved.get('context') != 10 or
                 saved.get('future') != 10 or saved.get('windowStride') != 20 or
-                saved.get('splitSeed') != manifest['settings'].get('designSeed', 0) or
-                saved.get('testFraction') != 0.2 or
+                saved.get('splitSeed') != settings.get('designSeed', 0) or
+                saved.get('testFraction') != settings.get('testFraction', 0.2) or
+                saved.get('validationFraction') != settings.get('validationFraction', 0.1) or
                 saved.get('sourceDataset') != str(out.resolve())):
-            raise ValueError('saved default profile dataset uses different settings')
+            raise ValueError('saved default stratified dataset uses different settings')
         dataset_metadata(profile_out)
     else:
         materialize_by_profile(out, profile_out, 10, 10, 20)
     atomic_json(out/'default-dataset.json', dict(
-        path='windows-profile-c10-p10-s20',
-        index='windows-profile-c10-p10-s20/dataset-index.json',
-        splitUnit='profile', partial=completion['partial'], completion='completion-summary.json'))
-    print('streamed', len(runs), 'runs into train/test indexed shards', flush=True)
+        path='windows-stratified-c10-p10-s20',
+        index='windows-stratified-c10-p10-s20/dataset-index.json',
+        splitUnit='stratified-run', partial=completion['partial'],
+        completion='completion-summary.json'))
+    print('streamed', len(runs), 'runs into stratified train/validation/test shards', flush=True)
 
 
 def part_rng(part, runs):

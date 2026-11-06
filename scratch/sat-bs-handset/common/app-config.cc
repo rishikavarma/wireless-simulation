@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <iostream>
 #include <string>
 
 namespace ns3
@@ -191,17 +192,40 @@ ComputeQueueBytes(double capacityBps, Time baseRtt, double queueSizeBdp)
     return std::max<uint64_t>(queueBytes, kMinQueueBytes);
 }
 
-/** Apply the byte budget to default device queues and AM/UM RLC transmit buffers before devices are
- * installed.
- */
+/** Apply the larger directional budget to DropTail and RLC defaults before devices are installed. */
 void
-ApplyQueueBudgetDefaults(uint64_t queueBytes)
+ApplyQueueBudgetDefaults(uint64_t queueBytesUl, uint64_t queueBytesDl)
 {
-    NS_ABORT_MSG_IF(queueBytes == 0, "queue budget must be > 0");
+    NS_ABORT_MSG_IF(queueBytesUl == 0 || queueBytesDl == 0, "queue budget must be > 0");
+    const uint64_t queueBytes = std::max(queueBytesUl, queueBytesDl);
     const QueueSize queueSize(std::to_string(queueBytes) + "B");
     Config::SetDefault("ns3::DropTailQueue<Packet>::MaxSize", QueueSizeValue(queueSize));
     Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(queueBytes));
     Config::SetDefault("ns3::NrRlcAm::MaxTxBufferSize", UintegerValue(queueBytes));
+}
+
+/** Override DRB RLC TX buffers after Attach: UE side is UL, gNB side is DL. */
+void
+ApplyDirectionalRlcBudgets(uint64_t queueBytesUl, uint64_t queueBytesDl)
+{
+    NS_ABORT_MSG_IF(queueBytesUl == 0 || queueBytesDl == 0, "queue budget must be > 0");
+    auto setMatched = [](const std::string& path, uint64_t bytes) {
+        const auto matches = Config::LookupMatches(path);
+        for (uint32_t i = 0; i < matches.GetN(); ++i)
+        {
+            matches.Get(i)->SetAttribute("MaxTxBufferSize", UintegerValue(bytes));
+        }
+        return matches.GetN();
+    };
+    const uint32_t ulCount =
+        setMatched("/NodeList/*/DeviceList/*/NrUeRrc/DataRadioBearerMap/*/NrRlc", queueBytesUl);
+    const uint32_t dlCount = setMatched(
+        "/NodeList/*/DeviceList/*/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/NrRlc",
+        queueBytesDl);
+    NS_ABORT_MSG_IF(ulCount == 0, "no UE DRB RLC instances found for UL queue budget");
+    NS_ABORT_MSG_IF(dlCount == 0, "no gNB DRB RLC instances found for DL queue budget");
+    std::cout << "config directionalRlc ulBytes=" << queueBytesUl << " ueBearers=" << ulCount
+              << " dlBytes=" << queueBytesDl << " gnbBearers=" << dlCount << '\n';
 }
 
 /** Replace existing root queue discs on the supplied devices with the selected AQM and apply its

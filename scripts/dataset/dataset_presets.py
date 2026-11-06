@@ -34,21 +34,38 @@ def calibrated_queues(config):
                 minimumQueueBytes=reference['minimumQueueBytes'], policy=reference['budgetPolicy'])
 
 
+def _directional_bdp(budgets, direction):
+    """Return the calibrated UL or DL BDP; fall back to the shared max reference."""
+    key = 'ulBdpBytes' if direction == 'ul' else 'dlBdpBytes'
+    if key in budgets:
+        return budgets[key]
+    return budgets['referenceBdpBytes']
+
+
 def apply_queue_budget(cfg, config):
-    """Use the same measured byte budget across traffic types and directions."""
+    """Size UE (UL) and gNB (DL) RLC buffers from their directional BDPs."""
     bandwidth = f"{cfg['radio']['ulBandwidthHz']/1e6:g}"
     reference = config['queueCalibration']
-    bdp = reference['bandwidthBudgets'][bandwidth]['referenceBdpBytes']
-    cfg['application']['queueSizeBytes'] = max(reference['minimumQueueBytes'],
-        math.ceil(cfg['application']['queueSizeBdp'] * bdp))
+    budgets = reference['bandwidthBudgets'][bandwidth]
+    floor = reference['minimumQueueBytes']
+    mult = cfg['application']['queueSizeBdp']
+    ul = max(floor, math.ceil(mult * _directional_bdp(budgets, 'ul')))
+    dl = max(floor, math.ceil(mult * _directional_bdp(budgets, 'dl')))
+    cfg['application']['queueSizeBytesUl'] = ul
+    cfg['application']['queueSizeBytesDl'] = dl
+    # Shared hops / legacy consumers use the larger directional budget.
+    cfg['application']['queueSizeBytes'] = max(ul, dl)
 
 
 def enlarged_socket_bytes(calibration, largest_queue=0):
     """Use one finite buffer covering the calibrated queues and path pipeline."""
     budgets = calibration['bandwidthBudgets'].values()
     largest_bdp = max(b['referenceBdpBytes'] for b in budgets)
-    largest_queue = max(largest_queue, max((q for b in budgets
-        for q in b.get('bytesByMultiplier', {}).values()), default=0))
+    queue_values = []
+    for b in budgets:
+        for key in ('bytesByMultiplier', 'bytesByMultiplierUl', 'bytesByMultiplierDl'):
+            queue_values.extend(b.get(key, {}).values())
+    largest_queue = max(largest_queue, max(queue_values, default=0))
     required = max(131072, math.ceil(2*(largest_queue+largest_bdp)))
     size = 1 << (required-1).bit_length()
     if size >= 2**32:
@@ -69,7 +86,7 @@ def socket_buffer_arguments(cfg, fallback=None):
 
 
 def settings(preset='comparison', profile_count=None, replicates=None, design_seed=None, target_windows=None,
-             design_file=None, observation_seconds=None):
+             design_file=None, observation_seconds=None, token_mode=None):
     if preset == 'full':
         source = Path(design_file) if design_file is not None else FULL_SETTINGS
         contents = source.read_bytes()
@@ -81,10 +98,14 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
         if design_file is not None:
             raise ValueError('--design-file requires the full preset')
         result = dict(profileCount=50, replicates=4, rngStart=701, designSeed=11,
-                      testFraction=0.25, windowStride=10, shardRuns=0)
+                      testFraction=0.25, validationFraction=0.25, windowStride=10, shardRuns=0)
     else:
         raise ValueError(f'unknown preset: {preset}')
     result['preset'] = preset
+    if token_mode is not None:
+        if preset != 'full':
+            raise ValueError('--token-mode requires the full preset')
+        result['tokenMode'] = token_mode
     if observation_seconds is not None:
         if preset != 'full' or observation_seconds < 1 or int(observation_seconds) != observation_seconds:
             raise ValueError('--observation-seconds requires the full preset and a positive integer')
@@ -102,19 +123,29 @@ def settings(preset='comparison', profile_count=None, replicates=None, design_se
         raise ValueError('the full preset requires relaySwitchEnabled: true')
     if preset == 'full' and result.get('satelliteAltitudeKm') != 800:
         raise ValueError('the full preset fixes satelliteAltitudeKm at 800')
-    if result['replicates'] < 2:
-        raise ValueError('at least two RNG replicates are required for a held-out split')
+    result.setdefault('validationFraction', 0.1)
+    if result['replicates'] < 3:
+        raise ValueError('at least three RNG replicates are required for train/validation/test')
     if result['designSeed'] < 0:
         raise ValueError('design seed must be nonnegative')
     if not 0 < result['testFraction'] < 1:
         raise ValueError('testFraction must be between zero and one')
+    if not 0 < result['validationFraction'] < 1:
+        raise ValueError('validationFraction must be between zero and one')
+    if result['testFraction'] + result['validationFraction'] >= 1:
+        raise ValueError('testFraction + validationFraction must leave a training share')
     if preset == 'full' and any(result[key] <= 0 for key in ('shardRuns', 'quantileSampleTokens')):
         raise ValueError('full-preset shard/sample sizes must be positive')
     if preset == 'full' and result['windowStride'] < 20:
         raise ValueError('full-preset windows must not overlap: windowStride must be at least 20')
-    n_test = max(1, math.ceil(result['replicates'] * result['testFraction']))
-    n_test = min(result['replicates'] - 1, n_test)
+    n_train, n_val, n_test = split_share_counts(
+        result['replicates'], result['testFraction'], result['validationFraction'])
+    # Legacy RNG-diagnostic path still holds out the final replicate block.
     result['testReplicates'] = list(range(result['replicates'] - n_test, result['replicates']))
+    result['validationReplicates'] = list(range(
+        result['replicates'] - n_test - n_val, result['replicates'] - n_test))
+    result['trainReplicates'] = list(range(0, n_train))
+    result['splitUnit'] = 'stratified-run'
     if target_windows is not None:
         if preset != 'full' or target_windows < 1:
             raise ValueError('--target-windows requires the full preset and a positive target')
@@ -137,11 +168,56 @@ def rng_of(rec):
     return rec['rngRun'] if 'rngRun' in rec else rec['replicate']
 
 
+def split_share_counts(n, test_fraction, validation_fraction):
+    """Choose integer train/validation/test counts for one profile's replicates."""
+    if n < 3:
+        raise ValueError('stratified train/validation/test needs at least 3 replicates')
+    n_test = min(n - 2, max(1, round(n * test_fraction)))
+    n_val = min(n - n_test - 1, max(1, round(n * validation_fraction)))
+    n_train = n - n_test - n_val
+    if n_train < 1:
+        raise ValueError('replicates cannot cover train/validation/test at the requested fractions')
+    return n_train, n_val, n_test
+
+
+def assign_stratified_splits(runs, test_fraction=0.2, validation_fraction=0.1, seed=0):
+    """Assign each run to train/validation/test with even feature and seed coverage.
+
+    UNUM's Appendix 8.1 uses an 80/20 train/test sample split and keeps diverse
+    scenario categories in the test set, rather than holding out whole seeds or
+    whole configurations. Here every profile contributes runs to all three sets,
+    and the replicate block is rotated by profile so each RNG seed also appears
+    in train, validation, and test across the campaign.
+    """
+    if not 0 < test_fraction < 1 or not 0 < validation_fraction < 1:
+        raise ValueError('split fractions must be in (0, 1)')
+    if test_fraction + validation_fraction >= 1:
+        raise ValueError('test and validation fractions must leave a training share')
+    by_case = {}
+    for run in runs:
+        by_case.setdefault(run['case'], []).append(run)
+    if not by_case:
+        raise ValueError('no runs to split')
+    assignment = {}
+    for case_index, case in enumerate(sorted(by_case)):
+        group = sorted(by_case[case], key=lambda run: (int(run['replicate']), run['prefix']))
+        n_train, n_val, n_test = split_share_counts(
+            len(group), test_fraction, validation_fraction)
+        offset = (case_index + int(seed)) % len(group)
+        rotated = group[offset:] + group[:offset]
+        labels = (['test'] * n_test) + (['validation'] * n_val) + (['train'] * n_train)
+        for run, label in zip(rotated, labels):
+            assignment[run['prefix']] = label
+    return assignment
+
+
 def split_rng_runs(manifest):
     """Keep every profile that shares an RNG run on the same side of the split.
 
     Held-out replicates stay together, so a training RNG number never appears
     in the test set and a held-out RNG number never appears in training.
+    Retained as a seed-generalization diagnostic; the default training artifact
+    uses assign_stratified_splits instead.
     """
     held = test_replicates(manifest)
     train, test = set(), set()
@@ -206,6 +282,24 @@ def stress_profiles(base, config):
     return result
 
 
+def set_token_mode(cfg, config):
+    """Size tokens by a measured RTT proxy when the design asks for RTT mode.
+
+    TCP uses the socket minimum RTT. UDP has no TCP RTT, so it uses twice the
+    latest completed one-second mean DL PDCP SDU delay (``pdcp_2xdelay``).
+    Fixed mode keeps the shared 100 ms wall-clock tokens for every transport.
+    """
+    if config.get('tokenMode') == 'rtt':
+        if cfg['application'].get('transport', 'tcp') == 'tcp':
+            cfg['output'].update(tokenMode='rtt', tokenRttColumn='minrtt',
+                                 tokenRttLock=False, tokenMissingRttS=0.1)
+        else:
+            cfg['output'].update(tokenMode='rtt', tokenRttColumn='pdcp_2xdelay',
+                                 tokenRttLock=False, tokenMissingRttS=0.1)
+    else:
+        cfg['output'].update(tokenMode='fixed', tokenFixedS=0.1, tokenRttLock=False)
+
+
 def expand_profiles(anchors, config):
     """Keep controlled comparisons and add balanced application/transport/direction strata.
 
@@ -229,9 +323,7 @@ def expand_profiles(anchors, config):
             continue
         cfg['handover']['enabled'] = True
         cfg['satellite']['altitudeKm'] = config['satelliteAltitudeKm']
-        if config.get('tokenMode') == 'rtt':
-            cfg['output'].update(tokenMode='rtt', tokenRttColumn='minrtt',
-                                 tokenRttLock=False, tokenMissingRttS=0.1)
+        set_token_mode(cfg, config)
         apply_queue_budget(cfg, config)
         signature = json.dumps(cfg, sort_keys=True)
         if signature not in signatures:
@@ -270,12 +362,10 @@ def expand_profiles(anchors, config):
     while len(result) < config['profileCount']:
         app, transport, variant, direction, sockets = strata[(len(result) - len(anchors) - len(stress)) % len(strata)]
         cfg = copy.deepcopy(templates[app])
-        if config.get('tokenMode') == 'rtt':
-            cfg['output'].update(tokenMode='rtt', tokenRttColumn='minrtt',
-                                 tokenRttLock=False, tokenMissingRttS=0.1)
         application = cfg['application']
         application.update(transport=transport, tcpVariant=variant, direction=direction,
                            queueSizeBdp=choose('queueSizeBdp'))
+        set_token_mode(cfg, config)
         application['socket-enlargement'] = sockets
         # The scenario's minimal JSON parser supports numbers, but not null.
         application['tcpSocketBufferBytes'] = config['enlargedSocketBufferBytes'] if sockets == 'socket-enlargement' else 0
@@ -327,17 +417,22 @@ def expand_profiles(anchors, config):
 
 def planned_size(config):
     runs = config['profileCount'] * config['replicates']
+    n_train, n_val, n_test = split_share_counts(
+        config['replicates'], config['testFraction'], config.get('validationFraction', 0.1))
+    shares = dict(trainRuns=config['profileCount'] * n_train,
+                  validationRuns=config['profileCount'] * n_val,
+                  testRuns=config['profileCount'] * n_test,
+                  splitUnit=config.get('splitUnit', 'stratified-run'),
+                  trainReplicatesPerProfile=n_train,
+                  validationReplicatesPerProfile=n_val,
+                  testReplicatesPerProfile=n_test)
     if config.get('tokenMode') == 'rtt':
-        return dict(runs=runs, trainRuns=config['profileCount']*(config['replicates']-len(config['testReplicates'])),
-                    testRuns=config['profileCount']*len(config['testReplicates']),
-                    windowStride=config['windowStride'], context=10, future=10,
-                    tokenMode='rtt', windows=None, expectedOnly=True)
+        return dict(runs=runs, windowStride=config['windowStride'], context=10, future=10,
+                    tokenMode='rtt', windows=None, expectedOnly=True, **shares)
     # Shared fixed 100 ms bins cover 99 seconds; context and future are 10 tokens each.
     tokens_per_run = config.get('observationSeconds', 99) * 10
     windows_per_run = (tokens_per_run - 20) // config['windowStride'] + 1
     return dict(runs=runs, uniqueTimeTokens=runs * tokens_per_run, tokensPerRun=tokens_per_run,
                 windowsPerRun=windows_per_run, windows=runs * windows_per_run,
-                trainRuns=config['profileCount']*(config['replicates']-len(config['testReplicates'])),
-                testRuns=config['profileCount']*len(config['testReplicates']),
                 windowStride=config['windowStride'], context=10, future=10,
-                tokenSeconds=0.1, expectedOnly=True)
+                tokenSeconds=0.1, expectedOnly=True, **shares)

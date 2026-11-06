@@ -69,6 +69,8 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
     }
     Overlay(root, "application.queueSizeBdp", cfg.workload.queueSizeBdp, JsonDouble);
     Overlay(root, "application.queueSizeBytes", cfg.workload.queueSizeBytes, JsonUint);
+    Overlay(root, "application.queueSizeBytesUl", cfg.workload.queueSizeBytesUl, JsonUint);
+    Overlay(root, "application.queueSizeBytesDl", cfg.workload.queueSizeBytesDl, JsonUint);
     Overlay(root, "application.computeDelayUs", cfg.workload.computeDelayUs, JsonUint);
     if (const std::optional<std::string> aqm = JsonGet(root, "application.aqm"))
     {
@@ -208,6 +210,10 @@ LoadApplication(const JsonNode& root, ScenarioConfig& cfg)
     }
     NS_ABORT_MSG_IF(w.queueSizeBytes > 0 && w.queueSizeBytes < 10240,
                     "application.queueSizeBytes must be zero or at least 10240");
+    NS_ABORT_MSG_IF(w.queueSizeBytesUl > 0 && w.queueSizeBytesUl < 10240,
+                    "application.queueSizeBytesUl must be zero or at least 10240");
+    NS_ABORT_MSG_IF(w.queueSizeBytesDl > 0 && w.queueSizeBytesDl < 10240,
+                    "application.queueSizeBytesDl must be zero or at least 10240");
     NS_ABORT_MSG_IF(w.queueSizeBdp <= 0.0, "application.queueSizeBdp must be > 0");
     NS_ABORT_MSG_IF(w.tcpVariant.empty(), "application.tcpVariant must be set");
 }

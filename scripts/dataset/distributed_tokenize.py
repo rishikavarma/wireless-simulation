@@ -41,10 +41,10 @@ def transport(kind, operation, zone, project, *paths, remote_command=None):
     return args
 
 
-def run(kind, operation, zone, project, *paths, remote_command=None):
+def run(kind, operation, zone, project, *paths, remote_command=None, timeout=3600):
     subprocess.run(transport(kind, operation, zone, project, *paths,
                             remote_command=remote_command), check=True,
-                   stdin=subprocess.DEVNULL, timeout=3600)
+                   stdin=subprocess.DEVNULL, timeout=timeout)
 
 
 def completed(campaign):
@@ -254,7 +254,10 @@ def main():
     subprocess.run(['python3', str(ROOT/'scripts/dataset/run_dataset.py'),
         '--stream', '--stream-from-raw', '--run', '--finalize-only',
         '--out-dir', str(campaign), '--batch-runs', '64', '--calibration-runs', '64',
-        '--jobs', '8'], check=True)
+        '--jobs', '8'], check=True,
+        env={**os.environ, 'DISTRIBUTED_POSTPROCESS': '1'})
+    subprocess.run(['python3', str(ROOT/'scripts/dataset/distributed_post.py'),
+        '--campaign', str(campaign), '--ranges', str(args.ranges)], check=True)
 
 
 if __name__ == '__main__':

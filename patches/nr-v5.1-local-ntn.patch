@@ -453,7 +453,7 @@ index 2476070..d386f4e 100644
      ueInfo->m_ulCqi.m_wbCqi = GetAmcUl()->CreateCqiFeedbackSiso(specVals, ueInfo->m_ulMcs);
      NS_LOG_DEBUG("Calculated MCS for RNTI " << ueInfo->m_rnti << " is " << ueInfo->m_ulMcs);
 diff --git a/model/nr-mac-scheduler-ns3.cc b/model/nr-mac-scheduler-ns3.cc
-index b50fbb9..4254ed2 100644
+index b50fbb9..801bcd6 100644
 --- a/model/nr-mac-scheduler-ns3.cc
 +++ b/model/nr-mac-scheduler-ns3.cc
 @@ -114,6 +114,11 @@ NrMacSchedulerNs3::GetTypeId()
@@ -468,7 +468,7 @@ index b50fbb9..4254ed2 100644
              .AddAttribute("CqiTimerThreshold",
                            "The time while a CQI is valid",
                            TimeValue(Seconds(1)),
-@@ -132,6 +137,12 @@ NrMacSchedulerNs3::GetTypeId()
+@@ -132,6 +137,26 @@ NrMacSchedulerNs3::GetTypeId()
                            MakeBooleanAccessor(&NrMacSchedulerNs3::SetFixedUlMcs,
                                                &NrMacSchedulerNs3::IsUlMcsFixed),
                            MakeBooleanChecker())
@@ -478,10 +478,24 @@ index b50fbb9..4254ed2 100644
 +                          BooleanValue(false),
 +                          MakeBooleanAccessor(&NrMacSchedulerNs3::m_ulGrantPowerAwareMcs),
 +                          MakeBooleanChecker())
++            .AddAttribute("UlSrGrantSize",
++                          "Largest transport-block request, in bytes, that one slot of the grant "
++                          "owed after a scheduling request may ask for. An SR carries no size, so "
++                          "this must fit a BSR plus a typical small packet.",
++                          UintegerValue(128),
++                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_ulSrGrantSize),
++                          MakeUintegerChecker<uint32_t>(1))
++            .AddAttribute("UlSrGrantBudget",
++                          "Total bytes owed to a UE after a scheduling request, issued as "
++                          "consecutive-slot grants of at most UlSrGrantSize until the BSR it "
++                          "carries arrives. A budget not above UlSrGrantSize issues one grant.",
++                          UintegerValue(0),
++                          MakeUintegerAccessor(&NrMacSchedulerNs3::m_ulSrGrantBudget),
++                          MakeUintegerChecker<uint32_t>())
              .AddAttribute("StartingMcsDl",
                            "Starting MCS for DL",
                            UintegerValue(0),
-@@ -604,6 +615,7 @@ NrMacSchedulerNs3::DoCschedUeConfigReq(
+@@ -604,6 +629,7 @@ NrMacSchedulerNs3::DoCschedUeConfigReq(
          UeInfoOf(*itUe)->m_dlMcs = m_startMcsDl;
          UeInfoOf(*itUe)->m_startMcsDlUe = m_startMcsDl;
          UeInfoOf(*itUe)->m_ulMcs = m_startMcsUl;
@@ -489,7 +503,29 @@ index b50fbb9..4254ed2 100644
          UeInfoOf(*itUe)->m_dlAmc = m_dlAmc;
          UeInfoOf(*itUe)->m_ulAmc = m_ulAmc;
          UeInfoOf(*itUe)->m_mcsCsiSource = m_mcsCsiSource;
-@@ -1212,7 +1224,9 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
+@@ -870,12 +896,21 @@ NrMacSchedulerNs3::BSRReceivedFromUe(const MacCeElement& bsr)
+     // no longer owed: from here on the uplink allocation follows the reported buffer.
+     UeInfoOf(*itUe)->m_srBytesPending = 0;
+ 
++    // Grants issued after the SR bootstrap grant left the gNB before this report (which rode on
++    // the bootstrap grant) could arrive, so the report still counts the bytes they already
++    // cover. Take them off once, or the same bytes would be granted a second time.
++    uint32_t alreadyGranted = UeInfoOf(*itUe)->m_srUnconfirmedBytes;
++    UeInfoOf(*itUe)->m_srUnconfirmedBytes = 0;
++
+     // The UE only notifies the buf size as sum of all components.
+     // see nr-ue-mac.cc:395
+     for (uint8_t lcg = 0; lcg < 4; ++lcg)
+     {
+         uint8_t bsrId = bsr.m_macCeValue.m_bufferStatus.at(lcg);
+         uint32_t bufSize = NrMacShortBsrCe::FromLevelToBytes(bsrId);
++        const uint32_t covered = std::min(bufSize, alreadyGranted);
++        bufSize -= covered;
++        alreadyGranted -= covered;
+ 
+         auto itLcg = UeInfoOf(*itUe)->m_ulLCG.find(lcg);
+         if (itLcg == UeInfoOf(*itUe)->m_ulLCG.end())
+@@ -1212,7 +1247,9 @@ NrMacSchedulerNs3::ResetExpiredHARQ(uint16_t rnti, NrMacHarqVector* harq)
              continue;
          }
  
@@ -500,19 +536,81 @@ index b50fbb9..4254ed2 100644
          {
              ++process.m_timer;
              NS_LOG_INFO("Updated process for UE " << rnti << " number "
+@@ -1438,7 +1475,7 @@ NrMacSchedulerNs3::ComputeActiveUe(ActiveUeMap* activeUe,
+         // lets it report its buffer status (3GPP TS 38.321, clauses 5.4.4 and 5.4.5).
+         if (!isDl)
+         {
+-            totBuffer += ue->m_srBytesPending;
++            totBuffer += std::min(ue->m_srBytesPending, m_ulSrGrantSize);
+         }
+ 
+         const auto& harqV = GetHarqVector(ue);
+@@ -1781,8 +1818,22 @@ NrMacSchedulerNs3::DoScheduleUlData(PointInFTPlane* spoint,
+                 continue;
+             }
+ 
+-            // The request has been answered by this grant.
+-            ue.first->m_srBytesPending = 0;
++            // This slot's share of the grant owed after the SR has been issued; any remainder is
++            // issued in the next slot, before the BSR can return.
++            if (ue.first->m_srBytesPending > 0)
++            {
++                const uint32_t asked = std::min(ue.first->m_srBytesPending, m_ulSrGrantSize);
++                if (ue.first->m_srBytesPending < std::max(m_ulSrGrantBudget, m_ulSrGrantSize))
++                {
++                    // Not the bootstrap grant itself: the BSR will not know about it. Count only
++                    // the payload, so that under-counting leaves bytes granted, not stranded.
++                    constexpr uint32_t rlcAmWorstCaseHeaderBytes = 4;
++                    const uint32_t overhead = MAC_SUBHEADER_SIZE + rlcAmWorstCaseHeaderBytes;
++                    ue.first->m_srUnconfirmedBytes +=
++                        dci->m_tbSize > overhead ? dci->m_tbSize - overhead : 0;
++                }
++                ue.first->m_srBytesPending -= asked;
++            }
+ 
+             assigned = true;
+ 
+@@ -1874,10 +1925,13 @@ NrMacSchedulerNs3::DoScheduleUlSr(PointInFTPlane* spoint, const std::list<uint16
+     NS_LOG_FUNCTION(this);
+     NS_ASSERT(spoint->m_rbg == 0);
+ 
+-    // 12 bytes of payload, plus the RLC header and the MAC subheader the UE prepends to them:
+-    // the request must buy a transport block that actually fits a buffer status report and a
+-    // minimal RLC PDU, not just their payload.
+-    const uint32_t srGrantSize = 12 + 2 + MAC_SUBHEADER_SIZE;
++    // An SR carries no size, so the bootstrap grant has to carry the buffer status report plus
++    // a typical small packet (TCP ACK, request, keepalive). A grant that only fits the report
++    // forces a second SR/BSR/grant round, each costing the full NTN K2 offset and propagation.
++    // Measured at 17/96/128/256 B on the 10 MHz UL RTT probe: 128 B gives the lowest RTT per
++    // PRB; 256 B gains nothing further and costs about six times the UL PRBs. A larger budget is
++    // issued as further grants in the following slots (see UlSrGrantBudget).
++    const uint32_t srGrantSize = std::max(m_ulSrGrantBudget, m_ulSrGrantSize);
+ 
+     for (const auto& v : rntiList)
+     {
+@@ -1896,6 +1950,7 @@ NrMacSchedulerNs3::DoScheduleUlSr(PointInFTPlane* spoint, const std::list<uint16
+         NS_LOG_DEBUG("Owing a " << srGrantSize << " byte bootstrap grant to UE " << v
+                                 << " because of a SR");
+         ueIt->second->m_srBytesPending = srGrantSize;
++        ueIt->second->m_srUnconfirmedBytes = 0;
+     }
+ }
+ 
 diff --git a/model/nr-mac-scheduler-ns3.h b/model/nr-mac-scheduler-ns3.h
-index e1ae87d..7dc5b8d 100644
+index e1ae87d..a069430 100644
 --- a/model/nr-mac-scheduler-ns3.h
 +++ b/model/nr-mac-scheduler-ns3.h
-@@ -1002,6 +1002,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+@@ -1002,6 +1002,9 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
  
      bool m_fixedMcsDl{false};  //!< Fixed MCS for *all* UE in DL
      bool m_fixedMcsUl{false};  //!< Fixed MCS for *all* UE in UL
 +    bool m_ulGrantPowerAwareMcs{false}; //!< Flat-channel fixed-total-power UL grant correction
++    uint32_t m_ulSrGrantSize{128};  //!< Largest per-slot request of the grant owed after an SR
++    uint32_t m_ulSrGrantBudget{0};  //!< Total bytes owed after an SR, over consecutive slots
      uint8_t m_startMcsDl{0};   //!< Starting (or fixed) value for DL MCS
      uint8_t m_startMcsUl{0};   //!< Starting (or fixed) value for UL MCS
      int8_t m_maxDlMcs{0};      //!< Maximum index for DL MCS
-@@ -1066,6 +1067,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
+@@ -1066,6 +1069,7 @@ class NR_EXPORT NrMacSchedulerNs3 : public NrMacScheduler
  
      uint32_t m_srsSlotCounter{0}; //!< Counter for UL slots
  
@@ -747,7 +845,7 @@ index ed6b387..12dd129 100644
  NrMacSchedulerUeInfo::ResetUlMetric()
  {
 diff --git a/model/nr-mac-scheduler-ue-info.h b/model/nr-mac-scheduler-ue-info.h
-index b954019..88b7dca 100644
+index b954019..8b21df8 100644
 --- a/model/nr-mac-scheduler-ue-info.h
 +++ b/model/nr-mac-scheduler-ue-info.h
 @@ -222,6 +222,15 @@ class NR_EXPORT NrMacSchedulerUeInfo
@@ -766,7 +864,15 @@ index b954019..88b7dca 100644
      /**
       * @brief ResetUlMetric
       *
-@@ -364,6 +373,9 @@ class NR_EXPORT NrMacSchedulerUeInfo
+@@ -326,6 +335,7 @@ class NR_EXPORT NrMacSchedulerUeInfo
+      * its logical channels look active.
+      */
+     uint32_t m_srBytesPending{0};
++    uint32_t m_srUnconfirmedBytes{0}; //!< Payload granted after the bootstrap grant, not yet in a BSR
+ 
+     uint32_t m_dlMRBRetx{0};       //!< MRB assigned for retx. To update the name,
+                                    //!< what is MRB is not defined
+@@ -364,6 +374,9 @@ class NR_EXPORT NrMacSchedulerUeInfo
  
      CqiInfo m_dlCqi; //!< DL CQI information
      CqiInfo m_ulCqi; //!< UL CQI information
@@ -1248,7 +1354,7 @@ index ff00e5f..fde61c0 100644
      std::list<uint8_t> m_extensionBits1; ///< Includes E1 after ACK_SN
      std::list<uint8_t> m_extensionBits2; ///< extension bits 2
 diff --git a/model/nr-rlc-am.cc b/model/nr-rlc-am.cc
-index 35eee58..54ab942 100644
+index 35eee58..00ff404 100644
 --- a/model/nr-rlc-am.cc
 +++ b/model/nr-rlc-am.cc
 @@ -15,6 +15,9 @@
@@ -1864,7 +1970,18 @@ index 35eee58..54ab942 100644
      m_txPdu(m_rnti, m_lcid, packet->GetSize());
  
      // Send RLC PDU to MAC layer
-@@ -795,7 +1031,11 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -780,6 +1016,10 @@ NrRlcAm::DoNotifyTxOpportunity(NrMacSapUser::TxOpportunityParameters txOpParams)
+     params.componentCarrierId = txOpParams.componentCarrierId;
+ 
+     m_macSapProvider->TransmitPdu(params);
++    // The MAC's local queue estimate cannot subtract the PDU size from an SDU
++    // backlog: that includes this RLC header. Refresh it before another grant
++    // is decoded, including a speculative grant in the following slot.
++    DoTransmitBufferStatusReport();
+ }
+ 
+ void
+@@ -795,7 +1035,11 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
  
      // Get RLC header parameters
      NrRlcAmHeader rlcAmHeader;
@@ -1877,7 +1994,7 @@ index 35eee58..54ab942 100644
      NS_LOG_LOGIC("RLC header: " << rlcAmHeader);
  
      // Receiver timestamp
-@@ -815,6 +1055,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -815,6 +1059,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
  
      delay = Simulator::Now() - rlcTag.GetSenderTimestamp();
  
@@ -1885,7 +2002,7 @@ index 35eee58..54ab942 100644
      m_rxPdu(m_rnti, m_lcid, rxPduParams.p->GetSize(), delay.GetNanoSeconds());
  
      if (rlcAmHeader.IsDataPdu())
-@@ -932,24 +1173,9 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -932,24 +1177,9 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
          }
          else
          {
@@ -1912,7 +2029,7 @@ index 35eee58..54ab942 100644
              }
          }
  
-@@ -1130,24 +1356,19 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -1130,24 +1360,19 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
  
                  incrementVtA = false;
  
@@ -1948,7 +2065,7 @@ index 35eee58..54ab942 100644
              }
              else
              {
-@@ -1191,6 +1412,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
+@@ -1191,6 +1416,7 @@ NrRlcAm::DoReceivePdu(NrMacSapUser::ReceivePduParameters rxPduParams)
  
          } // loop over SN : VT(A) <= SN < ACK SN
  
@@ -1956,7 +2073,7 @@ index 35eee58..54ab942 100644
          return;
      }
      else
-@@ -1370,7 +1592,19 @@ NrRlcAm::DoTransmitBufferStatusReport()
+@@ -1370,7 +1596,19 @@ NrRlcAm::DoTransmitBufferStatusReport()
      r.lcid = m_lcid;
      r.txQueueSize = m_txonBufferSize;
      r.txQueueHolDelay = txonQueueHolDelay.GetMilliSeconds();
@@ -1977,7 +2094,7 @@ index 35eee58..54ab942 100644
      r.retxQueueHolDelay = retxQueueHolDelay.GetMilliSeconds();
  
      if (m_statusPduRequested && !m_statusProhibitTimer.IsPending())
-@@ -1382,17 +1616,8 @@ NrRlcAm::DoTransmitBufferStatusReport()
+@@ -1382,17 +1620,8 @@ NrRlcAm::DoTransmitBufferStatusReport()
          r.statusPduSize = 0;
      }
  
@@ -1997,7 +2114,7 @@ index 35eee58..54ab942 100644
  }
  
  void
-@@ -1467,21 +1692,9 @@ NrRlcAm::ExpirePollRetransmitTimer()
+@@ -1467,21 +1696,9 @@ NrRlcAm::ExpirePollRetransmitTimer()
                                                                            << " to retxBuffer");
          for (nr::SequenceNumber10 sn = m_vtA; sn < m_vtS; sn++)
          {
@@ -2021,7 +2138,7 @@ index 35eee58..54ab942 100644
              }
          }
      }
-@@ -1493,6 +1706,10 @@ void
+@@ -1493,6 +1710,10 @@ void
  NrRlcAm::ExpireStatusProhibitTimer()
  {
      NS_LOG_FUNCTION(this);
@@ -2692,7 +2809,7 @@ index 0cfa850..d4540fa 100644
                                          //!< starts to occupy the channel with data transmission
      TracedCallback<Time> m_txCtrlTrace; //!< trace callback that is notifying when this spectrum phy
 diff --git a/model/nr-ue-mac.cc b/model/nr-ue-mac.cc
-index cf81e7d..3da141e 100644
+index cf81e7d..9df6639 100644
 --- a/model/nr-ue-mac.cc
 +++ b/model/nr-ue-mac.cc
 @@ -216,6 +216,10 @@ NrUeMac::GetTypeId()
@@ -2907,7 +3024,25 @@ index cf81e7d..3da141e 100644
          if (availableBytes < minTxOpBytes)
          {
              NS_LOG_WARN("Not enough bytes available to send a TxPDU, skipping");
-@@ -1101,15 +1172,21 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+@@ -1062,12 +1133,15 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
+                     NS_LOG_DEBUG("LCID " << +bsr.lcid << "has no data to send, skipping");
+                     continue;
+                 }
+-                if (bsr.txQueueSize < smallestBufferBytes)
++                if (bsr.txQueueSize + rlcAmWorstCaseHeaderBytes < smallestBufferBytes)
+                 {
+                     NS_LOG_DEBUG("LCID " << +bsr.lcid
+                                          << " has less data to send so far, prioritizing it");
+                     smallestBufferBsrLcid = bsr.lcid;
+-                    smallestBufferBytes = bsr.txQueueSize;
++                    // The RLC AM header is not part of the SDU backlog. A TxOpp equal to the
++                    // queue size would segment the SDU and strand its last bytes until another
++                    // SR/grant cycle, so offer the worst-case header as well, as for LCID 1.
++                    smallestBufferBytes = bsr.txQueueSize + rlcAmWorstCaseHeaderBytes;
+                 }
+             }
+         }
+@@ -1101,15 +1175,21 @@ NrUeMac::SendTxData(uint32_t usefulTbs, uint32_t activeTx)
                                               << " of a TxOpp "
                                                  "of "
                                               << bytesPerLcId << " B for a TX PDU");
@@ -2937,7 +3072,7 @@ index cf81e7d..3da141e 100644
      }
  }
  
-@@ -1294,7 +1371,7 @@ NrUeMac::DoReceiveControlMessage(Ptr<NrControlMessage> msg)
+@@ -1294,7 +1374,7 @@ NrUeMac::DoReceiveControlMessage(Ptr<NrControlMessage> msg)
              {
                  if (it->rarPayload.raPreambleId == m_raPreambleId)
                  {
@@ -2946,7 +3081,7 @@ index cf81e7d..3da141e 100644
                  }
              }
          }
-@@ -1333,6 +1410,7 @@ NrUeMac::RaResponseTimeout(bool contention)
+@@ -1333,6 +1413,7 @@ NrUeMac::RaResponseTimeout(bool contention)
      if (m_preambleTransmissionCounter == m_rachConfig.preambleTransMax + 1)
      {
          NS_LOG_INFO("RAR timeout, preambleTransMax reached => giving up");
@@ -2954,7 +3089,7 @@ index cf81e7d..3da141e 100644
          m_cmacSapUser->NotifyRandomAccessFailed();
      }
      else
-@@ -1358,6 +1436,16 @@ NrUeMac::DoConfigureRach(NrUeCmacSapProvider::RachConfig rc)
+@@ -1358,6 +1439,16 @@ NrUeMac::DoConfigureRach(NrUeCmacSapProvider::RachConfig rc)
      m_rachConfigured = true;
  }
  
@@ -2971,7 +3106,7 @@ index cf81e7d..3da141e 100644
  NrUeCmacSapProvider::RachConfig
  NrUeMac::GetRachConfig() const
  {
-@@ -1408,6 +1496,7 @@ NrUeMac::SendRaPreamble(bool contention)
+@@ -1408,6 +1499,7 @@ NrUeMac::SendRaPreamble(bool contention)
                                       << " at: " << Simulator::Now().As(Time::MS));
      Time raWindowBegin = m_phySapProvider->GetSlotPeriod();
      Time raWindowEnd = m_phySapProvider->GetSlotPeriod() * (6 + m_rachConfig.raResponseWindowSize);
@@ -2979,7 +3114,7 @@ index cf81e7d..3da141e 100644
      Simulator::Schedule(raWindowBegin, &NrUeMac::StartWaitingForRaResponse, this);
      m_noRaResponseReceivedEvent =
          Simulator::Schedule(raWindowEnd, &NrUeMac::RaResponseTimeout, this, contention);
-@@ -1431,6 +1520,9 @@ NrUeMac::DoStartNonContentionBasedRandomAccessProcedure(uint16_t rnti,
+@@ -1431,6 +1523,9 @@ NrUeMac::DoStartNonContentionBasedRandomAccessProcedure(uint16_t rnti,
                                                          uint8_t prachMask)
  {
      NS_LOG_FUNCTION(this << rnti << (uint16_t)preambleId << (uint16_t)prachMask);
@@ -2989,7 +3124,7 @@ index cf81e7d..3da141e 100644
      NS_ASSERT_MSG(prachMask == 0,
                    "requested PRACH MASK = " << (uint32_t)prachMask
                                              << ", but only PRACH MASK = 0 is supported");
-@@ -1493,6 +1585,9 @@ void
+@@ -1493,6 +1588,9 @@ void
  NrUeMac::DoReset()
  {
      NS_LOG_FUNCTION(this);

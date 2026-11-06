@@ -2,7 +2,7 @@
 """Train a small UNUM-like bucket forecaster and compare causal baselines.
 
 This file is preparation only. It does nothing until invoked with a finalized
-profile-held-out dataset produced by scripts/dataset/materialize_windows.py.
+stratified-run dataset produced by scripts/dataset/materialize_windows.py.
 """
 from __future__ import annotations
 
@@ -51,8 +51,10 @@ def atomic_json(path: Path, value: object) -> None:
 
 def schema(dataset: Path):
     index = json.loads((dataset/'dataset-index.json').read_text())
-    if index.get('format') != 'sharded-npz-v1' or index.get('splitUnit') != 'profile':
-        raise ValueError('use a finalized profile-held-out sharded dataset')
+    if index.get('format') != 'sharded-npz-v1':
+        raise ValueError('use a finalized sharded dataset')
+    if index.get('splitUnit') not in ('stratified-run', 'profile'):
+        raise ValueError('use a stratified-run or legacy profile-held-out dataset')
     if not (dataset/'post-complete.json').is_file():
         raise ValueError('dataset is not finalized')
     context, horizon = int(index['context']), int(index['future'])
@@ -72,19 +74,32 @@ def schema(dataset: Path):
 
 
 def validation_runs(dataset: Path, index: dict, fraction: float, seed: int):
+    """Return validation run IDs and their cases.
+
+    Stratified datasets already materialize a validation split. Legacy
+    profile-held-out datasets still carve validation profiles from train.
+    """
     source = Path(index['sourceDataset'])
     if not source.is_absolute():
         source = (dataset/source).resolve()
     if not (source/'manifest.json').is_file():
-        # The archived dataset may have moved off the collector. The profile
-        # materialization is stored directly below its source campaign.
         source = dataset.parent
     if not (source/'manifest.json').is_file():
-        raise ValueError('source manifest is missing beside the profile dataset')
+        raise ValueError('source manifest is missing beside the dataset')
     manifest = json.loads((source/'manifest.json').read_text())
     by_run = {str(row['prefix']): str(row['case']) for row in manifest['runs']}
     train_runs = set(index['splits']['train']['runs'])
     test_runs = set(index['splits']['test']['runs'])
+    if 'validation' in index['splits']:
+        validation = set(index['splits']['validation']['runs'])
+        if train_runs & test_runs or train_runs & validation or test_runs & validation:
+            raise ValueError('overlapping stratified train/validation/test runs')
+        if not train_runs or not validation or not test_runs:
+            raise ValueError('invalid stratified train/validation/test split')
+        if not train_runs | validation | test_runs <= set(by_run):
+            raise ValueError('dataset run missing from source manifest')
+        cases = sorted({by_run[run_id] for run_id in validation})
+        return validation, cases
     if train_runs & test_runs or not train_runs or not test_runs:
         raise ValueError('invalid train/test run split')
     if not train_runs | test_runs <= set(by_run):
@@ -112,16 +127,22 @@ def shard_paths(dataset: Path, index: dict, split: str):
 
 def count_windows(dataset: Path, index: dict, validation: set[str]):
     counts = dict(train=0, validation=0, test=0)
-    for split in ('train', 'test'):
-        for path in shard_paths(dataset, index, split):
-            with np.load(path, allow_pickle=False) as saved:
-                ids = saved['run_ids']
-            if split == 'test':
-                counts['test'] += len(ids)
-            else:
-                count = int(np.isin(ids, list(validation)).sum())
-                counts['validation'] += count
-                counts['train'] += len(ids)-count
+    if 'validation' in index['splits']:
+        for split in ('train', 'validation', 'test'):
+            for path in shard_paths(dataset, index, split):
+                with np.load(path, allow_pickle=False) as saved:
+                    counts[split] += len(saved['run_ids'])
+    else:
+        for split in ('train', 'test'):
+            for path in shard_paths(dataset, index, split):
+                with np.load(path, allow_pickle=False) as saved:
+                    ids = saved['run_ids']
+                if split == 'test':
+                    counts['test'] += len(ids)
+                else:
+                    count = int(np.isin(ids, list(validation)).sum())
+                    counts['validation'] += count
+                    counts['train'] += len(ids)-count
     if min(counts.values()) == 0:
         raise ValueError('train, validation and test must all contain windows')
     return counts
@@ -131,7 +152,10 @@ def batches(dataset: Path, index: dict, split: str, validation: set[str],
             batch_size: int, limit: int | None, count: int, seed: int,
             expected_names: list[str]):
     rng = np.random.default_rng(seed)
-    source_split = 'test' if split == 'test' else 'train'
+    if 'validation' in index['splits']:
+        source_split = split
+    else:
+        source_split = 'test' if split == 'test' else 'train'
     paths = list(shard_paths(dataset, index, source_split))
     if split == 'train':
         rng.shuffle(paths)
@@ -142,7 +166,7 @@ def batches(dataset: Path, index: dict, split: str, validation: set[str],
             if names != expected_names:
                 raise ValueError('shard feature order changed: ' + str(path))
             ids = saved['run_ids']
-            if source_split == 'test':
+            if 'validation' in index['splits'] or source_split == 'test':
                 selected = np.arange(len(ids))
             else:
                 in_validation = np.isin(ids, list(validation))
@@ -466,11 +490,11 @@ def train(args):
     atomic_json(output/'run-plan.json', dict(dataset=str(dataset), counts=counts,
         validationCases=sorted(cases), featureNames=names,
         bucketFeatures=[dict(name=name, classes=classes) for _, name, classes in bucket],
-        trials=[asdict(trial) for trial in TRIALS],
+        trials=[asdict(trial) for trial in TRIALS if trial.name in args.trials],
         args={key: str(value) if isinstance(value, Path) else value
               for key, value in vars(args).items()}, stats=stats))
     trial_results = []
-    for trial in TRIALS:
+    for trial in (item for item in TRIALS if item.name in args.trials):
         model = UnumBuckets(bucket, direct, context, horizon, trial, stats).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=trial.learning_rate,
                                        weight_decay=.01)
@@ -526,7 +550,7 @@ def train(args):
     checkpoint = torch.load(selected['checkpoint'], map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['state'])
     scores = score_model(model, dataset, index, validation, 'test',
-        args.batch_size, None, counts['test'], names, bucket, stats, device, args.seed)
+        args.batch_size, args.test_windows, counts['test'], names, bucket, stats, device, args.seed)
     write_results(output, scores, bucket, index)
     atomic_json(output/'selected-model.json', selected)
     print(json.dumps(scores.summary(), indent=2))
@@ -535,7 +559,7 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dataset', type=Path, required=True,
-                        help='finalized windows-profile-c10-p10-s20 directory')
+                        help='finalized windows-stratified-c10-p10-s20 directory')
     parser.add_argument('--output', type=Path, required=True,
                         help='new local directory for checkpoints, scores, and plots')
     parser.add_argument('--epochs', type=int, default=25)
@@ -544,12 +568,16 @@ def main():
     parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--train-windows-per-epoch', type=int, default=500000)
     parser.add_argument('--validation-windows', type=int, default=100000)
+    parser.add_argument('--test-windows', type=int, default=None)
+    parser.add_argument('--trials', nargs='+', choices=tuple(t.name for t in TRIALS),
+                        default=[t.name for t in TRIALS])
     parser.add_argument('--validation-fraction', type=float, default=.1)
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--device', choices=('auto', 'cpu', 'cuda', 'mps'), default='auto')
     args = parser.parse_args()
     if (args.epochs < 1 or args.patience < 1 or args.batch_size < 1 or
             args.train_windows_per_epoch < 1 or args.validation_windows < 1 or
+            (args.test_windows is not None and args.test_windows < 1) or
             not 0 < args.validation_fraction < 1):
         parser.error('epochs, patience, batch size and limits must be positive; validation fraction must be in (0,1)')
     train(args)

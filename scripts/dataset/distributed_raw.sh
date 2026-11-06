@@ -8,6 +8,9 @@ usage() {
 }
 mode=full
 if [[ ${1:-} == --short ]]; then mode=short; shift; fi
+# Short keeps documented fixed 100 ms tokens; full uses RTT tokens (TCP minrtt / UDP 2x PDCP).
+token_args=""
+if [[ $mode == short ]]; then token_args="--token-mode fixed"; fi
 [[ $# -ge 1 && $# -le 2 ]] || usage
 phase=$1
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -131,7 +134,7 @@ PY
     fi
     if [[ ! -f "$campaign_dir/manifest.json" ]]; then
         python3 scripts/dataset/run_dataset.py --preset full --stream --observation-seconds 300 \
-            --profile-count "$profile_count" --replicates "$replicates" \
+            --profile-count "$profile_count" --replicates "$replicates" $token_args \
             --out-dir "$campaign_dir" --run-prefix "$campaign" --plan
     fi
     python3 - "$campaign_dir" "$profile_count" "$replicates" <<'PY'
@@ -184,11 +187,10 @@ check_ready() {
 check_vms() {
     check_ready
     local instance zone project start stop transport failures=0 remote cores free_kib remote_min_gib remote_min_cpus
-    if [[ $mode == short ]]; then
-        remote_min_gib=70; remote_min_cpus=32
-    else
-        remote_min_gib=300; remote_min_cpus=64
-    fi
+    # Both campaign sizes stream sealed parts off the 100 GB worker boot disks.
+    # The production fleet is n2-standard-48, so requiring 64 cores or 300 GiB
+    # would reject every healthy worker before the full campaign could start.
+    remote_min_gib=70; remote_min_cpus=32
     while IFS=$'\t' read -r instance zone project start stop transport; do
         echo "checking SSH: $instance ($zone, $project)"
         if ! remote=$(vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
@@ -220,7 +222,7 @@ stage_one() {
     vm_gcloud 120 ssh --zone "$zone" --project "$project" "$instance" \
         --command="cd ~/wireless-simulation-worker && export LD_LIBRARY_PATH=\"\$PWD/ns-3-dev/build/lib\" && test -x ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized && ldd ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized > /tmp/dataset-libraries.txt && ! grep 'not found' /tmp/dataset-libraries.txt"
     local plan_args=""
-    if [[ $mode == short ]]; then plan_args="--profile-count 1000 --replicates 20"; fi
+    if [[ $mode == short ]]; then plan_args="--profile-count 1000 --replicates 20 --token-mode fixed"; fi
     vm_gcloud 300 ssh --zone "$zone" --project "$project" "$instance" \
         --command="cd ~/wireless-simulation-worker && (test -f results/$campaign/manifest.json || python3 scripts/dataset/run_dataset.py --preset full --stream --observation-seconds 300 --out-dir results/$campaign --run-prefix $campaign --plan $plan_args)"
     echo "staged $instance parts [$start, $stop); no simulations started"
