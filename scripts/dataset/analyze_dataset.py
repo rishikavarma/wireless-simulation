@@ -317,11 +317,15 @@ def main():
  # Verify source hashes and train/test separation, including missing TCP data for UDP.
  source=json.loads((campaign/'source-hashes.json').read_text())
  for name,digest in source.items():
-  if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
+  if name in ('configs','binary','nrPatch','nrLibrary','internetLibrary','ns3Patch','westwoodPatch'):continue
   snapshot=campaign/'source-snapshot'/name
   assert hashlib.sha256((snapshot if snapshot.exists() else ROOT/name).read_bytes()).hexdigest()==digest,name
  assert hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-nr-optimized.so').read_bytes()).hexdigest()==source['nrLibrary']
+ if 'internetLibrary' in source:
+  assert hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-internet-optimized.so').read_bytes()).hexdigest()==source['internetLibrary']
  assert hashlib.sha256((ROOT/'patches/ns3-v3.48-local-ntn.patch').read_bytes()).hexdigest()==source['ns3Patch']
+ if 'westwoodPatch' in source:
+  assert hashlib.sha256((ROOT/'patches/ns3-v3.48-westwood-lifetime.patch').read_bytes()).hexdigest()==source['westwoodPatch']
  assert hashlib.sha256((ROOT/'patches/nr-v5.1-local-ntn.patch').read_bytes()).hexdigest()==source['nrPatch']
  for rec in outcomes:assert hashlib.sha256(Path(rec['config']).read_bytes()).hexdigest()==source['configs'][rec['prefix']]
  if a.watch:

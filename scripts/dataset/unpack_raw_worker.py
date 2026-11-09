@@ -29,7 +29,9 @@ def verify_sources(campaign, hashes):
         raise ValueError('worker configurations differ from the local plan')
     special = {'binary': ROOT/'ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized',
                'nrLibrary': ROOT/'ns-3-dev/build/lib/libns3.48-nr-optimized.so',
+               'internetLibrary': ROOT/'ns-3-dev/build/lib/libns3.48-internet-optimized.so',
                'ns3Patch': ROOT/'patches/ns3-v3.48-local-ntn.patch',
+               'westwoodPatch': ROOT/'patches/ns3-v3.48-westwood-lifetime.patch',
                'nrPatch': ROOT/'patches/nr-v5.1-local-ntn.patch'}
     for name, expected in hashes.items():
         if name == 'configs':

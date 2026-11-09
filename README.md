@@ -97,11 +97,32 @@ so the window count is known only after collection; the earlier fixed-token plan
 million non-overlapping 20-token windows** (10 history + 10 future). These are
 planned counts, not collected data or a claim that every feature vector will be
 unique.
-The default stratified split keeps UNUM’s 20% test share and adds 10%
-validation: **28,000 / 4,000 / 8,000** train / validation / test runs, with every
-profile and RNG seed present in all three sets.
+The default sample split assigns completed windows 70%/10%/20% to train,
+validation, and test. Runs, profiles, and RNG seeds are not held out.
 See [full-preset ranges and comparison with UNUM](docs/experiment.md#full-dataset-preset)
 for the scope and limits of that comparison.
+
+### Westwood+ recovery of the cloud full dataset
+
+The first 40,000-run cloud campaign sealed 39,955 runs. Its 45 omitted runs
+all used uplink `TcpWestwoodPlus` and crashed with `SIGSEGV` in ns-3's
+`TcpWestwoodPlus::EstimateBW`. A scheduled estimator event retained a raw
+pointer after the congestion-control object was destroyed. The maintained
+[`patches/ns3-v3.48-westwood-lifetime.patch`](patches/ns3-v3.48-westwood-lifetime.patch)
+cancels that event on destruction and initializes a forked estimator's count
+state. All 45 omitted configs were rerun with the patched Internet library;
+all completed and produced raw traces. The recovery has 15 application passes
+and 30 completed network outcomes that did not meet the application's criterion.
+
+The original `full-distributed.tar.gz` remains a provenance-preserving partial
+artifact. The collector holds `results/full-distributed-recovery` with recovered
+raw, token, and radio data and `results/full-distributed-complete` with a
+validated 40,000-run sample dataset. The complete view has 47,917,229 windows
+of 10 context plus 10 prediction tokens, split into 33,542,060 training,
+4,791,723 validation, and 9,583,446 test windows. Existing window shards are
+hard-linked; 17,059 recovered windows were generated with the same random
+start rule and split 70%/10%/20%. The standalone collector archive is
+`results/full-distributed-complete.tar`, with a matching `.sha256` file.
 
 Inspect the setting without writing configurations or launching simulations:
 
@@ -236,8 +257,8 @@ python3 scripts/dataset/run_dataset.py --stream --run --finalize-only \
 
 Merge all workers before finalizing. The merger rejects differing manifests,
 configuration or source hashes, calibration boundaries, and conflicting part
-files. The finalizer requires every part, then builds train/test indexes and the
-stratified train/validation/test dataset. It runs without ns-3 on the collection host.
+files. The finalizer requires every part, then builds the streamed diagnostic
+indexes and the sample-level train/validation/test dataset. It runs without ns-3.
 
 ### Distributed raw metric collection and tokenization
 
@@ -389,9 +410,12 @@ python3 scripts/dataset/fetch_cloud_dataset.py
 ```
 
 It restarts the stopped collector when needed and stops it again after a
-verified download. It downloads only `short-distributed-300-20k.tar.gz` to `local/final-dataset/`,
+verified download. It downloads the current `full-distributed-complete.tar` to `local/final-dataset/`,
 verifies its SHA-256 and renames the temporary download. It refuses an archive
 larger than 490 GB and requires another 10 GB free locally. After verification, `fetch` saves a `.verified.json` receipt beside the archive.
+If the transfer is interrupted, keep the `.incoming` file and use
+`resume_cloud_archive.py` with the archive byte count and SHA-256 from the
+collector's `.sha256` file; `fetch` will not erase a partial download.
 To preview permanent cleanup from this machine, then execute it after download:
 
 ```bash
@@ -399,7 +423,7 @@ python3 scripts/dataset/delete_cloud_fleet.py
 python3 scripts/dataset/delete_cloud_fleet.py --execute
 ```
 
-For a custom directory, pass `--archive /path/to/short-distributed-300-20k.tar.gz`.
+For a custom directory, pass `--archive /path/to/full-distributed-complete.tar`.
 Execute rehashes the local archive and requires its verified-download receipt.
 It deletes exactly the 21 dataset VMs, their 22 pinned persistent disks
 (including the retained collector disk and all raw archives), and the dedicated
@@ -421,10 +445,12 @@ the collector acknowledges the part and removes the VM's compressed copy.
 These cleanup steps keep each 100 GB VM from retaining its entire assignment.
 The collector uses Python for command timeouts and a directory lock, so GNU
 `timeout` and `flock` are not required on macOS.
-The repository includes `artifacts/linux-simulator-ns3.48.tar.gz` (about
-21 MiB); `prepare` extracts its Linux binary and libraries on a macOS
-collector when needed, then builds the VM deployment bundle from the current
-source. The VM checks still verify the Linux libraries before simulations.
+On a fresh Linux collector, `prepare` builds the simulator from the pinned ns-3
+and NR source tags plus the maintained patches when the executable is missing.
+The source checkout stays under ignored `local/`; the generated executable and
+libraries are then packaged for the workers. The VM checks verify the Linux
+libraries before simulations. The first build needs network access and a C++
+toolchain and can take up to about an hour.
 
 On the collection host, set `DATASET_STORE_DIR` to a mounted directory with at
 least **2 TiB free**. The current repository filesystem is smaller than that.
@@ -483,21 +509,24 @@ For one run, `np.load("token-runs/<run-id>.npz")["tokens"]` has shape
 `(number_of_RTT_tokens, number_of_features)`. The archive also has the original
 continuous feature values and timing for every token.
 
-The default streaming training dataset holds out whole profiles: every RNG seed of a
-profile stays in the same train or test set. Bucket boundaries are fit only
-from training profiles, and windows never cross run boundaries. The streamed
-RNG split remains at the campaign root for measuring generalization to a new
-seed of a profile already seen in training.
-The prepared, unrun [UNUM-like bucket prediction experiment](docs/unum-bucket-prediction.md)
-trains a small Transformer and compares it with persistence and context-mean
-baselines using bucket-index MSE and per-feature plots.
+The default streaming training dataset starts each run at token zero and advances
+each 20-token window by a seeded random 1–10 tokens. Complete windows are
+shuffled into exact 70%/10%/20% train/validation/test shares. Windows never
+cross run boundaries, but overlapping windows from one run can appear in
+different splits. The root streamed RNG split remains available for a separate
+seed-generalization diagnostic. The default dataset uses the saved calibration
+bucket boundaries.
+The UNUM-like bucket predictor in `scripts/models/train_unum_buckets.py`
+trains a compact Transformer and compares its future bucket predictions with
+last-token persistence and context-mean baselines using bucket-index MSE, MAE,
+exact-bucket accuracy, and per-feature plots.
 
 Token output for the short TCP design. This creates a 180-profile campaign
 with four matched RNG seeds starting at 20001. Repeating the command resumes
 an incomplete campaign. It writes `token-runs/` and, after the last part, the
-default 10-history/10-future stratified dataset in
-`windows-stratified-c10-p10-s20/`. The campaign's `default-dataset.json` points
-to it. Every profile and every RNG seed appear in train, validation, and test.
+default 10-history/10-future sample-split dataset in
+`windows-random-c10-p10-step1-10/`. The campaign's `default-dataset.json` points
+to it.
 
 ```bash
 python3 scripts/dataset/run_dataset.py --preset full --stream \
@@ -506,16 +535,15 @@ python3 scripts/dataset/run_dataset.py --preset full --stream \
   --jobs 20 --batch-runs 20 --calibration-runs 20
 ```
 
-The following command regenerates the default stratified dataset from saved
-continuous tokens. It does not rerun ns-3. It uses a per-profile
-train/validation/test share (default 70/10/20), refits bucket boundaries from
-training runs only, and puts the radio shards in the same split. Omit
-`--stride` for non-overlapping windows.
+The following command regenerates the default sample-split dataset from saved
+tokens. It does not rerun ns-3. It uses randomized starts and a 70/10/20 split
+over completed windows. The radio shards follow the runs contributing to each
+split.
 
 ```bash
 python3 scripts/dataset/materialize_windows.py \
   --dataset-dir results/short-stream-tcp-rtt \
-  --context 10 --prediction 10 --stride 20
+  --context 10 --prediction 10
 ```
 
 To evaluate another seed on profiles already present in training, request the

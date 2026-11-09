@@ -8,6 +8,7 @@
 #   ./scripts/setup.sh                 # full setup
 #   ./scripts/setup.sh --skip-deps     # skip apt-get (already have a toolchain)
 #   ./scripts/setup.sh --skip-verify   # skip the smoke-test run
+#   ./scripts/setup.sh --simulator-only # build ns-3 without model dependencies
 #
 # Tested on Ubuntu 22.04 (also works under WSL). Needs sudo for apt-get
 # unless --skip-deps.
@@ -22,6 +23,7 @@ SCENARIO_LINK="$NS3_DIR/scratch/sat-bs-handset"
 
 SKIP_DEPS=0
 SKIP_VERIFY=0
+SIMULATOR_ONLY=0
 
 # Print setup options and supported environment variables from a literal help block.
 usage() {
@@ -31,6 +33,7 @@ Usage: ./scripts/setup.sh [options]
 Options:
   --skip-deps      Skip apt-get (use if the C++ toolchain is already installed)
   --skip-verify    Skip the smoke-test run after the build
+  --simulator-only Build ns-3 without installing model dependencies or running the smoke test
   -h, --help       Show this help
 
 Environment:
@@ -42,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-deps) SKIP_DEPS=1 ;;
         --skip-verify) SKIP_VERIFY=1 ;;
+        --simulator-only) SIMULATOR_ONLY=1; SKIP_VERIFY=1 ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "Unknown option: $1" >&2
@@ -100,6 +104,7 @@ else
     sudo apt-get install -y g++ python3 python3-pip git ninja-build pkg-config libeigen3-dev
 fi
 
+if [[ "$SIMULATOR_ONLY" -eq 0 ]]; then
 echo "==> Installing PyTorch, Transformers, and Chronos"
 # Do this before the ns-3 build. The CPU wheel avoids the large CUDA package
 # on machines without a GPU; an existing matching torch is left in place.
@@ -123,6 +128,7 @@ path = snapshot_download("amazon/chronos-t5-tiny")
 print(f"    torch {torch.__version__}; transformers {transformers.__version__}")
 print(f"    chronos {chronos.__name__}; weights {path}")
 PY
+fi
 
 echo "==> Ensuring CMake >= 3.25"
 if cmake_version_ok 3.25; then
@@ -197,6 +203,7 @@ pin_checkout "$NS3_DIR/contrib/nr" "$NR_TAG" https://gitlab.com/cttc-lena/nr.git
 
 echo "==> Applying local ns-3 and NR NTN patches"
 ensure_patch "$NS3_DIR" "$ROOT_DIR/patches/ns3-v3.48-local-ntn.patch"
+ensure_patch "$NS3_DIR" "$ROOT_DIR/patches/ns3-v3.48-westwood-lifetime.patch"
 ensure_patch "$NS3_DIR/contrib/nr" "$ROOT_DIR/patches/nr-v5.1-local-ntn.patch"
 
 echo "==> Symlinking scratch scenario into ns-3 scratch/"

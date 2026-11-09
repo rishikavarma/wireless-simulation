@@ -104,7 +104,9 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None,allow_failures=F
   sources={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'scratch/sat-bs-handset').rglob('*') if p.is_file() and p.suffix in ('.cc','.h')}
   sources['binary']=hashlib.sha256(BIN.read_bytes()).hexdigest()
   sources['nrLibrary']=hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-nr-optimized.so').read_bytes()).hexdigest()
+  sources['internetLibrary']=hashlib.sha256((ROOT/'ns-3-dev/build/lib/libns3.48-internet-optimized.so').read_bytes()).hexdigest()
   sources['ns3Patch']=hashlib.sha256((ROOT/'patches/ns3-v3.48-local-ntn.patch').read_bytes()).hexdigest()
+  sources['westwoodPatch']=hashlib.sha256((ROOT/'patches/ns3-v3.48-westwood-lifetime.patch').read_bytes()).hexdigest()
   sources['nrPatch']=hashlib.sha256((ROOT/'patches/nr-v5.1-local-ntn.patch').read_bytes()).hexdigest()
   sources['configs']={r['prefix']:hashlib.sha256(Path(r['config']).read_bytes()).hexdigest() for r in manifest['runs']}
   stamp=out/'source-hashes.json'
@@ -112,7 +114,7 @@ def run(out,jobs,records=None,verify_sources=True,manifest=None,allow_failures=F
   temporary=stamp.with_suffix('.json.tmp')
   temporary.write_text(json.dumps(sources,indent=2)+'\n');temporary.replace(stamp)
   for name in sources:
-   if name in ('configs','binary','nrPatch','nrLibrary','ns3Patch'):continue
+   if name in ('configs','binary','nrPatch','nrLibrary','internetLibrary','ns3Patch','westwoodPatch'):continue
    snapshot=out/'source-snapshot'/name;snapshot.parent.mkdir(parents=True,exist_ok=True)
    snapshot.write_bytes((ROOT/name).read_bytes())
  def one(rec):
@@ -326,7 +328,7 @@ def main():
                   (lambda records,verify:collected_raw(out,records,verify)) if a.stream_from_raw else
                   (lambda records,verify:run(out,a.jobs,records,verify,manifest)),prepare_features,
                   a.part_start,a.part_stop,a.finalize_only,a.max_hours,
-                  include_calibration=not a.stream_from_raw)
+                  include_calibration=not a.stream_from_raw, post_jobs=a.jobs)
  elif a.raw_parts and a.run:
   from stream_parts import planned_parts
   manifest=json.loads((out/'manifest.json').read_text())

@@ -29,6 +29,7 @@ def reset_uncommitted(campaign, part, group, progress_file, progress):
         os.replace(temporary, progress_file)
     for directory in ('dataset-parts', 'radio-parts'):
         (campaign/directory/f'{part:05d}.npz').unlink(missing_ok=True)
+        (campaign/directory/f'{part:05d}.npz.tmp').unlink(missing_ok=True)
     for run_id in run_ids:
         raw = ROOT/'results'/run_id
         if raw.is_symlink():
@@ -36,6 +37,7 @@ def reset_uncommitted(campaign, part, group, progress_file, progress):
         if raw.exists():
             shutil.rmtree(raw)
         (campaign/'token-runs'/f'{run_id}.npz').unlink(missing_ok=True)
+        (campaign/'token-runs'/f'{run_id}.npz.tmp').unlink(missing_ok=True)
         for suffix in ('.json', '.log', '-post.log'):
             (campaign/'logs'/f'{run_id}{suffix}').unlink(missing_ok=True)
         for directory in ('tcp-measurements', 'rtt-samples'):
@@ -103,7 +105,7 @@ def export(campaign, part, archive, source_hashes, seed):
         subprocess.run(['python3', 'scripts/dataset/run_dataset.py', '--stream',
             '--stream-from-raw', '--run', '--out-dir', str(campaign),
             '--batch-runs', '64', '--calibration-runs', '64', '--part-start', str(part),
-            '--part-stop', str(part+1), '--jobs', '8'], check=True)
+            '--part-stop', str(part+1), '--jobs', str(os.cpu_count() or 1)], check=True)
     progress = json.loads(progress_file.read_text())
     rows = [row for row in progress['parts'] if row['number'] == part]
     if len(rows) != 1 and part not in progress.get('emptyParts', []):

@@ -8,6 +8,7 @@ ns-3-dev/
 /data/
 /datasets/
 /local/
+/artifacts/linux-simulator-ns3.48*.tar.gz
 /scripts/dataset/cloud-resources.json
 /scripts/dataset/collector-commands.txt
 /scripts/dataset/vm-commands-private.txt

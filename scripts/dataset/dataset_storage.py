@@ -49,6 +49,10 @@ def archive_run_tokens(features_path, destination, run_id, source_names, edges):
     return len(rows)
 
 
+def _archive_token_task(task):
+    return archive_run_tokens(*task)
+
+
 def window_token_runs(paths, seq_len, stride, expected_columns, expected_run_ids=None):
     """Cut configurable datapoints from complete per-run token lists."""
     if expected_run_ids is not None and len(paths) != len(expected_run_ids):
@@ -74,7 +78,8 @@ def window_token_runs(paths, seq_len, stride, expected_columns, expected_run_ids
 
 def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                     run_batch, prepare_features, part_start=None, part_stop=None,
-                    finalize_only=False, max_hours=None, include_calibration=True):
+                    finalize_only=False, max_hours=None, include_calibration=True,
+                    post_jobs=8):
     """Run, tokenize and discard each part; assign saved parts to splits at the end."""
     from make_datasets import load_run_windows, fit_boundaries_on_train
     from analyze_dataset import RADIO_FEATURES, summarize
@@ -167,7 +172,7 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
         raise ValueError('saved window shard missing for part '+str(number))
 
     def save_token_lists(group, names, edges):
-        for rec in group:
+        def task(rec):
             target = token_path(rec)
             if target.exists():
                 with np.load(target) as saved:
@@ -178,14 +183,28 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                         raise ValueError('saved token archive belongs to another run: '+rec['prefix'])
             else:
                 source = raw_path(rec)/(rec['prefix']+'-features.csv')
-                count = archive_run_tokens(source, target, rec['prefix'], names, edges)
+                return source, target, rec['prefix'], names, edges
+            return None
+
+        tasks = [task(rec) for rec in group]
+        missing = [item for item in tasks if item is not None]
+        counts = {}
+        if missing:
+            with cf.ProcessPoolExecutor(max_workers=min(post_jobs, len(missing))) as pool:
+                for item, count in zip(missing, pool.map(_archive_token_task, missing)):
+                    counts[item[2]] = count
+        for rec in group:
+            count = counts.get(rec['prefix'])
+            if count is None:
+                with np.load(token_path(rec)) as saved:
+                    count = len(saved['tokens'])
             progress['tokenRuns'][rec['prefix']] = dict(
-                path=str(target.relative_to(out)), tokens=count, complete=True)
+                path=str(token_path(rec).relative_to(out)), tokens=count, complete=True)
 
     def prepare_group(group):
         # Each run writes to its own directory; concurrent folding avoids a
         # long serial postprocessing phase after parallel simulations.
-        with cf.ThreadPoolExecutor(max_workers=min(8, len(group))) as pool:
+        with cf.ThreadPoolExecutor(max_workers=min(post_jobs, len(group))) as pool:
             list(pool.map(prepare_features, group))
 
     # A collector has a binary; a merge-only coordinator may have only archives.
@@ -267,10 +286,8 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
                    token_starts=starts,
                    truncated=np.zeros(len(ids), dtype=bool))
         del tokens
-        radios = []
-        for rec in outcomes:
-            _, _, radio = summarize(rec)
-            radios.append(radio)
+        with cf.ProcessPoolExecutor(max_workers=min(post_jobs, len(outcomes))) as pool:
+            radios = [radio for _, _, radio in pool.map(summarize, outcomes)]
         atomic_npz(out/'radio-parts'/f'{number:05d}.npz', values=np.stack(radios),
                    run_ids=np.asarray([r['prefix'] for r in group]),
                    feature_names=np.asarray(RADIO_FEATURES),
@@ -412,29 +429,29 @@ def stream_campaign(root, out, manifest, batch_runs, calibration_runs,
     # sealed the immutable token and radio indexes.
     if os.environ.get('DISTRIBUTED_POSTPROCESS') == '1':
         return
-    from materialize_windows import materialize_by_profile
+    from materialize_windows import materialize_by_sample
     settings = manifest['settings']
-    profile_out = out/'windows-stratified-c10-p10-s20'
+    profile_out = out/'windows-random-c10-p10-step1-10'
     profile_index = profile_out/'dataset-index.json'
     if (profile_index.exists() and (profile_out/'post-complete.json').exists() and
             (profile_out/'radio-index.json').exists()):
         saved = json.loads(profile_index.read_text())
-        if (saved.get('splitUnit') != 'stratified-run' or saved.get('context') != 10 or
-                saved.get('future') != 10 or saved.get('windowStride') != 20 or
+        if (saved.get('splitUnit') != 'sample' or saved.get('context') != 10 or
+                saved.get('future') != 10 or saved.get('windowStepRange') != [1, 10] or
                 saved.get('splitSeed') != settings.get('designSeed', 0) or
                 saved.get('testFraction') != settings.get('testFraction', 0.2) or
                 saved.get('validationFraction') != settings.get('validationFraction', 0.1) or
                 saved.get('sourceDataset') != str(out.resolve())):
-            raise ValueError('saved default stratified dataset uses different settings')
+            raise ValueError('saved default sample dataset uses different settings')
         dataset_metadata(profile_out)
     else:
-        materialize_by_profile(out, profile_out, 10, 10, 20)
+        materialize_by_sample(out, profile_out, 10, 10)
     atomic_json(out/'default-dataset.json', dict(
-        path='windows-stratified-c10-p10-s20',
-        index='windows-stratified-c10-p10-s20/dataset-index.json',
-        splitUnit='stratified-run', partial=completion['partial'],
+        path='windows-random-c10-p10-step1-10',
+        index='windows-random-c10-p10-step1-10/dataset-index.json',
+        splitUnit='sample', partial=completion['partial'],
         completion='completion-summary.json'))
-    print('streamed', len(runs), 'runs into stratified train/validation/test shards', flush=True)
+    print('streamed', len(runs), 'runs into sample-level train/validation/test shards', flush=True)
 
 
 def part_rng(part, runs):

@@ -256,7 +256,7 @@ def main():
         '--out-dir', str(campaign), '--batch-runs', '64', '--calibration-runs', '64',
         '--jobs', '8'], check=True,
         env={**os.environ, 'DISTRIBUTED_POSTPROCESS': '1'})
-    subprocess.run(['python3', str(ROOT/'scripts/dataset/distributed_post.py'),
+    subprocess.run(['python3', str(ROOT/'scripts/dataset/distributed_sample_windows.py'),
         '--campaign', str(campaign), '--ranges', str(args.ranges)], check=True)
 
 

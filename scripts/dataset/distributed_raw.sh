@@ -120,18 +120,7 @@ if count < 10:
     raise SystemExit(f'20,000-run short mode needs 10 comparable VMs; inventory has {count}')
 PY
     fi
-    simulator="$root/ns-3-dev/build/scratch/sat-bs-handset/ns3.48-sat-bs-handset-optimized"
-    if ! python3 - "$simulator" <<'PY'
-import sys
-from pathlib import Path
-path=Path(sys.argv[1])
-raise SystemExit(0 if path.is_file() and path.open('rb').read(4)==b'\x7fELF' else 1)
-PY
-    then
-        artifact="$root/artifacts/linux-simulator-ns3.48.tar.gz"
-        [[ -s "$artifact" ]] || { echo "missing Linux simulator artifact: $artifact" >&2; exit 1; }
-        tar -C "$root" -xzf "$artifact"
-    fi
+    bash "$root/scripts/dataset/build_linux_simulator.sh"
     if [[ ! -f "$campaign_dir/manifest.json" ]]; then
         python3 scripts/dataset/run_dataset.py --preset full --stream --observation-seconds 300 \
             --profile-count "$profile_count" --replicates "$replicates" $token_args \

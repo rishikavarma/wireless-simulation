@@ -1,0 +1,22 @@
+diff --git a/src/internet/model/tcp-westwood-plus.cc b/src/internet/model/tcp-westwood-plus.cc
+--- a/src/internet/model/tcp-westwood-plus.cc
++++ b/src/internet/model/tcp-westwood-plus.cc
+@@ -72,12 +72,17 @@ TcpWestwoodPlus::TcpWestwoodPlus(const TcpWestwoodPlus& sock)
+       m_lastSampleBW(sock.m_lastSampleBW),
+       m_lastBW(sock.m_lastBW),
+       m_fType(sock.m_fType),
+-      m_IsCount(sock.m_IsCount)
++      m_ackedSegments(0),
++      m_IsCount(false),
++      m_lastAck(sock.m_lastAck)
+ {
+     NS_LOG_FUNCTION(this);
+     NS_LOG_LOGIC("Invoked the copy constructor");
+ }
+ 
+ TcpWestwoodPlus::~TcpWestwoodPlus()
+ {
++    // The scheduled callback holds a raw pointer to this congestion-control object.
++    // A TCP socket may close before the RTT expires, leaving a dangling callback.
++    m_bwEstimateEvent.Cancel();
+ }
