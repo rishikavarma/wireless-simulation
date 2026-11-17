@@ -173,11 +173,16 @@ def train(args):
         validation_scores = score(model, dataset, index, validation, 'validation',
             args.batch_size, args.validation_windows, counts['validation'], names,
             bucket, stats, device, args.seed)
-        mse = validation_scores.summary()['model']['mse']
-        history.append(dict(epoch=epoch, trainMSE=float(np.mean(losses)), validationMSE=mse))
-        print('epoch', epoch, 'validation bucket MSE', round(mse, 4), flush=True)
-        if mse < best - args.min_improvement:
-            best, best_epoch = mse, epoch
+        summary = validation_scores.summary()['model']
+        bucket_error = summary['meanBucketIndexError']
+        history.append(dict(epoch=epoch, trainMSE=float(np.mean(losses)),
+                            validationBucketIndexError=bucket_error,
+                            validationWithinOneBucket=summary['withinOneBucket'],
+                            validationMSE=summary['mse']))
+        print('epoch', epoch, 'validation bucket-index error', round(bucket_error, 4),
+              'within one bucket', round(summary['withinOneBucket'], 4), flush=True)
+        if bucket_error < best - args.min_improvement:
+            best, best_epoch = bucket_error, epoch
             torch.save(dict(state=model.state_dict(), targets=[name for _, name, _ in bucket], stats=stats,
                             context=context, horizon=horizon), checkpoint)
         atomic_json(output / 'tuning.json', history)
@@ -189,7 +194,8 @@ def train(args):
                    args.test_windows, counts['test'], names, bucket, stats, device, args.seed)
     write_results(output, scores, bucket, index)
     atomic_json(output / 'selected-model.json', dict(bestEpoch=best_epoch,
-        bestValidationMSE=best, targets=[name for _, name, _ in bucket], checkpoint=str(checkpoint)))
+        bestValidationBucketIndexError=best, targets=[name for _, name, _ in bucket],
+        checkpoint=str(checkpoint)))
     print(json.dumps(scores.summary(), indent=2))
 
 

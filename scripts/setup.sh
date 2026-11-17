@@ -38,6 +38,7 @@ Options:
 
 Environment:
   NS3_DIR          ns-3 checkout path (default: ./ns-3-dev at the repo root)
+  SETUP_KEEP_SHELL_RC=1  do not append a PATH line to ~/.bashrc
 EOF
 }
 
@@ -146,7 +147,12 @@ else
 fi
 
 echo "==> Persisting \$HOME/.local/bin on PATH"
-ensure_local_bin_on_path
+# SETUP_KEEP_SHELL_RC=1 leaves ~/.bashrc alone (batch systems such as TACC load modules instead).
+if [[ "${SETUP_KEEP_SHELL_RC:-0}" == 1 ]]; then
+    echo "    skipped (SETUP_KEEP_SHELL_RC=1)"
+else
+    ensure_local_bin_on_path
+fi
 
 # Latest pair the 5G-LENA README lists as compatible. Master of each tree
 # has drifted: ns-3's phased-array channel method takes beamforming vectors

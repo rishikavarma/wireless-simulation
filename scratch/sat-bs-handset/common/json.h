@@ -6,6 +6,7 @@
 #ifndef SAT_BS_HANDSET_COMMON_JSON_H
 #define SAT_BS_HANDSET_COMMON_JSON_H
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>

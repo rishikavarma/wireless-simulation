@@ -8,7 +8,7 @@ ns-3-dev/
 /data/
 /datasets/
 /local/
-/artifacts/linux-simulator-ns3.48*.tar.gz
+/artifacts/
 /scripts/dataset/cloud-resources.json
 /scripts/dataset/collector-commands.txt
 /scripts/dataset/vm-commands-private.txt
@@ -18,12 +18,8 @@ ns-3-dev/
 /embedding/
 /requirements-train.txt
 
-# Keep experiment/application explanations; reports and slides belong under local/.
-/docs/*
-!/docs/experiment.md
-!/docs/application-rates.md
-!/docs/rlc-am-retransmission.md
-!/docs/unum-bucket-prediction.md
+# Reports and slides belong under local/; root README is the project doc.
+/docs/
 
 # Dataset archives generated outside results/.
 *.npz

@@ -99,8 +99,6 @@ planned counts, not collected data or a claim that every feature vector will be
 unique.
 The default sample split assigns completed windows 70%/10%/20% to train,
 validation, and test. Runs, profiles, and RNG seeds are not held out.
-See [full-preset ranges and comparison with UNUM](docs/experiment.md#full-dataset-preset)
-for the scope and limits of that comparison.
 
 ### Westwood+ recovery of the cloud full dataset
 
@@ -194,392 +192,23 @@ A stopped token command resumes from `stream-progress.json`; keep the same batch
 and calibration sizes. Streaming does not produce the raw-data comparison plots
 or report.
 
-### Run streaming parts on several VMs
+### Large campaigns on TACC
 
-This streaming mode removes extracted raw metric directories after tokenization.
-The distributed raw workflow below retains compressed copies of every trace.
-
-Use the same repository revision, design settings, campaign name, run prefix,
-`--batch-runs`, and `--calibration-runs` on every VM and on the collection host.
-Each VM plans its own copy of the campaign. Parts are numbered from zero; range
-ends are exclusive. Part zero calibrates the shared token boundaries and is
-automatically generated on every worker, even if its assigned range starts later.
-The merger keeps one copy of part zero. Set `--batch-runs` near `--jobs` so a
-part fills the available cores. The following example uses 64 concurrent runs
-on a 90-core, 354 GiB VM:
+Multi-node GCP collection is retired. For large dataset generation and UNUM
+training, use the TACC helpers:
 
 ```bash
-python3 scripts/dataset/run_dataset.py --preset full --stream \
-  --out-dir results/full-distributed --run-prefix full-distributed --plan
-python3 scripts/dataset/run_dataset.py --stream --run \
-  --out-dir results/full-distributed --jobs 64 \
-  --batch-runs 64 --calibration-runs 64 --part-start 0 --part-stop 1
-python3 scripts/dataset/schedule_stream_parts.py \
-  --campaign results/full-distributed --start 1 --jobs 64 \
-  --batch-runs 64 --calibration-runs 64 --hours 2.4
+bash scripts/tacc/sync.sh
+# on a TACC login node:
+bash scripts/tacc/satellite_study.sh info
+bash scripts/tacc/satellite_study.sh setup
+ACCOUNT=<allocation> bash scripts/tacc/satellite_study.sh pilot
+ACCOUNT=<allocation> bash scripts/tacc/satellite_study.sh train
 ```
 
-The scheduler prints an estimated `partStop` using the calibration's 90th
-percentile run time, the job count, and headroom for slower parts. Assign its
-`partStart` through `partStop` to the first VM. For later VMs, start at the
-previous VM's `partStop`; each VM needs its own calibration run. The run command
-for an assigned range is:
-
-```bash
-python3 scripts/dataset/run_dataset.py --stream --run \
-  --out-dir results/full-distributed --jobs 64 \
-  --batch-runs 64 --calibration-runs 64 \
-  --part-start 1 --part-stop STOP --max-hours 2.4
-```
-
-`--max-hours` stops starting new parts at the deadline and lets the current
-part finish. Resume the same range to continue. Check `stream-progress.json`
-for the exact completed part numbers before assigning another VM. Limit `--jobs`
-if memory cannot support one simulation per core.
-
-Retrieve each worker's campaign directory into a separate local directory.
-For example, from a host with the Google Cloud CLI:
-
-```bash
-gcloud compute scp --recurse --zone us-central1-c --project cmps-infraai \
-  instance-20261029-190248:~/wireless-simulation/results/full-distributed \
-  /tmp/worker-1
-```
-
-Plan the same campaign locally, then merge each retrieved worker directory:
-
-```bash
-python3 scripts/dataset/merge_stream_parts.py \
-  --destination results/full-distributed --source /tmp/worker-1
-python3 scripts/dataset/run_dataset.py --stream --run --finalize-only \
-  --out-dir results/full-distributed --batch-runs 64 --calibration-runs 64
-```
-
-Merge all workers before finalizing. The merger rejects differing manifests,
-configuration or source hashes, calibration boundaries, and conflicting part
-files. The finalizer requires every part, then builds the streamed diagnostic
-indexes and the sample-level train/validation/test dataset. It runs without ns-3.
-
-### Distributed raw metric collection and tokenization
-
-Use `scripts/dataset/distributed_raw.sh` when every original simulation trace
-must be retained. Its distributed plan measures **300 seconds per simulation**
-over **20–320 s**, with 15 s warmup, 5 s measurement offset, 1 s traffic margin,
-and 10 s drain. Total simulated time is 331 s. Put one `gcloud compute ssh` command per line in a machine
-file, with an instance, zone, and project. The script assigns all 640 parts of
-the default 40,000-run full preset evenly across those instances. It packages
-the local source and compiled simulator so every worker uses identical bytes.
-With 20 machines, each receives one 2,000-run RNG replicate (32 parts).
-For a 10-hour collection target, start with 20 VMs comparable to the measured
-90-core instance (19 more than the first VM). This is a capacity estimate based
-on local pilot timings, not a deadline guarantee; use `status` to watch actual
-part completion and add machines before deployment if more margin is needed.
-Each worker runs its assigned simulations, keeps their metric CSVs, and writes
-one compressed archive per completed 64-run part. A 60-second heartbeat checks
-for worker failures and restarts the unfinished part, with three retries per part.
-The collection host retrieves archives as parts finish, verifies source and
-configuration hashes, extracts one part at a time, and tokenizes it locally.
-Raw metric CSVs remain in the compressed archives;
-the extracted copies are removed after successful tokenization.
-For the cloud campaign, set `DISTRIBUTED_TOKENIZE=1` (already set by
-`cloud_dataset.sh`). Once raw retrieval finishes, the collector sends unfinished
-parts to available workers for tokenization. It verifies each returned
-part before adding it to `stream-progress.json`. Existing completed parts remain
-the checkpoint; interrupted parts are retried from their raw archives. The
-collector retains the raw archives until final packaging. For an existing fleet,
-run `python3 scripts/dataset/install_token_dependencies.py` from an authenticated
-machine before switching to worker tokenization; fresh workers receive NumPy and
-Matplotlib during bootstrap.
-
-The current short campaign (planned with `--token-mode fixed`) runs entirely in GCP: **20,000 simulations**,
-**60 million measured 100 ms tokens**, and **3 million nonoverlapping
-10-context + 10-future windows**. Twenty `n2-standard-48` workers in
-`us-central1-a` each have 48 vCPUs and a 100 GB boot disk. Each receives 16 of
-320 parts and runs at most 48 simulations concurrently.
-
-The dedicated `dataset-collector` is `n2-highmem-32` (32 vCPUs, 256 GiB RAM),
-with a separate 4 TB balanced persistent disk mounted at `/srv/dataset`.
-Its repository and all raw archives, extracted traces, tokens, temporary files
-and final packaging live at `/srv/dataset/wireless-simulation`. Raw archives
-stay in GCP. A 3.5 TB collection guard and 40 GiB reserve stop retrieval before
-the disk fills. The coordinator's systemd service has a 200 GiB memory-high
-threshold and a 230 GiB memory limit, leaving memory for the OS. An interrupted
-collector can resume; workers retain archives and wait when their disks are low.
-Once every raw archive is collected, restarting the service skips completed
-simulations and token parts. A part is committed only after its complete token
-package has been verified and merged. Incomplete worker output remains local to
-that worker and can be regenerated from the retained raw archive.
-The data disk is retained when the collector VM is deleted.
-
-All nodes share the `default` VPC. Collector-to-worker traffic uses private IPs,
-a dedicated SSH key, a local `dataset` account on each worker, and pinned host
-keys. `dataset-collector-to-workers` permits private SSH between tagged nodes.
-Existing project firewall rules also remain in effect. No user gcloud credentials
-are copied to the collector. Local administration uses IAP.
-
-The SSH inventories (`scripts/dataset/vm-commands.txt` and
-`scripts/dataset/vm-commands-private.txt`), private host keys, and resource ID
-manifest (`scripts/dataset/cloud-resources.json`) describe this particular
-fleet. Keep them locally; they are excluded from this change. Save a private
-copy of the resource manifest before replacing this computer, since cleanup
-requires its original VM, disk, and firewall IDs.
-
-To rerun on this **existing staged fleet**, use the commands below from the
-repository root. Install and authenticate `gcloud`, select access to project
-`cmps-infraai`, and keep the local SSH and resource manifest files available.
-The collector already has the Linux simulator bundle, Python environment,
-private SSH configuration, production plan, and worker staging. For a fresh
-fleet, provision and bootstrap machines of the stated sizes, generate both
-inventories and a new resource ID manifest from the new resources, install the
-shutdown helper, then run `prepare`, `stage`, and the readiness check on the
-collector. Old resource IDs must never be reused for cleanup of a new fleet.
-
-On the **collector**, stage and inspect without starting production simulations:
-
-```bash
-cd /srv/dataset/wireless-simulation
-bash scripts/dataset/cloud_dataset.sh prepare
-bash scripts/dataset/cloud_dataset.sh stage
-bash scripts/dataset/cloud_dataset.sh check-vms
-```
-
-From this local machine, use the short-lived controller commands:
-
-```bash
-python3 scripts/dataset/cloud_control.py start
-python3 scripts/dataset/cloud_control.py status
-python3 scripts/dataset/cloud_control.py status --workers
-python3 scripts/dataset/cloud_control.py status --wake
-python3 scripts/dataset/cloud_control.py fetch
-```
-
-`start` returns after systemd accepts the remote job; no long-lived local
-connection is required. Workers also run detached under `nohup`. Closing this
-terminal, sleeping this computer, or losing its network does not stop remote
-computation or collection. If the launch connection drops before acknowledgement,
-check status or repeat `start`; the service name and worker PID checks prevent
-duplicate jobs. No production run is launched by `status`.
-
-`status` reads VM states, collector service state, collected/tokenized part and
-run counts, free disk space and recent journal messages. `--workers` adds live
-worker health, active tokenizers, simulation heartbeat and original ranges. If the collector has stopped,
-plain status does not wake it; `status --wake` briefly starts it, reads the saved
-completion record, then stops it again. `fetch` downloads only the finalized
-archive and leaves the collector stopped.
-
-Alternatively, explicitly start the campaign on the collector:
-
-```bash
-bash scripts/dataset/cloud_dataset.sh start
-journalctl -u wireless-dataset -f
-```
-
-`stage` installs the identical simulator and source bundle on every worker and
-checks shared libraries. `start` launches workers and cloud collection under
-systemd. The four-run smoke check exercises private transfers, raw checksum
-verification, tokenization, profile splitting and packaging entirely on the
-VMs, separately from production output. Before starting a new campaign, inspect
-`status` and verify there is no active or already completed campaign. A completed
-campaign needs its own output directory or new fleet; `start` will not overwrite it.
-
-Successful cloud finalization publishes the archive checksum and
-`results/cloud-complete.json`, then schedules shutdown of the twenty workers
-and finally the collector with a **30-minute grace period**. The grace starts
-only after final packaging, checksum verification and the completion receipt.
-Change it when launching with `cloud_control.py start --shutdown-grace-minutes 60`.
-Status includes the grace period and scheduled shutdown time. Each guest flushes its disks before shutdown; the
-persistent disks and final dataset are retained. A failure before finalization
-leaves the fleet running for recovery. Email notifications are disabled. Push notifications use ntfy without email
-credentials or GCP Monitoring permissions. Run `cloud_control.py notifications`
-locally to get the subscription URL, install the ntfy phone app, and subscribe to
-that topic on `https://ntfy.sh`. Topic names are shared secrets; the setup command
-generates a long random name and keeps it in the collector's private config.
-After subscribing, run `cloud_control.py notification-test` to publish a clearly
-labeled test message. The collector publishes a completion notification after
-packaging/checksum verification and before scheduling its shutdown grace period.
-It reports completed counts, whether output is partial, and compressed size;
-no dataset contents are sent. Your laptop can be offline. Notification failure
-does not delete the dataset or prevent scheduled shutdown. `stop_cloud_fleet.py --dry-run` verifies
-the exact sudo permissions without scheduling shutdown. The helper grants the
-worker account only the fixed check, schedule, and cancel operations.
-
-Only after cloud finalization, run this command on this computer:
-
-```bash
-python3 scripts/dataset/fetch_cloud_dataset.py
-```
-
-It restarts the stopped collector when needed and stops it again after a
-verified download. It downloads the current `full-distributed-complete.tar` to `local/final-dataset/`,
-verifies its SHA-256 and renames the temporary download. It refuses an archive
-larger than 490 GB and requires another 10 GB free locally. After verification, `fetch` saves a `.verified.json` receipt beside the archive.
-If the transfer is interrupted, keep the `.incoming` file and use
-`resume_cloud_archive.py` with the archive byte count and SHA-256 from the
-collector's `.sha256` file; `fetch` will not erase a partial download.
-To preview permanent cleanup from this machine, then execute it after download:
-
-```bash
-python3 scripts/dataset/delete_cloud_fleet.py
-python3 scripts/dataset/delete_cloud_fleet.py --execute
-```
-
-For a custom directory, pass `--archive /path/to/full-distributed-complete.tar`.
-Execute rehashes the local archive and requires its verified-download receipt.
-It deletes exactly the 21 dataset VMs, their 22 pinned persistent disks
-(including the retained collector disk and all raw archives), and the dedicated
-collector-to-workers firewall rule. It preserves the shared VPC and unrelated
-resources. Resource IDs in the local `cloud-resources.json` prevent deleting replacements
-with reused names. Cleanup is separate from fetch, never automatic, and can be
-resumed after partial deletion. The local archive and cleanup report remain.
-
-Nothing continuously collects on this computer. The former optional macOS
-collector disk image is not used by this cloud workflow.
-
-`all` combines these steps. Deployment runs `check-vms` again and stops before
-launching any worker if an SSH check fails. The completed token dataset is
-compressed as `results/short-distributed-300-20k.tar.gz`; raw metric traces
-remain in the already-compressed
-`results/short-distributed-300-20k-raw-archives/`. Workers delete uncompressed
-raw directories after packing each part. After checksum-verified retrieval,
-the collector acknowledges the part and removes the VM's compressed copy.
-These cleanup steps keep each 100 GB VM from retaining its entire assignment.
-The collector uses Python for command timeouts and a directory lock, so GNU
-`timeout` and `flock` are not required on macOS.
-On a fresh Linux collector, `prepare` builds the simulator from the pinned ns-3
-and NR source tags plus the maintained patches when the executable is missing.
-The source checkout stays under ignored `local/`; the generated executable and
-libraries are then packaged for the workers. The VM checks verify the Linux
-libraries before simulations. The first build needs network access and a C++
-toolchain and can take up to about an hour.
-
-On the collection host, set `DATASET_STORE_DIR` to a mounted directory with at
-least **2 TiB free**. The current repository filesystem is smaller than that.
-The raw archive directory defaults to
-`DATASET_STORE_DIR/full-distributed-raw-archives`; set
-`RAW_ARCHIVE_DIR` separately if it has at least 1.5 TiB free. Each VM should
-have at least **350 GiB free** for its raw traces and archives.
-Then run:
-
-```bash
-DATASET_STORE_DIR=/mnt/dataset \
-  bash scripts/dataset/distributed_raw.sh all vm-commands.txt
-```
-
-`all` prepares the local plan, deploys and starts the workers, collects completed
-parts continuously, and produces `DATASET_STORE_DIR/full-distributed/default-dataset.json`.
-It also compresses the finished token dataset into
-`DATASET_STORE_DIR/full-distributed.tar.gz`. The original metric CSVs remain
-inside `RAW_ARCHIVE_DIR/worker-*/part-*.tar.gz`.
-
-Workers isolate each simulation with a Linux address-space limit: 70% of
-currently available RAM (also respecting cgroup headroom), divided by the active
-concurrency. Core dumps are disabled. A simulation exits if its coordinator dies.
-Each completed run gets an atomic status file. Interrupted runs are retried twice
-at lower concurrency; persistent failures are excluded as whole runs, without
-padding or treating truncated time series as complete observations.
-
-Every raw part is sealed with its completed and omitted run IDs, including empty
-parts. Surviving runs are archived and checksummed before raw cleanup. If the
-worker itself repeatedly dies, the collector lowers its concurrency and then
-launches a sealing pass over its remaining assignment. A failure to access or
-seal a worker still stops collection rather than silently claiming its data was
-recovered.
-
-Finalization consolidates surviving whole runs and writes
-`completion-summary.json` with the planned count, retained count and omitted
-IDs. The original manifest stays intact; dataset indexes and `default-dataset.json`
-mark partial output explicitly. Profile splits permit unequal replicate coverage
-for partial datasets and refit boundaries using training profiles only. If fewer
-than two profiles survive, the RNG layout is retained as the default. If no
-training calibration run survives, the result is explicitly marked raw-only;
-completed raw archives remain available, and no training dataset is fabricated.
-The same bounded collector filesystem applies during recovery and consolidation.
-
-Use `prepare`, `deploy`, `status`, and `collect` separately to inspect or resume
-each stage. A disconnected collection shell does not stop a launched worker;
-run `collect` again to continue retrieval and local tokenization. The worker
-bundle includes a prebuilt x86_64 simulator; the VMs must be compatible with
-its system libraries.
-
-Check available storage before deployment with `df -h /mnt/dataset` on the
-collection host and `df -h ~` on each VM. `df` shows available capacity; `du -sh
-/mnt/dataset` shows space already used by the dataset directory.
-
-For one run, `np.load("token-runs/<run-id>.npz")["tokens"]` has shape
-`(number_of_RTT_tokens, number_of_features)`. The archive also has the original
-continuous feature values and timing for every token.
-
-The default streaming training dataset starts each run at token zero and advances
-each 20-token window by a seeded random 1–10 tokens. Complete windows are
-shuffled into exact 70%/10%/20% train/validation/test shares. Windows never
-cross run boundaries, but overlapping windows from one run can appear in
-different splits. The root streamed RNG split remains available for a separate
-seed-generalization diagnostic. The default dataset uses the saved calibration
-bucket boundaries.
-The UNUM-like bucket predictor in `scripts/models/train_unum_buckets.py`
-trains a compact Transformer and compares its future bucket predictions with
-last-token persistence and context-mean baselines using bucket-index MSE, MAE,
-exact-bucket accuracy, and per-feature plots.
-
-Token output for the short TCP design. This creates a 180-profile campaign
-with four matched RNG seeds starting at 20001. Repeating the command resumes
-an incomplete campaign. It writes `token-runs/` and, after the last part, the
-default 10-history/10-future sample-split dataset in
-`windows-random-c10-p10-step1-10/`. The campaign's `default-dataset.json` points
-to it.
-
-```bash
-python3 scripts/dataset/run_dataset.py --preset full --stream \
-  --design-file scripts/dataset/short_dataset.json \
-  --out-dir results/short-stream-tcp-rtt --run-prefix short-stream-tcp-rtt \
-  --jobs 20 --batch-runs 20 --calibration-runs 20
-```
-
-The following command regenerates the default sample-split dataset from saved
-tokens. It does not rerun ns-3. It uses randomized starts and a 70/10/20 split
-over completed windows. The radio shards follow the runs contributing to each
-split.
-
-```bash
-python3 scripts/dataset/materialize_windows.py \
-  --dataset-dir results/short-stream-tcp-rtt \
-  --context 10 --prediction 10
-```
-
-To evaluate another seed on profiles already present in training, request the
-RNG-held-out split explicitly. This uses the saved stream bucket boundaries:
-
-```bash
-python3 scripts/dataset/materialize_windows.py \
-  --dataset-dir results/short-stream-tcp-rtt \
-  --split-unit rng --context 10 --prediction 10 --stride 20
-```
-
-Its output is `results/short-stream-tcp-rtt/windows-c10-p10-s20/`.
-
-The short plan is 360 runs. Tokens aggregate TCP measurements over the current
-measured minimum RTT, so the number of windows depends on the run. All primary
-and background UDP traffic is excluded. Keep the design file unchanged after
-planning.
-
-A smaller full-preset pilot uses the same two stages. Its default profile
-split keeps all four replicates of a profile together:
-
-```bash
-python3 scripts/dataset/run_dataset.py --preset full --stream \
-  --out-dir results/full-stream-100x4 --run-prefix full-stream-100x4 \
-  --profile-count 100 --replicates 4 --jobs 2 \
-  --batch-runs 4 --calibration-runs 12
-```
-
-This plan has 400 runs. The 12-run calibration part is drawn from the first
-training RNG run. Later parts hold four runs of one RNG number. For lower peak
-memory, use `--jobs 1 --batch-runs 2` on a new campaign.
-
-The full dataset has not been run. The queue calibration below uses short
-ns-3 experiments; the broader cross-factor configurations still need a pilot
-before collecting all 40,000 runs. Raw trace storage and runtime grow with traffic/load;
-sharding bounds processing memory, not total disk use.
+Details, queues, and chaining are in [`scripts/tacc/README.md`](scripts/tacc/README.md).
+Local single-host streaming with `run_dataset.py --stream` remains supported for
+smaller campaigns.
 
 ## Repeatable knob comparison experiment
 
@@ -864,12 +493,9 @@ through MAC's header-inclusive estimate. The generic NR scheduler keeps a single
 128 B grant (`UlSrGrantBudget=0`).
 
 All 88 calibration runs passed, as did all 11 relay-switch timing regression
-cases (maximum UL arrival error 24 ns against the 100 ns limit). The earlier
-63/62 ms reference and probe remain in
-[the prior grant-fix artifact](artifacts/rtt-grant-fix-20261102/calibration.png).
-Service capacity is unchanged to the reported precision; RTT and queue budgets
-changed. [New calibration plot](artifacts/rtt-multigrant-fix-20261103/calibration.png)
-and [relay regression summary](artifacts/rtt-multigrant-fix-20261103/relay-summary.json).
+cases (maximum UL arrival error 24 ns against the 100 ns limit). Service
+capacity is unchanged to the reported precision; RTT and queue budgets changed.
+The accepted reference above records the current calibration results.
 
 | Bandwidth | Direction | PDCP service capacity | Immediate-ACK path RTT | Directional BDP |
 | --- | --- | ---: | ---: | ---: |
@@ -889,10 +515,6 @@ seeds reached a 44 ms minimum, matching the earlier fixed 64 B follow-up. The fo
 in the seed-20001 probe the gNB issued 6,179 UL DCIs versus 4,769 with the
 128 B bootstrap alone. Uplink service capacity is unchanged to the reported
 precision (794.2 kbit/s at 10 MHz).
-The earlier timing records are in
-[control-event timestamps](artifacts/rtt-scheduling-fix-20261102/timing-10mhz-ul.csv),
-[radio events](artifacts/rtt-scheduling-fix-20261102/radio-events-10mhz-ul.csv)
-and [transport blocks](artifacts/rtt-scheduling-fix-20261102/transport-blocks-10mhz-ul.csv).
 
 All 88 simulations completed with one relay switch each. The top two loads
 agree within 3.8% across cohorts, below the 15% plateau criterion; the
@@ -1038,11 +660,11 @@ sequence numbers, and seven interval KPIs. Optional MAC payload dumps expose
 simulated packet bytes. The PHY abstraction does not produce waveform IQ,
 DMRS samples, coded/scrambled bits, or channel-estimate arrays.
 
-See [experiment design, model and metric definitions](docs/experiment.md) and
-[all application rate details](docs/application-rates.md) for source rates,
-packet sizes, directions and the distinction between goodput and PDCP throughput.
-The TCP/UDP plot uses matched native CBR anchors: application goodput over 20–119 s
-and undelivered source bytes at run end, with each RNG repeat shown.
+Source rates, packet sizes, directions, and the distinction between goodput and
+PDCP throughput are defined by the application configs under
+`scratch/sat-bs-handset/`. The TCP/UDP plot uses matched native CBR anchors:
+application goodput over 20–119 s and undelivered source bytes at run end, with
+each RNG repeat shown.
 
 ## Single scenario
 
@@ -1063,9 +685,9 @@ scratch/sat-bs-handset/   scenario, radio/mobility, applications and telemetry
 patches/                  maintained ns-3.48 / NR v5.1 changes
 scripts/setup.sh          pinned upstream setup and smoke check
 scripts/dataset/          presets, collection, processing, validation, plots and report
+scripts/tacc/             TACC sync, dataset generation, and training helpers
+scripts/models/           UNUM bucket / baseline training and comparison plots
 experiments/queue-calibration/ maintained capacity/RTT calibration and reference
-docs/experiment.md        experiment design, model and metric definitions
-docs/application-rates.md source behavior, configured rates and interpretation
 local/reports/            ignored result and investigation write-ups
 local/slides/             ignored slide decks, notes and previews
 local/figures/            ignored presentation/design figures

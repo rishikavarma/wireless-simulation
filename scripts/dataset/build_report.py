@@ -20,8 +20,8 @@ def main():
  report_dir.mkdir(parents=True,exist_ok=True)
  report_path=report_dir/'dataset-summary.md'
  figdir=report_dir/'figures';figdir.mkdir(exist_ok=True)
- metrics_link=Path(os.path.relpath(ROOT/'docs/experiment.md',report_dir)).as_posix()
- rates_link=Path(os.path.relpath(ROOT/'docs/application-rates.md',report_dir)).as_posix()
+ metrics_link='../../../README.md'
+ rates_link='../../../README.md'
  validation_link=Path(os.path.relpath(campaign/'validation.json',report_dir)).as_posix()
  summaries_link=Path(os.path.relpath(campaign/'run-summary.csv',report_dir)).as_posix()
  for path in (campaign/'figures').iterdir():
@@ -41,7 +41,7 @@ def main():
 Completed **{total:,} simulations** ({v['profiles']:,} profiles × {n_replicates} matched RNG replicates): **{v['crashes']} crashes**, {v['applicationCriterionPassed']:,}/{total:,} primary application criteria passed. Each simulation lasts 130 s; comparisons use 20–119 s. Results below are medians of per-run measurements across {n_replicates} replicates, not significance claims.
 {coverage_note}
 
-1. **Metrics collected.** Added all seven requested interval KPIs, per-TB SINR/MCS/error outcomes, HARQ ACK/NACK, BSR levels, RACH/connection events, RLC/PDCP sequence numbers and per-UE geometry/timing. Optional dumps retain actual simulated MAC bytes at TX and successful RX, providing partial MSG 326/31 equivalents. **Not captured:** coded/scrambled bits, sampled IQ, received DMRS, pilot/interpolated channel estimates, RF synchronization/frequency-offset estimates, and full RRC message bodies. Waveform/bit-level outputs are unavailable in this PHY abstraction. Full RRC bodies are not logged; RRC event metadata is collected. [Coverage and exact KPI definitions]({metrics_link}).
+1. **Metrics collected.** Added all seven requested interval KPIs, per-TB SINR/MCS/error outcomes, HARQ ACK/NACK, BSR levels, RACH/connection events, RLC/PDCP sequence numbers and per-UE geometry/timing. Optional dumps retain actual simulated MAC bytes at TX and successful RX, providing partial MSG 326/31 equivalents. **Not captured:** coded/scrambled bits, sampled IQ, received DMRS, pilot/interpolated channel estimates, RF synchronization/frequency-offset estimates, and full RRC message bodies. Waveform/bit-level outputs are unavailable in this PHY abstraction. Full RRC bodies are not logged; RRC event metadata is collected. [Project README]({metrics_link}).
 
 2. **UE motion.** Tested stationary, 1.4, 15, 30 and 50 m/s inside 0.5 km and 50 km disks, with stationary controls at each radius. At 50 m/s versus stationary in the 50 km disk, paired changes are **{paired('motion-50000-50','stationary-50000','srtt_ms'):+.2f} ms SRTT**, **{paired('motion-50000-50','stationary-50000','ul_sinr_db'):+.3f} dB UL SINR**, and **{paired('motion-50000-50','stationary-50000','propagation_rtt_ms'):+.4f} ms geometric RTT**. Increasing speed changes geometry but does not introduce Doppler, fast fading or vehicle penetration loss in this model. [Motion comparison](figures/motion.png).{motion_follow_up}
 
@@ -49,7 +49,7 @@ Completed **{total:,} simulations** ({v['profiles']:,} profiles × {n_replicates
 
 4. **UDP and TCP algorithms.** All nine workloads support UDP; TCP-only dataset fields are **NaN**. Matched 512-byte CBR sources at 10 kbit/s deliver **{f(m['app-cbr']['application_goodput_kbps'])} / {f(m['cbr-udp']['application_goodput_kbps'])} kbit/s of application payload for UL TCP / UDP over 20–119 s. Discrete packet timing affects the finite-window rate. Across all {cbr_count} UL/DL CBR runs, the maximum source-byte delivery shortfall at run end is **{f(max_shortfall)}%**; this is a cutoff measurement, not a permanent-loss estimate. Application delay was not logged. Both transports retain RLC AM. [Application-level TCP/UDP comparison](figures/udp-vs-tcp.png). NewReno / CUBIC / BBR bulk transfers carry **{f(m['app-iperf']['ul_pdcp_throughput_kbps'])} / {f(m['iperf-TcpCubic']['ul_pdcp_throughput_kbps'])} / {f(m['iperf-TcpBbr']['ul_pdcp_throughput_kbps'])} kbit/s** at PDCP; their TCP SRTT p90 values are **{f(m['app-iperf']['srtt_p90_ms'])} / {f(m['iperf-TcpCubic']['srtt_p90_ms'])} / {f(m['iperf-TcpBbr']['srtt_p90_ms'])} ms**. PDCP throughput includes network/transport overhead and TCP retransmissions; it is distinct from application payload goodput. [TCP algorithms](figures/tcp-algorithms.png).
 
-5. **Applications and rates.** Probe/file profiles use 10 kbit/s pacing while active. Stream averages about **7.89 kbit/s body / 8.21 kbit/s framed**, IoT **0.512 / 0.533 kbit/s**, and RPC is completion/think-time limited. Native profiles include **NGMN VoIP** (12.2 kbit/s speech, 0.75 kbit/s silence), **CBR**, **OnOff** (configured rate during ON; 50% duty here), and **iperf-style BulkSend/PacketSink** (unpaced TCP; paced UDP). Native CBR also runs downlink. [All application rate details]({rates_link}), [application comparison](figures/applications.png).
+5. **Applications and rates.** Probe/file profiles use 10 kbit/s pacing while active. Stream averages about **7.89 kbit/s body / 8.21 kbit/s framed**, IoT **0.512 / 0.533 kbit/s**, and RPC is completion/think-time limited. Native profiles include **NGMN VoIP** (12.2 kbit/s speech, 0.75 kbit/s silence), **CBR**, **OnOff** (configured rate during ON; 50% duty here), and **iperf-style BulkSend/PacketSink** (unpaced TCP; paced UDP). Native CBR also runs downlink. [Project README]({rates_link}); [application comparison](figures/applications.png).
 
 PDCP volumes and PRB totals reconcile for every UE in every audited run. Maximum accommodated RX overlap is **{v['maxBoundaryOverlapNs']:g} ns**, within the retained 100 ns bound. Minimum elevation is **{v['minElevationDeg']:.2f}°**. Retained outcomes include **{v.get('zeroDeliveryRuns',0)} zero-delivery runs**, **{v.get('outageRuns',0)} runs with visibility gaps**, and **{v.get('rlcOverflowRuns',0)} runs with observed RLC overflow**. Missing RTT stays missing and does not remove a run from the dataset.
 
@@ -61,7 +61,7 @@ The dataset keeps **{v['features']} transport features** and adds a separate **{
 '''
  report_path.write_text(report)
  sources=[ROOT/'scripts/dataset/run_dataset.py',ROOT/'scripts/dataset/campaign_config.py',ROOT/'scripts/dataset/dataset_presets.py',ROOT/'scripts/dataset/dataset_storage.py',ROOT/'scripts/dataset/full_dataset.json',ROOT/'scripts/dataset/analyze_dataset.py',ROOT/'scripts/dataset/build_report.py',report_path]
- optional_sources=[ROOT/'docs/experiment.md',ROOT/'docs/application-rates.md',motion_path]
+ optional_sources=[ROOT/'README.md',motion_path]
  sources.extend(p for p in optional_sources if p.is_file())
  hashes={str(p.relative_to(ROOT)):__import__('hashlib').sha256(p.read_bytes()).hexdigest() for p in sources}
  (campaign/'analysis-source-hashes.json').write_text(json.dumps(hashes,indent=2)+'\n')
